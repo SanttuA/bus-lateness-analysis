@@ -7,6 +7,7 @@ import pandas as pd
 from dashboard_data import (
     DEFAULT_DB_PATH,
     build_hourly_line_metrics,
+    build_stop_heatmap_weights,
     build_stop_metrics,
     load_observations,
     load_stop_metadata,
@@ -44,6 +45,23 @@ def sample_stops() -> pd.DataFrame:
     )
 
 
+def sample_stop_metrics() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "stop_id": ["late", "early", "zero", "missing"],
+            "stop_name": ["Late stop", "Early stop", "Zero stop", "Missing stop"],
+            "stop_lat": [60.45, 60.43, 60.41, None],
+            "stop_lon": [22.27, 22.22, 22.20, 22.25],
+            "obs_count": [10, 5, 4, 8],
+            "line_count": [2, 1, 1, 3],
+            "avg_delay_min": [2.0, -3.0, 0.0, 4.0],
+            "median_delay_min": [1.5, -2.0, 0.0, 3.0],
+            "pct_late": [40.0, 50.0, 0.0, 75.0],
+            "pct_over_3_min_late": [20.0, 0.0, 0.0, 50.0],
+        }
+    )
+
+
 class DashboardDataTests(unittest.TestCase):
     def test_prepare_observations_adds_local_time_and_stop_metadata(self) -> None:
         prepared = prepare_observations(sample_observations(), sample_stops())
@@ -70,6 +88,42 @@ class DashboardDataTests(unittest.TestCase):
 
         self.assertEqual(metrics["line_ref"].astype(str).to_list(), ["3"])
         self.assertEqual(metrics.loc[0, "obs_count"], 3)
+
+    def test_stop_heatmap_weights_split_late_and_early_average_delay(self) -> None:
+        metrics = sample_stop_metrics()
+
+        late = build_stop_heatmap_weights(
+            metrics,
+            "avg_delay_min",
+            delay_direction="late",
+        )
+        early = build_stop_heatmap_weights(
+            metrics,
+            "avg_delay_min",
+            delay_direction="early",
+        )
+
+        self.assertEqual(late["stop_id"].to_list(), ["late"])
+        self.assertEqual(early["stop_id"].to_list(), ["early"])
+        self.assertAlmostEqual(late.loc[0, "heat_weight"], 20.0)
+        self.assertAlmostEqual(early.loc[0, "heat_weight"], 15.0)
+
+    def test_stop_heatmap_weights_convert_late_rate_to_observation_count(self) -> None:
+        heat = build_stop_heatmap_weights(sample_stop_metrics(), "pct_late")
+
+        weights = dict(zip(heat["stop_id"], heat["heat_weight"], strict=True))
+
+        self.assertEqual(set(weights), {"late", "early"})
+        self.assertAlmostEqual(weights["late"], 4.0)
+        self.assertAlmostEqual(weights["early"], 2.5)
+
+    def test_stop_heatmap_weights_remove_missing_coordinates_and_zero_heat(self) -> None:
+        heat = build_stop_heatmap_weights(sample_stop_metrics(), "pct_over_3_min_late")
+
+        self.assertEqual(heat["stop_id"].to_list(), ["late"])
+        self.assertGreater(heat.loc[0, "heat_weight"], 0)
+        self.assertTrue(heat["stop_lat"].notna().all())
+        self.assertTrue(heat["stop_lon"].notna().all())
 
     def test_real_data_smoke_loads_and_joins_stops(self) -> None:
         if not DEFAULT_DB_PATH.exists():

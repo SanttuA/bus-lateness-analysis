@@ -14,6 +14,7 @@ from dashboard_data import (
     DIVERGING_METRICS,
     METRIC_LABELS,
     build_hourly_line_metrics,
+    build_stop_heatmap_weights,
     build_stop_metrics,
     filter_observations,
     latest_gtfs_dir,
@@ -40,6 +41,8 @@ LATE_EARLY_SCALE = [
 ]
 
 SEQUENTIAL_SCALE = "YlOrRd"
+EARLY_HEAT_SCALE = "Blues"
+STOP_HEATMAP_RADIUS = 25
 
 
 @st.cache_data(show_spinner="Loading Föli observations")
@@ -161,6 +164,72 @@ def make_stop_map(stop_metrics: object, metric_key: str) -> go.Figure:
         mapbox_style="carto-positron",
         margin={"l": 0, "r": 0, "t": 20, "b": 0},
         coloraxis_colorbar_title=metric_label(metric_key),
+    )
+    return fig
+
+
+def heatmap_weight_label(metric_key: str, delay_direction: str = "late") -> str:
+    if metric_key == "avg_delay_min":
+        if delay_direction == "early":
+            return "Early-running intensity"
+        return "Late delay intensity"
+    if metric_key == "pct_late":
+        return "Estimated late observations"
+    if metric_key == "pct_over_3_min_late":
+        return "Estimated >3 min late observations"
+    return metric_label(metric_key)
+
+
+def make_stop_heatmap(
+    stop_metrics: object,
+    metric_key: str,
+    *,
+    delay_direction: str = "late",
+) -> go.Figure:
+    heat_df = build_stop_heatmap_weights(
+        stop_metrics,
+        metric_key,
+        delay_direction=delay_direction,
+    )
+    center = {
+        "lat": float(heat_df["stop_lat"].mean()),
+        "lon": float(heat_df["stop_lon"].mean()),
+    }
+    weight_label = heatmap_weight_label(metric_key, delay_direction)
+    fig = px.density_mapbox(
+        heat_df,
+        lat="stop_lat",
+        lon="stop_lon",
+        z="heat_weight",
+        radius=STOP_HEATMAP_RADIUS,
+        hover_name="stop_name",
+        hover_data={
+            "stop_id": True,
+            "avg_delay_min": ":.2f",
+            "median_delay_min": ":.2f",
+            "pct_late": ":.1f",
+            "pct_over_3_min_late": ":.1f",
+            "obs_count": True,
+            "line_count": True,
+            "heat_weight": ":.2f",
+            "stop_lat": False,
+            "stop_lon": False,
+        },
+        center=center,
+        zoom=9,
+        height=650,
+        labels={
+            **{key: label for key, label in METRIC_LABELS.items()},
+            "heat_weight": weight_label,
+        },
+        color_continuous_scale=EARLY_HEAT_SCALE
+        if delay_direction == "early"
+        else SEQUENTIAL_SCALE,
+    )
+    fig.update_layout(
+        mapbox_style="carto-positron",
+        margin={"l": 0, "r": 0, "t": 20, "b": 0},
+        coloraxis_colorbar_title=weight_label,
     )
     return fig
 
@@ -291,10 +360,62 @@ def main() -> None:
         if map_df.empty:
             st.info("No mapped stops meet the minimum observation threshold.")
         else:
-            st.plotly_chart(
-                make_stop_map(map_df, metric_key),
-                use_container_width=True,
-            )
+            marker_tab, heatmap_tab = st.tabs(["Markers", "Heatmap"])
+            with marker_tab:
+                st.plotly_chart(
+                    make_stop_map(map_df, metric_key),
+                    use_container_width=True,
+                )
+            with heatmap_tab:
+                if metric_key == "avg_delay_min":
+                    late_heatmap_tab, early_heatmap_tab = st.tabs(
+                        ["Late heatmap", "Early heatmap"]
+                    )
+                    with late_heatmap_tab:
+                        late_heat = build_stop_heatmap_weights(
+                            map_df,
+                            metric_key,
+                            delay_direction="late",
+                        )
+                        if late_heat.empty:
+                            st.info("No late delay hotspots meet the current filters.")
+                        else:
+                            st.plotly_chart(
+                                make_stop_heatmap(
+                                    late_heat,
+                                    metric_key,
+                                    delay_direction="late",
+                                ),
+                                use_container_width=True,
+                            )
+                    with early_heatmap_tab:
+                        early_heat = build_stop_heatmap_weights(
+                            map_df,
+                            metric_key,
+                            delay_direction="early",
+                        )
+                        if early_heat.empty:
+                            st.info(
+                                "No early-running hotspots meet the current filters."
+                            )
+                        else:
+                            st.plotly_chart(
+                                make_stop_heatmap(
+                                    early_heat,
+                                    metric_key,
+                                    delay_direction="early",
+                                ),
+                                use_container_width=True,
+                            )
+                else:
+                    heat = build_stop_heatmap_weights(map_df, metric_key)
+                    if heat.empty:
+                        st.info("No heatmap hotspots meet the current filters.")
+                    else:
+                        st.plotly_chart(
+                            make_stop_heatmap(heat, metric_key),
+                            use_container_width=True,
+                        )
 
         late_tab, early_tab = st.tabs(["Most late stops", "Most early stops"])
         with late_tab:

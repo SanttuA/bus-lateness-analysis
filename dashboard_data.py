@@ -227,6 +227,43 @@ def build_stop_metrics(
     return grouped[grouped["obs_count"] >= min_observations].reset_index(drop=True)
 
 
+def build_stop_heatmap_weights(
+    stop_metrics: pd.DataFrame,
+    metric_key: str,
+    *,
+    delay_direction: str = "late",
+) -> pd.DataFrame:
+    result = stop_metrics.dropna(subset=["stop_lat", "stop_lon"]).copy()
+    if result.empty:
+        result["heat_weight"] = pd.Series(dtype="float64")
+        return result
+
+    if metric_key == "avg_delay_min":
+        if delay_direction == "late":
+            result["heat_weight"] = result["avg_delay_min"].clip(lower=0) * result[
+                "obs_count"
+            ]
+        elif delay_direction == "early":
+            result["heat_weight"] = (-result["avg_delay_min"]).clip(lower=0) * result[
+                "obs_count"
+            ]
+        else:
+            raise ValueError("delay_direction must be 'late' or 'early'")
+    elif metric_key == "pct_late":
+        result["heat_weight"] = result["pct_late"] / 100.0 * result["obs_count"]
+    elif metric_key == "pct_over_3_min_late":
+        result["heat_weight"] = (
+            result["pct_over_3_min_late"] / 100.0 * result["obs_count"]
+        )
+    elif metric_key == "obs_count":
+        result["heat_weight"] = result["obs_count"]
+    else:
+        raise ValueError(f"Unsupported heatmap metric: {metric_key}")
+
+    result["heat_weight"] = pd.to_numeric(result["heat_weight"], errors="coerce")
+    return result[result["heat_weight"] > 0].reset_index(drop=True)
+
+
 def summarize_observations(df: pd.DataFrame) -> dict[str, float | int]:
     if df.empty:
         return {
