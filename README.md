@@ -23,21 +23,14 @@ This project uses `uv`.
 uv sync
 ```
 
-## Usage
+## Analysis
 
-Show the 10 lines with the highest average delay:
-
-```sh
-uv run python analysis/avg-line-delay.py
-```
-
-Use a different database, output limit, or minimum observation count:
-
-```sh
-uv run python analysis/avg-line-delay.py --db data/foli.db --limit 20 --min-observations 50
-```
+See [ANALYSIS.md](ANALYSIS.md) for script commands, notebook usage, and metric
+definitions.
 
 ## Data License And Attribution
+
+Project code is licensed under the MIT License. See [LICENSE](LICENSE).
 
 Data retrieved from the Föli API (`data.foli.fi`) is licensed under
 [Creative Commons Attribution 4.0 International (CC BY 4.0)](https://creativecommons.org/licenses/by/4.0/deed.en).
