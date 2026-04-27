@@ -10,6 +10,7 @@ import pandas as pd
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "foli.db"
+DEFAULT_GTFS_ROOT = PROJECT_ROOT / "data" / "gtfs"
 DEFAULT_TIMEZONE = "Europe/Helsinki"
 DEFAULT_RUSH_WINDOWS = ("07:00-09:00", "15:00-18:00")
 
@@ -79,6 +80,28 @@ def resolve_db_path(path: Path) -> Path:
     if not db_path.exists():
         raise SystemExit(f"Database not found: {db_path}")
     return db_path
+
+
+def resolve_project_path(path: Path) -> Path:
+    resolved = path.expanduser()
+    if not resolved.is_absolute():
+        resolved = PROJECT_ROOT / resolved
+    return resolved.resolve()
+
+
+def latest_gtfs_dir(root: Path = DEFAULT_GTFS_ROOT) -> Path | None:
+    gtfs_root = resolve_project_path(root)
+    if not gtfs_root.exists():
+        return None
+
+    candidates = [
+        path
+        for path in gtfs_root.iterdir()
+        if path.is_dir() and (path / "stops.txt").exists()
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: path.name)
 
 
 def connect_readonly_db(path: Path) -> sqlite3.Connection:

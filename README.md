@@ -13,7 +13,8 @@ data/foli.db
 
 The database is not committed to this repository. It should contain a
 `vehicle_observations` table with fields such as `line_ref`, `delay_seconds`,
-and `is_gtfs_matchable`.
+and `is_gtfs_matchable`. Some analyses also use `service_alerts`,
+`collector_polls`, and the newest local GTFS archive under `data/gtfs/`.
 
 ## Setup
 
