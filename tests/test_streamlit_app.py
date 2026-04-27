@@ -17,6 +17,7 @@ from streamlit_app import (
     make_stop_map,
     make_stop_heatmap,
     scale_stop_marker_sizes,
+    stop_marker_caption,
 )
 from tests.test_dashboard_data import sample_stop_metrics
 
@@ -38,6 +39,11 @@ class StopMarkerMapTests(unittest.TestCase):
         )
 
         self.assertEqual(extent, 4.5)
+
+    def test_stop_marker_caption_mentions_time_filter(self) -> None:
+        caption = stop_marker_caption(sample_stop_metrics(), "avg_delay_min")
+
+        self.assertIn("date, line, direction, day, and time filters", caption)
 
     def test_scale_stop_marker_sizes_empty_input_returns_empty(self) -> None:
         self.assertEqual(scale_stop_marker_sizes([]), [])
