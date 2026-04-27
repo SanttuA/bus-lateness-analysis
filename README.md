@@ -29,6 +29,18 @@ uv sync
 See [ANALYSIS.md](ANALYSIS.md) for script commands, notebook usage, and metric
 definitions.
 
+## Dashboard
+
+Run the local interactive dashboard with:
+
+```sh
+uv run streamlit run streamlit_app.py
+```
+
+The dashboard reads `data/foli.db`, joins observations to the newest local GTFS
+snapshot under `data/gtfs/`, and visualizes signed delay by line, local hour,
+and next-stop location.
+
 ## Data License And Attribution
 
 Project code is licensed under the MIT License. See [LICENSE](LICENSE).
