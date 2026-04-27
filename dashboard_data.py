@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -138,6 +139,7 @@ def prepare_observations(
     result["local_time"] = local_times
     result["local_date"] = local_times.dt.date
     result["local_hour"] = local_times.dt.hour
+    result["local_minute_of_day"] = result["local_hour"] * 60 + local_times.dt.minute
     result["local_weekday"] = local_times.dt.weekday
     result["is_weekday"] = result["local_weekday"] < 5
 
@@ -166,6 +168,8 @@ def filter_observations(
     line_refs: list[str] | tuple[str, ...] | None = None,
     direction_refs: list[str] | tuple[str, ...] | None = None,
     day_filter: str = "All days",
+    start_time: time | None = None,
+    end_time: time | None = None,
 ) -> pd.DataFrame:
     result = df
     if start_date is not None:
@@ -182,6 +186,15 @@ def filter_observations(
         result = result[result["is_weekday"]]
     elif day_filter == "Weekends":
         result = result[~result["is_weekday"]]
+    if start_time is not None or end_time is not None:
+        start_minute = 0 if start_time is None else _minute_of_day(start_time)
+        end_minute = (24 * 60) - 1 if end_time is None else _minute_of_day(end_time)
+        if start_minute > end_minute:
+            raise ValueError("start_time must be before or equal to end_time")
+        result = result[
+            (result["local_minute_of_day"] >= start_minute)
+            & (result["local_minute_of_day"] <= end_minute)
+        ]
     return result
 
 
@@ -316,6 +329,7 @@ def _empty_prepared_frame() -> pd.DataFrame:
             "local_time",
             "local_date",
             "local_hour",
+            "local_minute_of_day",
             "local_weekday",
             "is_weekday",
             "gtfs_stop_name",
@@ -324,6 +338,10 @@ def _empty_prepared_frame() -> pd.DataFrame:
             "stop_name",
         ]
     )
+
+
+def _minute_of_day(value: time) -> int:
+    return value.hour * 60 + value.minute
 
 
 def _empty_metric_frame(group_columns: list[str]) -> pd.DataFrame:

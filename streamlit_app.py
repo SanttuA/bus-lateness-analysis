@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from datetime import date
+from datetime import date, time, timedelta
 from pathlib import Path
 
 import plotly.express as px
@@ -313,6 +313,14 @@ def main() -> None:
             value=30,
             step=10,
         )
+        heatmap_start_time, heatmap_end_time = st.slider(
+            "Heatmap time range",
+            min_value=time(0, 0),
+            max_value=time(23, 59),
+            value=(time(0, 0), time(23, 59)),
+            step=timedelta(minutes=30),
+            format="HH:mm",
+        )
 
     filtered = filter_observations(
         df,
@@ -326,6 +334,12 @@ def main() -> None:
         st.warning("No observations match the selected filters.")
         st.stop()
 
+    heatmap_filtered = filter_observations(
+        filtered,
+        start_time=heatmap_start_time,
+        end_time=heatmap_end_time,
+    )
+
     summary = summarize_observations(filtered)
     col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("Observations", f"{summary['obs_count']:,}")
@@ -335,16 +349,22 @@ def main() -> None:
     col5.metric("Late", f"{summary['pct_late']:.1f}%")
 
     hourly = build_hourly_line_metrics(
-        filtered,
+        heatmap_filtered,
         min_observations=int(min_observations),
     )
     stop_metrics = build_stop_metrics(
         filtered,
         min_observations=int(min_observations),
     )
+    heatmap_stop_metrics = build_stop_metrics(
+        heatmap_filtered,
+        min_observations=int(min_observations),
+    )
 
     st.subheader("Line By Hour")
-    if hourly.empty:
+    if heatmap_filtered.empty:
+        st.info("No observations match the selected heatmap time range.")
+    elif hourly.empty:
         st.info("No line-hour groups meet the minimum observation threshold.")
     else:
         st.plotly_chart(
@@ -367,55 +387,75 @@ def main() -> None:
                     use_container_width=True,
                 )
             with heatmap_tab:
-                if metric_key == "avg_delay_min":
-                    late_heatmap_tab, early_heatmap_tab = st.tabs(
-                        ["Late heatmap", "Early heatmap"]
+                if heatmap_filtered.empty:
+                    st.info("No observations match the selected heatmap time range.")
+                elif heatmap_stop_metrics.empty:
+                    st.info(
+                        "No stops in the selected heatmap time range meet the "
+                        "minimum observation threshold."
                     )
-                    with late_heatmap_tab:
-                        late_heat = build_stop_heatmap_weights(
-                            map_df,
-                            metric_key,
-                            delay_direction="late",
-                        )
-                        if late_heat.empty:
-                            st.info("No late delay hotspots meet the current filters.")
-                        else:
-                            st.plotly_chart(
-                                make_stop_heatmap(
-                                    late_heat,
-                                    metric_key,
-                                    delay_direction="late",
-                                ),
-                                use_container_width=True,
-                            )
-                    with early_heatmap_tab:
-                        early_heat = build_stop_heatmap_weights(
-                            map_df,
-                            metric_key,
-                            delay_direction="early",
-                        )
-                        if early_heat.empty:
-                            st.info(
-                                "No early-running hotspots meet the current filters."
-                            )
-                        else:
-                            st.plotly_chart(
-                                make_stop_heatmap(
-                                    early_heat,
-                                    metric_key,
-                                    delay_direction="early",
-                                ),
-                                use_container_width=True,
-                            )
                 else:
-                    heat = build_stop_heatmap_weights(map_df, metric_key)
-                    if heat.empty:
-                        st.info("No heatmap hotspots meet the current filters.")
-                    else:
-                        st.plotly_chart(
-                            make_stop_heatmap(heat, metric_key),
-                            use_container_width=True,
+                    heatmap_map_df = heatmap_stop_metrics.dropna(
+                        subset=["stop_lat", "stop_lon"]
+                    )
+                    if heatmap_map_df.empty:
+                        st.info(
+                            "No mapped stops in the selected heatmap time range "
+                            "meet the minimum observation threshold."
                         )
+                    elif metric_key == "avg_delay_min":
+                        late_heatmap_tab, early_heatmap_tab = st.tabs(
+                            ["Late heatmap", "Early heatmap"]
+                        )
+                        with late_heatmap_tab:
+                            late_heat = build_stop_heatmap_weights(
+                                heatmap_map_df,
+                                metric_key,
+                                delay_direction="late",
+                            )
+                            if late_heat.empty:
+                                st.info(
+                                    "No late delay hotspots meet the current heatmap "
+                                    "filters."
+                                )
+                            else:
+                                st.plotly_chart(
+                                    make_stop_heatmap(
+                                        late_heat,
+                                        metric_key,
+                                        delay_direction="late",
+                                    ),
+                                    use_container_width=True,
+                                )
+                        with early_heatmap_tab:
+                            early_heat = build_stop_heatmap_weights(
+                                heatmap_map_df,
+                                metric_key,
+                                delay_direction="early",
+                            )
+                            if early_heat.empty:
+                                st.info(
+                                    "No early-running hotspots meet the current "
+                                    "heatmap filters."
+                                )
+                            else:
+                                st.plotly_chart(
+                                    make_stop_heatmap(
+                                        early_heat,
+                                        metric_key,
+                                        delay_direction="early",
+                                    ),
+                                    use_container_width=True,
+                                )
+                    else:
+                        heat = build_stop_heatmap_weights(heatmap_map_df, metric_key)
+                        if heat.empty:
+                            st.info("No heatmap hotspots meet the current filters.")
+                        else:
+                            st.plotly_chart(
+                                make_stop_heatmap(heat, metric_key),
+                                use_container_width=True,
+                            )
 
         late_tab, early_tab = st.tabs(["Most late stops", "Most early stops"])
         with late_tab:

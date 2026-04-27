@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import time
 import unittest
 
 import pandas as pd
@@ -9,6 +10,7 @@ from dashboard_data import (
     build_hourly_line_metrics,
     build_stop_heatmap_weights,
     build_stop_metrics,
+    filter_observations,
     load_observations,
     load_stop_metadata,
     prepare_observations,
@@ -67,10 +69,47 @@ class DashboardDataTests(unittest.TestCase):
         prepared = prepare_observations(sample_observations(), sample_stops())
 
         self.assertEqual(prepared.loc[0, "local_hour"], 11)
+        self.assertEqual(prepared.loc[0, "local_minute_of_day"], 11 * 60 + 5)
         self.assertEqual(str(prepared.loc[0, "local_date"]), "2026-04-23")
         self.assertEqual(prepared.loc[0, "stop_name"], "Keskusta")
         self.assertEqual(prepared.loc[0, "stop_lat"], 60.45)
         self.assertEqual(prepared.loc[0, "stop_lon"], 22.27)
+
+    def test_filter_observations_limits_inclusive_local_time_range(self) -> None:
+        prepared = prepare_observations(sample_observations(), sample_stops())
+
+        filtered = filter_observations(
+            prepared,
+            start_time=time(11, 10),
+            end_time=time(11, 15),
+        )
+
+        self.assertEqual(filtered["delay_seconds"].to_list(), [-120, 0])
+
+    def test_filter_observations_full_day_time_range_preserves_rows(self) -> None:
+        prepared = prepare_observations(sample_observations(), sample_stops())
+
+        filtered = filter_observations(
+            prepared,
+            start_time=time(0, 0),
+            end_time=time(23, 59),
+        )
+
+        self.assertEqual(len(filtered), len(prepared))
+
+    def test_filter_observations_combines_time_with_existing_filters(self) -> None:
+        prepared = prepare_observations(sample_observations(), sample_stops())
+
+        filtered = filter_observations(
+            prepared,
+            line_refs=["3"],
+            direction_refs=["1"],
+            day_filter="Weekdays",
+            start_time=time(11, 0),
+            end_time=time(11, 12),
+        )
+
+        self.assertEqual(filtered["delay_seconds"].to_list(), [60, -120])
 
     def test_stop_metrics_preserve_signed_delay_and_late_rates(self) -> None:
         prepared = prepare_observations(sample_observations(), sample_stops())
