@@ -5,50 +5,53 @@ import argparse
 import pandas as pd
 
 from _shared import (
-    DELAY_FILTER_SQL,
+    QUALIFIED_DELAY_FILTER_SQL,
+    add_bucket_arg,
     add_common_args,
-    add_local_time_columns,
+    add_quality_args,
     add_rush_window_args,
     add_timezone_arg,
+    aggregate_delay_buckets,
+    apply_quality_filter,
+    base_quality_query,
     connect_readonly_db,
     flag_rush_period,
-    minutes,
     parse_rush_windows,
     print_or_empty,
     read_sql,
     round_numeric,
     rush_window_values,
+    summarize_delay_metrics,
     write_optional_csv,
 )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Rank lines by how much worse they perform during rush windows."
+        description="Rank lines by robust delay lift during rush windows."
     )
     add_common_args(parser)
     add_timezone_arg(parser)
+    add_quality_args(parser)
+    add_bucket_arg(parser)
     add_rush_window_args(parser)
-    parser.set_defaults(limit=10, min_observations=1)
+    parser.set_defaults(limit=10, min_observations=30)
     return parser.parse_args()
 
 
 def load_observations(args: argparse.Namespace) -> pd.DataFrame:
-    query = f"""
-    SELECT
-        recorded_at_utc,
-        line_ref,
-        published_line_name,
-        delay_seconds
-    FROM vehicle_observations
-    WHERE {DELAY_FILTER_SQL}
-    """
+    query = base_quality_query(where=QUALIFIED_DELAY_FILTER_SQL)
     with connect_readonly_db(args.db) as con:
         return read_sql(con, query)
 
 
 def build_rush_impact(args: argparse.Namespace, df: pd.DataFrame) -> pd.DataFrame:
-    df = add_local_time_columns(df, "recorded_at_utc", args.timezone)
+    df = apply_quality_filter(
+        df,
+        quality_mode=args.quality_mode,
+        exclude_stop_call_disagreement=args.exclude_stop_call_disagreement,
+    )
+    df = aggregate_delay_buckets(df, bucket=args.bucket, timezone=args.timezone)
     if df.empty:
         return pd.DataFrame()
 
@@ -58,54 +61,65 @@ def build_rush_impact(args: argparse.Namespace, df: pd.DataFrame) -> pd.DataFram
         windows,
         include_weekends=args.include_weekends,
     )
-    df["delay_abs_seconds"] = df["delay_seconds"].abs()
-
-    grouped = df.groupby(["line_ref", "is_rush"], as_index=False).agg(
-        line_name=("published_line_name", "first"),
-        obs_count=("delay_seconds", "size"),
-        avg_delay_min=("delay_seconds", lambda s: minutes(s).mean()),
-        avg_abs_delay_min=("delay_abs_seconds", lambda s: minutes(s).mean()),
-        pct_late=("delay_seconds", lambda s: (s > 0).mean() * 100.0),
+    grouped = summarize_delay_metrics(
+        df,
+        ["line_ref", "is_rush"],
+        min_observations=args.min_observations,
+        extra_aggs={"line_name": ("published_line_name", "first")},
     )
-    if not {True, False}.issubset(set(grouped["is_rush"])):
+    if grouped.empty or not {True, False}.issubset(set(grouped["is_rush"])):
         return pd.DataFrame()
 
-    pivot = grouped.pivot(index="line_ref", columns="is_rush")
+    rush = grouped[grouped["is_rush"]].drop(columns=["is_rush"])
+    non_rush = grouped[~grouped["is_rush"]].drop(columns=["is_rush"])
+    result = non_rush.merge(
+        rush,
+        how="inner",
+        on="line_ref",
+        suffixes=("_non_rush", "_rush"),
+    )
+    if result.empty:
+        return result
 
-    result = pd.DataFrame(index=pivot.index)
-    result["line_name"] = pivot[("line_name", True)].combine_first(
-        pivot[("line_name", False)]
+    result["line_name"] = result["line_name_rush"].combine_first(
+        result["line_name_non_rush"]
     )
-    result["rush_obs_count"] = pivot[("obs_count", True)]
-    result["non_rush_obs_count"] = pivot[("obs_count", False)]
-    result["rush_avg_delay_min"] = pivot[("avg_delay_min", True)]
-    result["non_rush_avg_delay_min"] = pivot[("avg_delay_min", False)]
-    result["rush_avg_abs_delay_min"] = pivot[("avg_abs_delay_min", True)]
-    result["non_rush_avg_abs_delay_min"] = pivot[("avg_abs_delay_min", False)]
-    result["rush_pct_late"] = pivot[("pct_late", True)]
-    result["non_rush_pct_late"] = pivot[("pct_late", False)]
-    result = result.reset_index()
-
-    result = result.dropna(subset=["rush_obs_count", "non_rush_obs_count"])
-    result = result[
-        (result["rush_obs_count"] >= args.min_observations)
-        & (result["non_rush_obs_count"] >= args.min_observations)
-    ]
-    result["rush_delay_lift_min"] = (
-        result["rush_avg_delay_min"] - result["non_rush_avg_delay_min"]
+    result["rush_p90_delay_lift_min"] = (
+        result["p90_delay_min_rush"] - result["p90_delay_min_non_rush"]
     )
-    result["rush_abs_delay_lift_min"] = (
-        result["rush_avg_abs_delay_min"] - result["non_rush_avg_abs_delay_min"]
+    result["rush_median_delay_lift_min"] = (
+        result["median_delay_min_rush"] - result["median_delay_min_non_rush"]
     )
-    result["rush_late_pct_point_lift"] = (
-        result["rush_pct_late"] - result["non_rush_pct_late"]
+    result["rush_over_5_min_late_pct_point_lift"] = (
+        result["pct_over_5_min_late_rush"] - result["pct_over_5_min_late_non_rush"]
     )
-
     result = result.sort_values(
-        ["rush_delay_lift_min", "rush_abs_delay_lift_min", "rush_obs_count"],
+        [
+            "rush_p90_delay_lift_min",
+            "rush_over_5_min_late_pct_point_lift",
+            "bucket_count_rush",
+        ],
         ascending=[False, False, False],
     ).head(args.limit)
-    return round_numeric(result)
+
+    ordered = [
+        "line_ref",
+        "line_name",
+        "bucket_count_non_rush",
+        "bucket_count_rush",
+        "raw_poll_count_non_rush",
+        "raw_poll_count_rush",
+        "median_delay_min_non_rush",
+        "median_delay_min_rush",
+        "rush_median_delay_lift_min",
+        "p90_delay_min_non_rush",
+        "p90_delay_min_rush",
+        "rush_p90_delay_lift_min",
+        "pct_over_5_min_late_non_rush",
+        "pct_over_5_min_late_rush",
+        "rush_over_5_min_late_pct_point_lift",
+    ]
+    return round_numeric(result[ordered])
 
 
 def main() -> None:

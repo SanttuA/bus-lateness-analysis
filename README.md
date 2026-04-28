@@ -38,8 +38,20 @@ uv run streamlit run streamlit_app.py
 ```
 
 The dashboard reads `data/foli.db`, joins observations to the newest local GTFS
-snapshot under `data/gtfs/`, and visualizes signed delay by line, local hour,
-and next-stop location.
+snapshot under `data/gtfs/`, applies conservative quality filtering, collapses
+repeated polls into trip-stop buckets, and visualizes robust delay by line,
+local hour, and next-stop location.
+
+## Data Caveats
+
+- SIRI VM delay is estimated vehicle-monitoring state, not measured arrival
+  truth.
+- Raw Föli VM rows are repeated polls, so treating every 30-second poll as an
+  independent event overweights vehicles that remain visible for longer.
+- The default analytics use conservative filtering for extreme, stale,
+  pre-trip, and post-trip rows before drawing operational conclusions.
+- Rows where VM delay strongly disagrees with next stop-call expected-vs-aimed
+  times are flagged by default and can be excluded explicitly in CLI scripts.
 
 ## Data License And Attribution
 

@@ -3,9 +3,17 @@ from __future__ import annotations
 import sqlite3
 from datetime import time
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 import pandas as pd
+
+from analysis._shared import (
+    DELAY_METRIC_COLUMNS,
+    QUALIFIED_DELAY_FILTER_SQL,
+    aggregate_delay_buckets,
+    apply_quality_filter,
+    base_quality_query,
+    summarize_delay_metrics,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -13,20 +21,22 @@ DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "foli.db"
 DEFAULT_GTFS_ROOT = PROJECT_ROOT / "data" / "gtfs"
 DEFAULT_TIMEZONE = "Europe/Helsinki"
 
-DELAY_FILTER_SQL = """
-    is_gtfs_matchable = 1
-    AND delay_seconds IS NOT NULL
-    AND line_ref IS NOT NULL
-"""
-
 METRIC_LABELS = {
-    "avg_delay_min": "Average delay (min)",
-    "pct_late": "Late observations (%)",
+    "p90_delay_min": "P90 delay (min)",
+    "median_delay_min": "Median delay (min)",
+    "p75_delay_min": "P75 delay (min)",
+    "p95_delay_min": "P95 delay (min)",
+    "signed_mean_delay_min": "Signed mean delay (min)",
     "pct_over_3_min_late": "Over 3 min late (%)",
-    "obs_count": "Observation count",
+    "pct_over_5_min_late": "Over 5 min late (%)",
+    "pct_early": "Early buckets (%)",
+    "pct_over_1_min_early": "Over 1 min early (%)",
+    "pct_over_3_min_early": "Over 3 min early (%)",
+    "bucket_count": "Bucket count",
+    "raw_poll_count": "Raw poll count",
 }
 
-DIVERGING_METRICS = {"avg_delay_min"}
+DIVERGING_METRICS = set(DELAY_METRIC_COLUMNS)
 
 
 def resolve_project_path(path: Path | str) -> Path:
@@ -64,18 +74,7 @@ def load_observations(
     *,
     limit: int | None = None,
 ) -> pd.DataFrame:
-    query = f"""
-    SELECT
-        recorded_at_utc,
-        line_ref,
-        direction_ref,
-        published_line_name,
-        delay_seconds,
-        next_stop_point_ref,
-        next_stop_point_name
-    FROM vehicle_observations
-    WHERE {DELAY_FILTER_SQL}
-    """
+    query = base_quality_query(where=QUALIFIED_DELAY_FILTER_SQL)
     params: list[object] = []
     if limit is not None:
         query += "\nLIMIT ?"
@@ -117,7 +116,11 @@ def prepare_observations(
     if observations.empty:
         return _empty_prepared_frame()
 
-    result = observations.copy()
+    result = apply_quality_filter(observations, quality_mode="conservative")
+    result = aggregate_delay_buckets(result, bucket="trip-stop", timezone=timezone)
+    if result.empty:
+        return _empty_prepared_frame()
+
     result["recorded_at_utc"] = pd.to_datetime(
         result["recorded_at_utc"],
         utc=True,
@@ -133,15 +136,7 @@ def prepare_observations(
         result["published_line_name"].astype("string").fillna(result["line_ref"])
     )
     result["stop_id"] = result["next_stop_point_ref"].astype("string")
-
-    tz = ZoneInfo(timezone)
-    local_times = result["recorded_at_utc"].dt.tz_convert(tz)
-    result["local_time"] = local_times
-    result["local_date"] = local_times.dt.date
-    result["local_hour"] = local_times.dt.hour
-    result["local_minute_of_day"] = result["local_hour"] * 60 + local_times.dt.minute
-    result["local_weekday"] = local_times.dt.weekday
-    result["is_weekday"] = result["local_weekday"] < 5
+    result["local_minute_of_day"] = result["local_minutes"]
 
     stop_columns = ["stop_id", "gtfs_stop_name", "stop_lat", "stop_lon"]
     if stops.empty:
@@ -206,15 +201,13 @@ def build_hourly_line_metrics(
     if df.empty:
         return _empty_metric_frame(["line_ref", "local_hour", "line_name"])
 
-    grouped = df.groupby(["line_ref", "local_hour"], as_index=False).agg(
-        line_name=("published_line_name", "first"),
-        obs_count=("delay_seconds", "size"),
-        avg_delay_min=("delay_min", "mean"),
-        median_delay_min=("delay_min", "median"),
-        pct_late=("delay_seconds", lambda s: (s > 0).mean() * 100.0),
-        pct_over_3_min_late=("delay_seconds", lambda s: (s > 180).mean() * 100.0),
+    grouped = summarize_delay_metrics(
+        df,
+        ["line_ref", "local_hour"],
+        min_observations=min_observations,
+        extra_aggs={"line_name": ("published_line_name", "first")},
     )
-    return grouped[grouped["obs_count"] >= min_observations].reset_index(drop=True)
+    return grouped.reset_index(drop=True)
 
 
 def build_stop_metrics(
@@ -225,19 +218,13 @@ def build_stop_metrics(
     if df.empty:
         return _empty_metric_frame(["stop_id", "stop_name", "stop_lat", "stop_lon"])
 
-    grouped = df.groupby(
+    grouped = summarize_delay_metrics(
+        df,
         ["stop_id", "stop_name", "stop_lat", "stop_lon"],
-        dropna=False,
-        as_index=False,
-    ).agg(
-        obs_count=("delay_seconds", "size"),
-        line_count=("line_ref", "nunique"),
-        avg_delay_min=("delay_min", "mean"),
-        median_delay_min=("delay_min", "median"),
-        pct_late=("delay_seconds", lambda s: (s > 0).mean() * 100.0),
-        pct_over_3_min_late=("delay_seconds", lambda s: (s > 180).mean() * 100.0),
+        min_observations=min_observations,
+        extra_aggs={"line_count": ("line_ref", "nunique")},
     )
-    return grouped[grouped["obs_count"] >= min_observations].reset_index(drop=True)
+    return grouped.reset_index(drop=True)
 
 
 def build_stop_heatmap_weights(
@@ -251,25 +238,18 @@ def build_stop_heatmap_weights(
         result["heat_weight"] = pd.Series(dtype="float64")
         return result
 
-    if metric_key == "avg_delay_min":
+    count_column = "bucket_count" if "bucket_count" in result.columns else "obs_count"
+    if metric_key in DIVERGING_METRICS:
         if delay_direction == "late":
-            result["heat_weight"] = result["avg_delay_min"].clip(lower=0) * result[
-                "obs_count"
-            ]
+            result["heat_weight"] = result[metric_key].clip(lower=0) * result[count_column]
         elif delay_direction == "early":
-            result["heat_weight"] = (-result["avg_delay_min"]).clip(lower=0) * result[
-                "obs_count"
-            ]
+            result["heat_weight"] = (-result[metric_key]).clip(lower=0) * result[count_column]
         else:
             raise ValueError("delay_direction must be 'late' or 'early'")
-    elif metric_key == "pct_late":
-        result["heat_weight"] = result["pct_late"] / 100.0 * result["obs_count"]
-    elif metric_key == "pct_over_3_min_late":
-        result["heat_weight"] = (
-            result["pct_over_3_min_late"] / 100.0 * result["obs_count"]
-        )
-    elif metric_key == "obs_count":
-        result["heat_weight"] = result["obs_count"]
+    elif metric_key.startswith("pct_"):
+        result["heat_weight"] = result[metric_key] / 100.0 * result[count_column]
+    elif metric_key in ("bucket_count", "raw_poll_count", "obs_count"):
+        result["heat_weight"] = result[metric_key]
     else:
         raise ValueError(f"Unsupported heatmap metric: {metric_key}")
 
@@ -280,33 +260,37 @@ def build_stop_heatmap_weights(
 def summarize_observations(df: pd.DataFrame) -> dict[str, float | int]:
     if df.empty:
         return {
-            "obs_count": 0,
+            "bucket_count": 0,
+            "raw_poll_count": 0,
             "line_count": 0,
             "stop_count": 0,
-            "avg_delay_min": 0.0,
-            "pct_late": 0.0,
+            "median_delay_min": 0.0,
+            "p90_delay_min": 0.0,
+            "pct_over_5_min_late": 0.0,
         }
 
     return {
-        "obs_count": int(len(df)),
+        "bucket_count": int(len(df)),
+        "raw_poll_count": int(df["raw_poll_count"].sum()),
         "line_count": int(df["line_ref"].nunique(dropna=True)),
         "stop_count": int(df["stop_id"].nunique(dropna=True)),
-        "avg_delay_min": float(df["delay_min"].mean()),
-        "pct_late": float((df["delay_seconds"] > 0).mean() * 100.0),
+        "median_delay_min": float(df["delay_min"].median()),
+        "p90_delay_min": float(df["delay_min"].quantile(0.90)),
+        "pct_over_5_min_late": float((df["delay_seconds"] > 300).mean() * 100.0),
     }
 
 
 def rank_late_stops(stop_metrics: pd.DataFrame, *, limit: int = 20) -> pd.DataFrame:
     return stop_metrics.sort_values(
-        ["avg_delay_min", "obs_count"],
-        ascending=[False, False],
+        ["p90_delay_min", "pct_over_5_min_late", "bucket_count"],
+        ascending=[False, False, False],
     ).head(limit)
 
 
 def rank_early_stops(stop_metrics: pd.DataFrame, *, limit: int = 20) -> pd.DataFrame:
     return stop_metrics.sort_values(
-        ["avg_delay_min", "obs_count"],
-        ascending=[True, False],
+        ["p90_early_min_abs", "pct_over_3_min_early", "bucket_count"],
+        ascending=[False, False, False],
     ).head(limit)
 
 
@@ -325,13 +309,18 @@ def _empty_prepared_frame() -> pd.DataFrame:
             "next_stop_point_ref",
             "next_stop_point_name",
             "delay_min",
+            "raw_poll_count",
+            "representative_time_utc",
+            "bucket_mode",
             "stop_id",
             "local_time",
             "local_date",
             "local_hour",
             "local_minute_of_day",
+            "local_minutes",
             "local_weekday",
             "is_weekday",
+            "day_type",
             "gtfs_stop_name",
             "stop_lat",
             "stop_lon",
@@ -348,11 +337,20 @@ def _empty_metric_frame(group_columns: list[str]) -> pd.DataFrame:
     return pd.DataFrame(
         columns=[
             *group_columns,
-            "obs_count",
+            "bucket_count",
+            "raw_poll_count",
             "line_count",
-            "avg_delay_min",
+            "signed_mean_delay_min",
             "median_delay_min",
-            "pct_late",
+            "p75_delay_min",
+            "p90_delay_min",
+            "p95_delay_min",
             "pct_over_3_min_late",
+            "pct_over_5_min_late",
+            "pct_early",
+            "pct_over_1_min_early",
+            "pct_over_3_min_early",
+            "median_early_min_abs",
+            "p90_early_min_abs",
         ]
     )

@@ -41,7 +41,7 @@ class StopMarkerMapTests(unittest.TestCase):
         self.assertEqual(extent, 4.5)
 
     def test_stop_marker_caption_mentions_time_filter(self) -> None:
-        caption = stop_marker_caption(sample_stop_metrics(), "avg_delay_min")
+        caption = stop_marker_caption(sample_stop_metrics(), "p90_delay_min")
 
         self.assertIn("date, line, direction, day, and time filters", caption)
 
@@ -67,7 +67,7 @@ class StopMarkerMapTests(unittest.TestCase):
         self.assertLess(sizes[1], sizes[2])
 
     def test_make_stop_map_uses_visible_dark_marker_layer(self) -> None:
-        fig = make_stop_map(sample_stop_metrics(), "avg_delay_min", delay_extent=5.0)
+        fig = make_stop_map(sample_stop_metrics(), "p90_delay_min", delay_extent=5.0)
 
         self.assertEqual(fig.layout.mapbox.style, "carto-darkmatter")
         self.assertEqual(len(fig.data), 2)
@@ -75,7 +75,7 @@ class StopMarkerMapTests(unittest.TestCase):
         halo_trace, marker_trace = fig.data
         self.assertEqual(halo_trace.hoverinfo, "skip")
         self.assertEqual(halo_trace.marker.color, "rgba(6, 9, 15, 0.95)")
-        self.assertEqual(marker_trace.marker.colorbar.title.text, "Delay (min)")
+        self.assertEqual(marker_trace.marker.colorbar.title.text, "P90 delay (min)")
         self.assertEqual(marker_trace.marker.cmin, -5.0)
         self.assertEqual(marker_trace.marker.cmax, 5.0)
         self.assertNotEqual(
@@ -86,11 +86,13 @@ class StopMarkerMapTests(unittest.TestCase):
         self.assertEqual(len(marker_trace.lat), 3)
         self.assertEqual(len(halo_trace.lat), len(marker_trace.lat))
         self.assertIn("Stop ID", marker_trace.hovertemplate)
-        self.assertIn("Observations", marker_trace.hovertemplate)
-        self.assertIn("Average delay (min)", marker_trace.hovertemplate)
+        self.assertIn("Buckets", marker_trace.hovertemplate)
+        self.assertIn("Raw polls", marker_trace.hovertemplate)
         self.assertIn("Median delay (min)", marker_trace.hovertemplate)
-        self.assertIn("Late observations (%)", marker_trace.hovertemplate)
+        self.assertIn("P90 delay (min)", marker_trace.hovertemplate)
         self.assertIn("Over 3 min late (%)", marker_trace.hovertemplate)
+        self.assertIn("Over 5 min late (%)", marker_trace.hovertemplate)
+        self.assertIn("Over 3 min early (%)", marker_trace.hovertemplate)
         self.assertIn("Lines", marker_trace.hovertemplate)
 
     def test_make_hourly_heatmap_applies_delay_extent(self) -> None:
@@ -99,12 +101,12 @@ class StopMarkerMapTests(unittest.TestCase):
                 "line_ref": ["1", "1"],
                 "local_hour": [8, 9],
                 "line_name": ["1", "1"],
-                "obs_count": [30, 40],
-                "avg_delay_min": [-0.5, 0.75],
+                "bucket_count": [30, 40],
+                "p90_delay_min": [-0.5, 0.75],
             }
         )
 
-        fig = make_hourly_heatmap(hourly, "avg_delay_min", delay_extent=2.0)
+        fig = make_hourly_heatmap(hourly, "p90_delay_min", delay_extent=2.0)
 
         heatmap = fig.data[0]
         self.assertEqual(heatmap.zmin, -2.0)
@@ -145,7 +147,7 @@ class StopHeatmapScaleTests(unittest.TestCase):
     def test_make_stop_heatmap_applies_color_axis_max(self) -> None:
         fig = make_stop_heatmap(
             sample_stop_metrics(),
-            "avg_delay_min",
+            "p90_delay_min",
             delay_direction="late",
             max_intensity=20.0,
         )

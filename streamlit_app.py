@@ -48,10 +48,18 @@ STOP_MARKER_MIN_SIZE = 9.0
 STOP_MARKER_MAX_SIZE = 30.0
 STOP_MARKER_HALO_PADDING = 5.0
 STOP_MARKER_COLORBAR_TITLES = {
-    "avg_delay_min": "Delay (min)",
-    "pct_late": "Late (%)",
+    "p90_delay_min": "P90 delay (min)",
+    "median_delay_min": "Median delay (min)",
+    "p75_delay_min": "P75 delay (min)",
+    "p95_delay_min": "P95 delay (min)",
+    "signed_mean_delay_min": "Signed mean (min)",
     "pct_over_3_min_late": ">3 min late (%)",
-    "obs_count": "Observations",
+    "pct_over_5_min_late": ">5 min late (%)",
+    "pct_early": "Early (%)",
+    "pct_over_1_min_early": ">1 min early (%)",
+    "pct_over_3_min_early": ">3 min early (%)",
+    "bucket_count": "Buckets",
+    "raw_poll_count": "Raw polls",
 }
 HEATMAP_SCALE_AUTO = "Auto"
 HEATMAP_SCALE_MANUAL = "Manual maximum"
@@ -122,15 +130,16 @@ def make_hourly_heatmap(
     *,
     delay_extent: float | None = None,
 ) -> go.Figure:
+    count_key = "bucket_count" if "bucket_count" in hourly.columns else "obs_count"
     order = hourly.groupby("line_ref").agg(
         sort_metric=(metric_key, "mean"),
-        total_obs=("obs_count", "sum"),
+        total_buckets=(count_key, "sum"),
     )
-    if metric_key == "obs_count":
-        ordered_lines = order.sort_values("total_obs", ascending=False).index
+    if metric_key in ("bucket_count", "raw_poll_count", "obs_count"):
+        ordered_lines = order.sort_values("total_buckets", ascending=False).index
     else:
         ordered_lines = order.sort_values(
-            ["sort_metric", "total_obs"],
+            ["sort_metric", "total_buckets"],
             ascending=[False, False],
         ).index
 
@@ -139,7 +148,7 @@ def make_hourly_heatmap(
         .reindex(index=ordered_lines, columns=range(24))
     )
     counts = (
-        hourly.pivot(index="line_ref", columns="local_hour", values="obs_count")
+        hourly.pivot(index="line_ref", columns="local_hour", values=count_key)
         .reindex(index=ordered_lines, columns=range(24))
     )
 
@@ -157,7 +166,7 @@ def make_hourly_heatmap(
             "Line %{y}<br>"
             "Hour %{x}<br>"
             f"{colorbar_title}: %{{z:.2f}}<br>"
-            "Observations: %{customdata:.0f}"
+            "Buckets: %{customdata:.0f}"
             "<extra></extra>"
         ),
     }
@@ -210,15 +219,16 @@ def stop_marker_colorbar_title(metric_key: str) -> str:
 
 
 def stop_marker_caption(map_df: object, metric_key: str) -> str:
-    observations = int(pd.to_numeric(map_df["obs_count"], errors="coerce").sum())
-    if metric_key == "avg_delay_min":
-        color_text = "Color shows average signed delay (blue = early, red = late)."
+    buckets = int(pd.to_numeric(map_df["bucket_count"], errors="coerce").sum())
+    raw_polls = int(pd.to_numeric(map_df["raw_poll_count"], errors="coerce").sum())
+    if metric_key in DIVERGING_METRICS:
+        color_text = "Color shows signed delay (blue = early, red = late)."
     else:
         color_text = f"Color shows {metric_label(metric_key).lower()}."
     return (
         "Showing one aggregated marker per mapped GTFS stop "
-        f"({len(map_df):,} stops, {observations:,} observations). "
-        f"{color_text} Size shows observation count. "
+        f"({len(map_df):,} stops, {buckets:,} buckets from {raw_polls:,} raw polls). "
+        f"{color_text} Size shows bucket count. "
         "Stop markers use the selected date, line, direction, day, and time filters."
     )
 
@@ -234,7 +244,7 @@ def make_stop_map(
         "lat": float(map_df["stop_lat"].mean()),
         "lon": float(map_df["stop_lon"].mean()),
     }
-    marker_sizes = scale_stop_marker_sizes(map_df["obs_count"])
+    marker_sizes = scale_stop_marker_sizes(map_df["bucket_count"])
     halo_sizes = [size + STOP_MARKER_HALO_PADDING for size in marker_sizes]
     color_values = pd.to_numeric(map_df[metric_key], errors="coerce")
     colorbar_title = stop_marker_colorbar_title(metric_key)
@@ -267,12 +277,14 @@ def make_stop_map(
     customdata = map_df[
         [
             "stop_id",
-            "obs_count",
+            "bucket_count",
+            "raw_poll_count",
             "line_count",
-            "avg_delay_min",
             "median_delay_min",
-            "pct_late",
+            "p90_delay_min",
             "pct_over_3_min_late",
+            "pct_over_5_min_late",
+            "pct_over_3_min_early",
         ]
     ].to_numpy()
     fig = go.Figure()
@@ -301,12 +313,14 @@ def make_stop_map(
             hovertemplate=(
                 "<b>%{text}</b><br>"
                 "Stop ID: %{customdata[0]}<br>"
-                "Observations: %{customdata[1]:,.0f}<br>"
-                "Lines: %{customdata[2]:,.0f}<br>"
-                "Average delay (min): %{customdata[3]:.2f}<br>"
+                "Buckets: %{customdata[1]:,.0f}<br>"
+                "Raw polls: %{customdata[2]:,.0f}<br>"
+                "Lines: %{customdata[3]:,.0f}<br>"
                 "Median delay (min): %{customdata[4]:.2f}<br>"
-                "Late observations (%): %{customdata[5]:.1f}<br>"
-                "Over 3 min late (%): %{customdata[6]:.1f}"
+                "P90 delay (min): %{customdata[5]:.2f}<br>"
+                "Over 3 min late (%): %{customdata[6]:.1f}<br>"
+                "Over 5 min late (%): %{customdata[7]:.1f}<br>"
+                "Over 3 min early (%): %{customdata[8]:.1f}"
                 "<extra></extra>"
             ),
             showlegend=False,
@@ -329,14 +343,16 @@ def make_stop_map(
 
 
 def heatmap_weight_label(metric_key: str, delay_direction: str = "late") -> str:
-    if metric_key == "avg_delay_min":
+    if metric_key in DIVERGING_METRICS:
         if delay_direction == "early":
             return "Early-running intensity"
         return "Late delay intensity"
-    if metric_key == "pct_late":
-        return "Estimated late observations"
     if metric_key == "pct_over_3_min_late":
         return "Estimated >3 min late observations"
+    if metric_key == "pct_over_5_min_late":
+        return "Estimated >5 min late buckets"
+    if metric_key.startswith("pct_"):
+        return f"Estimated {metric_label(metric_key).lower()}"
     return metric_label(metric_key)
 
 
@@ -411,11 +427,13 @@ def make_stop_heatmap(
         hover_name="stop_name",
         hover_data={
             "stop_id": True,
-            "avg_delay_min": ":.2f",
             "median_delay_min": ":.2f",
-            "pct_late": ":.1f",
+            "p90_delay_min": ":.2f",
             "pct_over_3_min_late": ":.1f",
-            "obs_count": True,
+            "pct_over_5_min_late": ":.1f",
+            "pct_over_3_min_early": ":.1f",
+            "bucket_count": True,
+            "raw_poll_count": True,
             "line_count": True,
             "heat_weight": ":.2f",
             "stop_lat": False,
@@ -445,29 +463,40 @@ def table_columns(df):
     columns = [
         "stop_id",
         "stop_name",
-        "obs_count",
+        "bucket_count",
+        "raw_poll_count",
         "line_count",
-        "avg_delay_min",
         "median_delay_min",
-        "pct_late",
+        "p90_delay_min",
         "pct_over_3_min_late",
+        "pct_over_5_min_late",
+        "pct_over_3_min_early",
     ]
     return df[columns].rename(
         columns={
             "stop_id": "Stop ID",
             "stop_name": "Stop",
-            "obs_count": "Observations",
+            "bucket_count": "Buckets",
+            "raw_poll_count": "Raw polls",
             "line_count": "Lines",
-            "avg_delay_min": "Avg delay (min)",
             "median_delay_min": "Median delay (min)",
-            "pct_late": "Late (%)",
+            "p90_delay_min": "P90 delay (min)",
             "pct_over_3_min_late": "Over 3 min late (%)",
+            "pct_over_5_min_late": "Over 5 min late (%)",
+            "pct_over_3_min_early": "Over 3 min early (%)",
         }
     )
 
 
 def main() -> None:
     st.title("Föli Bus Lateness")
+    st.info(
+        "Data caveats: SIRI VM delay is estimated vehicle state, not actual "
+        "arrival truth. The dashboard uses conservative quality filtering and "
+        "trip-stop buckets by default so repeated 30-second polls do not dominate "
+        "the metrics. Treat extreme, stale, pre-trip, and post-trip values as "
+        "diagnostic data before drawing operational conclusions."
+    )
 
     gtfs_dir = latest_gtfs_dir()
     if gtfs_dir is None:
@@ -577,11 +606,11 @@ def main() -> None:
 
     summary = summarize_observations(filtered)
     col1, col2, col3, col4, col5 = st.columns(5)
-    col1.metric("Observations", f"{summary['obs_count']:,}")
+    col1.metric("Buckets", f"{summary['bucket_count']:,}")
     col2.metric("Lines", f"{summary['line_count']:,}")
     col3.metric("Stops", f"{summary['stop_count']:,}")
-    col4.metric("Avg delay", f"{summary['avg_delay_min']:.2f} min")
-    col5.metric("Late", f"{summary['pct_late']:.1f}%")
+    col4.metric("Median delay", f"{summary['median_delay_min']:.2f} min")
+    col5.metric(">5 min late", f"{summary['pct_over_5_min_late']:.1f}%")
 
     hourly = build_hourly_line_metrics(
         heatmap_filtered,
@@ -681,7 +710,7 @@ def main() -> None:
                         "No mapped stops in the selected time range meet the "
                         "minimum observation threshold."
                     )
-                elif metric_key == "avg_delay_min":
+                elif metric_key in DIVERGING_METRICS:
                     late_heatmap_tab, early_heatmap_tab = st.tabs(
                         ["Late heatmap", "Early heatmap"]
                     )

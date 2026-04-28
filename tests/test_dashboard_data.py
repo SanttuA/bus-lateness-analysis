@@ -54,12 +54,21 @@ def sample_stop_metrics() -> pd.DataFrame:
             "stop_name": ["Late stop", "Early stop", "Zero stop", "Missing stop"],
             "stop_lat": [60.45, 60.43, 60.41, None],
             "stop_lon": [22.27, 22.22, 22.20, 22.25],
-            "obs_count": [10, 5, 4, 8],
+            "bucket_count": [10, 5, 4, 8],
+            "raw_poll_count": [25, 15, 4, 20],
             "line_count": [2, 1, 1, 3],
-            "avg_delay_min": [2.0, -3.0, 0.0, 4.0],
+            "signed_mean_delay_min": [2.0, -3.0, 0.0, 4.0],
             "median_delay_min": [1.5, -2.0, 0.0, 3.0],
-            "pct_late": [40.0, 50.0, 0.0, 75.0],
+            "p75_delay_min": [1.8, -1.0, 0.0, 3.5],
+            "p90_delay_min": [2.0, -3.0, 0.0, 4.0],
+            "p95_delay_min": [2.2, -3.5, 0.0, 4.5],
             "pct_over_3_min_late": [20.0, 0.0, 0.0, 50.0],
+            "pct_over_5_min_late": [10.0, 0.0, 0.0, 25.0],
+            "pct_early": [0.0, 80.0, 0.0, 0.0],
+            "pct_over_1_min_early": [0.0, 60.0, 0.0, 0.0],
+            "pct_over_3_min_early": [0.0, 40.0, 0.0, 0.0],
+            "median_early_min_abs": [0.0, 2.0, 0.0, 0.0],
+            "p90_early_min_abs": [0.0, 3.0, 0.0, 0.0],
         }
     )
 
@@ -74,17 +83,18 @@ class DashboardDataTests(unittest.TestCase):
         self.assertEqual(prepared.loc[0, "stop_name"], "Keskusta")
         self.assertEqual(prepared.loc[0, "stop_lat"], 60.45)
         self.assertEqual(prepared.loc[0, "stop_lon"], 22.27)
+        self.assertEqual(prepared.loc[0, "raw_poll_count"], 3)
 
     def test_filter_observations_limits_inclusive_local_time_range(self) -> None:
         prepared = prepare_observations(sample_observations(), sample_stops())
 
         filtered = filter_observations(
             prepared,
-            start_time=time(11, 10),
-            end_time=time(11, 15),
+            start_time=time(11, 0),
+            end_time=time(11, 10),
         )
 
-        self.assertEqual(filtered["delay_seconds"].to_list(), [-120, 0])
+        self.assertEqual(filtered["delay_seconds"].to_list(), [0])
 
     def test_filter_observations_full_day_time_range_preserves_rows(self) -> None:
         prepared = prepare_observations(sample_observations(), sample_stops())
@@ -109,36 +119,39 @@ class DashboardDataTests(unittest.TestCase):
             end_time=time(11, 12),
         )
 
-        self.assertEqual(filtered["delay_seconds"].to_list(), [60, -120])
+        self.assertEqual(filtered["delay_seconds"].to_list(), [0])
 
     def test_stop_metrics_preserve_signed_delay_and_late_rates(self) -> None:
         prepared = prepare_observations(sample_observations(), sample_stops())
         metrics = build_stop_metrics(prepared, min_observations=1)
         stop_10 = metrics[metrics["stop_id"].astype(str) == "10"].iloc[0]
 
-        self.assertAlmostEqual(stop_10["avg_delay_min"], -1 / 3)
+        self.assertEqual(stop_10["bucket_count"], 1)
+        self.assertEqual(stop_10["raw_poll_count"], 3)
         self.assertAlmostEqual(stop_10["median_delay_min"], 0.0)
-        self.assertAlmostEqual(stop_10["pct_late"], 100 / 3)
+        self.assertAlmostEqual(stop_10["p90_delay_min"], 0.0)
         self.assertAlmostEqual(stop_10["pct_over_3_min_late"], 0.0)
 
     def test_min_observations_filters_hourly_groups(self) -> None:
         prepared = prepare_observations(sample_observations(), sample_stops())
-        metrics = build_hourly_line_metrics(prepared, min_observations=2)
+        metrics = build_hourly_line_metrics(prepared, min_observations=1)
 
-        self.assertEqual(metrics["line_ref"].astype(str).to_list(), ["3"])
-        self.assertEqual(metrics.loc[0, "obs_count"], 3)
+        self.assertEqual(set(metrics["line_ref"].astype(str)), {"3", "4"})
+        line_3 = metrics[metrics["line_ref"].astype(str) == "3"].iloc[0]
+        self.assertEqual(line_3["bucket_count"], 1)
+        self.assertEqual(line_3["raw_poll_count"], 3)
 
     def test_stop_heatmap_weights_split_late_and_early_average_delay(self) -> None:
         metrics = sample_stop_metrics()
 
         late = build_stop_heatmap_weights(
             metrics,
-            "avg_delay_min",
+            "p90_delay_min",
             delay_direction="late",
         )
         early = build_stop_heatmap_weights(
             metrics,
-            "avg_delay_min",
+            "p90_delay_min",
             delay_direction="early",
         )
 
@@ -148,13 +161,12 @@ class DashboardDataTests(unittest.TestCase):
         self.assertAlmostEqual(early.loc[0, "heat_weight"], 15.0)
 
     def test_stop_heatmap_weights_convert_late_rate_to_observation_count(self) -> None:
-        heat = build_stop_heatmap_weights(sample_stop_metrics(), "pct_late")
+        heat = build_stop_heatmap_weights(sample_stop_metrics(), "pct_over_5_min_late")
 
         weights = dict(zip(heat["stop_id"], heat["heat_weight"], strict=True))
 
-        self.assertEqual(set(weights), {"late", "early"})
-        self.assertAlmostEqual(weights["late"], 4.0)
-        self.assertAlmostEqual(weights["early"], 2.5)
+        self.assertEqual(set(weights), {"late"})
+        self.assertAlmostEqual(weights["late"], 1.0)
 
     def test_stop_heatmap_weights_remove_missing_coordinates_and_zero_heat(self) -> None:
         heat = build_stop_heatmap_weights(sample_stop_metrics(), "pct_over_3_min_late")

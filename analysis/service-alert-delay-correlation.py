@@ -7,40 +7,53 @@ from pathlib import Path
 import pandas as pd
 
 from _shared import (
-    DELAY_FILTER_SQL,
+    QUALIFIED_DELAY_FILTER_SQL,
+    add_bucket_arg,
     add_common_args,
+    add_quality_args,
+    add_timezone_arg,
+    aggregate_delay_buckets,
+    apply_quality_filter,
+    base_quality_query,
     connect_readonly_db,
     latest_gtfs_dir,
-    minutes,
     print_or_empty,
     read_sql,
     resolve_project_path,
     round_numeric,
+    summarize_delay_metrics,
     write_optional_csv,
 )
 
 
+ALERT_GROUP_COLUMNS = ["cause", "effect", "priority", "alert_scope"]
+MATCH_CONTEXT_COLUMNS = ["line_ref", "direction_ref", "local_hour", "day_type"]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Compare observed delays when service alerts are active vs inactive."
+        description="Compare alert-period delays with matched non-alert controls."
     )
     add_common_args(parser)
+    add_timezone_arg(parser)
+    add_quality_args(parser)
+    add_bucket_arg(parser)
     parser.add_argument(
         "--gtfs-dir",
         type=Path,
         help="GTFS directory containing routes.txt. Defaults to the newest data/gtfs/* directory.",
     )
     parser.add_argument(
-        "--scope",
-        choices=("both", "overall", "line"),
-        default="both",
-        help="Which table to print. Defaults to both.",
+        "--view",
+        choices=("grouped", "line", "both"),
+        default="grouped",
+        help="Print alert groups, alert groups by line, or both. Defaults to grouped.",
     )
     parser.add_argument(
         "--alert-kind",
         choices=("any", "route", "stop"),
-        default="route",
-        help="Which alert match to use for the active-alert flag. Defaults to route.",
+        default="any",
+        help="Which alert target scope to use. Defaults to any.",
     )
     parser.add_argument(
         "--line-ref",
@@ -82,22 +95,13 @@ def load_route_map(gtfs_dir_arg: Path | None) -> dict[str, str]:
 
 
 def load_observations(args: argparse.Namespace) -> pd.DataFrame:
-    where = DELAY_FILTER_SQL
+    where = QUALIFIED_DELAY_FILTER_SQL
     params: list[object] = []
     if args.line_ref:
-        where += " AND line_ref = ?"
+        where += " AND v.line_ref = ?"
         params.append(args.line_ref)
 
-    query = f"""
-    SELECT
-        recorded_at_utc,
-        line_ref,
-        published_line_name,
-        delay_seconds,
-        next_stop_point_ref
-    FROM vehicle_observations
-    WHERE {where}
-    """
+    query = base_quality_query(where=where)
     with connect_readonly_db(args.db) as con:
         return read_sql(con, query, params)
 
@@ -123,7 +127,7 @@ def load_alerts(args: argparse.Namespace) -> pd.DataFrame:
         return read_sql(con, query)
 
 
-def build_alert_intervals(
+def build_alert_targets(
     alerts: pd.DataFrame,
     route_map: dict[str, str],
     obs_start: pd.Timestamp,
@@ -131,14 +135,12 @@ def build_alert_intervals(
     *,
     include_routes: bool,
     include_stops: bool,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
     if alerts.empty:
-        empty_route = pd.DataFrame(columns=["line_ref", "start_utc", "end_utc"])
-        empty_stop = pd.DataFrame(columns=["stop_id", "start_utc", "end_utc"])
-        return empty_route, empty_stop
-
-    route_rows: list[dict[str, object]] = []
-    stop_rows: list[dict[str, object]] = []
+        return pd.DataFrame(
+            columns=[*ALERT_GROUP_COLUMNS, "target_ref", "start_utc", "end_utc"]
+        )
 
     for alert in alerts.itertuples(index=False):
         start = pd.to_datetime(alert.validity_start_utc, utc=True, errors="coerce")
@@ -150,211 +152,147 @@ def build_alert_intervals(
         if pd.isna(end):
             end = obs_end + pd.Timedelta(microseconds=1)
 
-        lines = set()
+        base = {
+            "cause": _clean_alert_value(alert.cause),
+            "effect": _clean_alert_value(alert.effect),
+            "priority": int(alert.priority) if not pd.isna(alert.priority) else -1,
+            "start_utc": start,
+            "end_utc": end,
+        }
+
         if include_routes:
+            lines = set()
             if alert.line_ref is not None and not pd.isna(alert.line_ref):
                 lines.add(str(alert.line_ref))
             for route_ref in json_list(alert.affected_routes_json):
                 lines.add(route_map.get(route_ref, route_ref))
+            for line_ref in lines:
+                rows.append({**base, "alert_scope": "route", "target_ref": line_ref})
 
-        stops = set(json_list(alert.affected_stops_json)) if include_stops else set()
+        if include_stops:
+            for stop_id in set(json_list(alert.affected_stops_json)):
+                rows.append({**base, "alert_scope": "stop", "target_ref": stop_id})
 
-        for line_ref in lines:
-            route_rows.append(
-                {
-                    "line_ref": line_ref,
-                    "start_utc": start,
-                    "end_utc": end,
-                    "source_alert_id": alert.source_alert_id,
-                    "cause": alert.cause,
-                    "effect": alert.effect,
-                    "priority": alert.priority,
-                }
-            )
-        for stop_id in stops:
-            stop_rows.append(
-                {
-                    "stop_id": stop_id,
-                    "start_utc": start,
-                    "end_utc": end,
-                    "source_alert_id": alert.source_alert_id,
-                    "cause": alert.cause,
-                    "effect": alert.effect,
-                    "priority": alert.priority,
-                }
-            )
-
-    route_intervals = collapse_intervals(pd.DataFrame(route_rows), "line_ref")
-    stop_intervals = collapse_intervals(pd.DataFrame(stop_rows), "stop_id")
-    return route_intervals, stop_intervals
+    if not rows:
+        return pd.DataFrame(
+            columns=[*ALERT_GROUP_COLUMNS, "target_ref", "start_utc", "end_utc"]
+        )
+    return pd.DataFrame(rows).drop_duplicates().reset_index(drop=True)
 
 
-def collapse_intervals(intervals: pd.DataFrame, key_column: str) -> pd.DataFrame:
+def mark_active_for_group(observations: pd.DataFrame, intervals: pd.DataFrame) -> pd.Series:
+    active = pd.Series(False, index=observations.index)
     if intervals.empty:
-        return pd.DataFrame(columns=[key_column, "start_utc", "end_utc"])
+        return active
 
-    intervals = intervals[[key_column, "start_utc", "end_utc"]].drop_duplicates()
-    intervals = intervals.sort_values([key_column, "start_utc", "end_utc"])
-    rows: list[dict[str, object]] = []
+    scope = intervals["alert_scope"].iloc[0]
+    if scope == "route":
+        observation_key = "line_ref"
+    else:
+        observation_key = "next_stop_point_ref"
 
-    for key, key_intervals in intervals.groupby(key_column):
-        current_start: pd.Timestamp | None = None
-        current_end: pd.Timestamp | None = None
-
-        for interval in key_intervals.itertuples(index=False):
-            start = interval.start_utc
-            end = interval.end_utc
-            if current_start is None:
-                current_start = start
-                current_end = end
-                continue
-            if start <= current_end:
-                current_end = max(current_end, end)
-                continue
-
-            rows.append(
-                {
-                    key_column: key,
-                    "start_utc": current_start,
-                    "end_utc": current_end,
-                }
-            )
-            current_start = start
-            current_end = end
-
-        if current_start is not None:
-            rows.append(
-                {
-                    key_column: key,
-                    "start_utc": current_start,
-                    "end_utc": current_end,
-                }
-            )
-
-    return pd.DataFrame(rows)
-
-
-def mark_active_intervals(
-    observations: pd.DataFrame,
-    intervals: pd.DataFrame,
-    observation_key: str,
-    interval_key: str,
-    output_column: str,
-) -> pd.DataFrame:
-    result = observations.copy()
-    result[output_column] = False
-    if intervals.empty:
-        return result
-
-    result[observation_key] = result[observation_key].astype("string")
+    obs_keys = observations[observation_key].astype("string")
+    obs_times = pd.to_datetime(
+        observations["representative_time_utc"],
+        utc=True,
+        errors="coerce",
+    )
     intervals = intervals.copy()
-    intervals[interval_key] = intervals[interval_key].astype("string")
+    intervals["target_ref"] = intervals["target_ref"].astype("string")
 
-    for key, key_intervals in intervals.groupby(interval_key):
-        key_mask = result[observation_key] == key
+    for target_ref, target_intervals in intervals.groupby("target_ref"):
+        key_mask = obs_keys == target_ref
         if not key_mask.any():
             continue
-        times = result.loc[key_mask, "recorded_at_utc"]
-        active = pd.Series(False, index=times.index)
-        for interval in key_intervals.itertuples(index=False):
-            active |= (times >= interval.start_utc) & (times <= interval.end_utc)
-        result.loc[active.index, output_column] = active
+        target_times = obs_times[key_mask]
+        target_active = pd.Series(False, index=target_times.index)
+        for interval in target_intervals.itertuples(index=False):
+            target_active |= (target_times >= interval.start_utc) & (
+                target_times <= interval.end_utc
+            )
+        active.loc[target_active.index] |= target_active
 
-    return result
+    return active
+
+
+def matched_control_rows(
+    observations: pd.DataFrame,
+    active_mask: pd.Series,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    active = observations[active_mask].copy()
+    if active.empty:
+        return active, pd.DataFrame(columns=observations.columns)
+
+    contexts = active[MATCH_CONTEXT_COLUMNS].drop_duplicates()
+    controls = observations[~active_mask].merge(
+        contexts,
+        how="inner",
+        on=MATCH_CONTEXT_COLUMNS,
+    )
+    return active, controls
 
 
 def summarize_alert_lift(
-    df: pd.DataFrame,
-    group_keys: list[str],
+    active: pd.DataFrame,
+    controls: pd.DataFrame,
+    *,
     min_observations: int,
-    limit: int | None = None,
+    group_keys: list[str] | None = None,
 ) -> pd.DataFrame:
-    result_group_keys = group_keys
-    working = df
-    if not group_keys:
-        working = df.copy()
-        working["_scope"] = "overall"
-        group_keys = ["_scope"]
-
-    extra_agg = {}
-    if "line_ref" in result_group_keys:
-        extra_agg["line_name"] = ("published_line_name", "first")
-
-    grouped = working.groupby(group_keys + ["active_alert"], as_index=False).agg(
-        obs_count=("delay_seconds", "size"),
-        avg_delay_min=("delay_seconds", lambda s: minutes(s).mean()),
-        median_delay_min=("delay_seconds", lambda s: minutes(s).median()),
-        pct_late=("delay_seconds", lambda s: (s > 0).mean() * 100.0),
-        pct_over_3_min_late=("delay_seconds", lambda s: (s > 180).mean() * 100.0),
-        pct_route_alert=("active_route_alert", lambda s: s.mean() * 100.0),
-        pct_stop_alert=("active_stop_alert", lambda s: s.mean() * 100.0),
-        **extra_agg,
+    group_keys = group_keys or []
+    active_metrics = summarize_delay_metrics(
+        active,
+        group_keys,
+        min_observations=min_observations,
+        extra_aggs={"line_name": ("published_line_name", "first")}
+        if "line_ref" in group_keys
+        else None,
     )
-    if grouped.empty or not {True, False}.issubset(set(grouped["active_alert"])):
+    control_metrics = summarize_delay_metrics(
+        controls,
+        group_keys,
+        min_observations=min_observations,
+        extra_aggs={"line_name": ("published_line_name", "first")}
+        if "line_ref" in group_keys
+        else None,
+    )
+    if active_metrics.empty or control_metrics.empty:
         return pd.DataFrame()
 
-    active = grouped[grouped["active_alert"]].drop(columns=["active_alert"])
-    inactive = grouped[~grouped["active_alert"]].drop(columns=["active_alert"])
-    result = inactive.merge(
-        active,
-        how="inner",
-        on=group_keys,
-        suffixes=("_no_alert", "_alert"),
-    )
-    result = result[
-        (result["obs_count_no_alert"] >= min_observations)
-        & (result["obs_count_alert"] >= min_observations)
-    ]
+    if group_keys:
+        result = control_metrics.merge(
+            active_metrics,
+            how="inner",
+            on=group_keys,
+            suffixes=("_control", "_alert"),
+        )
+    else:
+        result = pd.concat(
+            [
+                control_metrics.add_suffix("_control"),
+                active_metrics.add_suffix("_alert"),
+            ],
+            axis=1,
+        )
     if result.empty:
         return result
 
-    result["delay_lift_min"] = (
-        result["avg_delay_min_alert"] - result["avg_delay_min_no_alert"]
-    )
-    result["late_pct_point_lift"] = (
-        result["pct_late_alert"] - result["pct_late_no_alert"]
-    )
-    result["over_3_min_late_pct_point_lift"] = (
-        result["pct_over_3_min_late_alert"] - result["pct_over_3_min_late_no_alert"]
-    )
-
-    if "line_name_no_alert" in result.columns:
+    if "line_name_control" in result.columns:
         result["line_name"] = result["line_name_alert"].combine_first(
-            result["line_name_no_alert"]
+            result["line_name_control"]
         )
-        result = result.drop(columns=["line_name_no_alert", "line_name_alert"])
+        result = result.drop(columns=["line_name_control", "line_name_alert"])
 
-    result = result.sort_values(
-        ["delay_lift_min", "obs_count_alert"],
-        ascending=[False, False],
+    result["median_delay_lift_min"] = (
+        result["median_delay_min_alert"] - result["median_delay_min_control"]
     )
-    if limit is not None:
-        result = result.head(limit)
-
-    if "_scope" in result.columns:
-        result = result.drop(columns=["_scope"])
-
-    ordered_columns = result_group_keys.copy()
-    if "line_name" in result.columns and "line_name" not in ordered_columns:
-        ordered_columns.append("line_name")
-    ordered_columns.extend(
-        [
-            "obs_count_no_alert",
-            "obs_count_alert",
-            "avg_delay_min_no_alert",
-            "avg_delay_min_alert",
-            "delay_lift_min",
-            "pct_late_no_alert",
-            "pct_late_alert",
-            "late_pct_point_lift",
-            "pct_over_3_min_late_no_alert",
-            "pct_over_3_min_late_alert",
-            "over_3_min_late_pct_point_lift",
-            "pct_route_alert_alert",
-            "pct_stop_alert_alert",
-        ]
+    result["p90_delay_lift_min"] = (
+        result["p90_delay_min_alert"] - result["p90_delay_min_control"]
     )
-    return round_numeric(result[ordered_columns])
+    result["over_5_min_late_pct_point_lift"] = (
+        result["pct_over_5_min_late_alert"] - result["pct_over_5_min_late_control"]
+    )
+    return result
 
 
 def build_correlation(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -362,90 +300,145 @@ def build_correlation(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFr
     if observations.empty:
         return pd.DataFrame(), pd.DataFrame()
 
-    observations["recorded_at_utc"] = pd.to_datetime(
-        observations["recorded_at_utc"],
-        utc=True,
-        errors="coerce",
+    observations = apply_quality_filter(
+        observations,
+        quality_mode=args.quality_mode,
+        exclude_stop_call_disagreement=args.exclude_stop_call_disagreement,
     )
-    observations = observations.dropna(subset=["recorded_at_utc"])
+    observations = aggregate_delay_buckets(
+        observations,
+        bucket=args.bucket,
+        timezone=args.timezone,
+    )
+    if observations.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
     observations["line_ref"] = observations["line_ref"].astype("string")
+    observations["direction_ref"] = observations["direction_ref"].astype("string")
     observations["next_stop_point_ref"] = observations["next_stop_point_ref"].astype("string")
 
     alerts = load_alerts(args)
     route_map = load_route_map(args.gtfs_dir)
     include_routes = args.alert_kind in ("route", "any")
     include_stops = args.alert_kind in ("stop", "any")
-    route_intervals, stop_intervals = build_alert_intervals(
+    targets = build_alert_targets(
         alerts,
         route_map,
-        observations["recorded_at_utc"].min(),
-        observations["recorded_at_utc"].max(),
+        observations["representative_time_utc"].min(),
+        observations["representative_time_utc"].max(),
         include_routes=include_routes,
         include_stops=include_stops,
     )
+    if targets.empty:
+        return pd.DataFrame(), pd.DataFrame()
 
-    if include_routes:
-        observations = mark_active_intervals(
-            observations,
-            route_intervals,
-            "line_ref",
-            "line_ref",
-            "active_route_alert",
+    grouped_rows: list[pd.DataFrame] = []
+    line_rows: list[pd.DataFrame] = []
+    for group_values, intervals in targets.groupby(ALERT_GROUP_COLUMNS, dropna=False):
+        active_mask = mark_active_for_group(observations, intervals)
+        active, controls = matched_control_rows(observations, active_mask)
+        if active.empty or controls.empty:
+            continue
+
+        group_data = dict(zip(ALERT_GROUP_COLUMNS, group_values, strict=True))
+        grouped = summarize_alert_lift(
+            active,
+            controls,
+            min_observations=args.min_observations,
         )
-    else:
-        observations["active_route_alert"] = False
+        if not grouped.empty:
+            for column, value in group_data.items():
+                grouped[column] = value
+            grouped_rows.append(grouped)
 
-    if include_stops:
-        observations = mark_active_intervals(
-            observations,
-            stop_intervals,
-            "next_stop_point_ref",
-            "stop_id",
-            "active_stop_alert",
+        by_line = summarize_alert_lift(
+            active,
+            controls,
+            min_observations=args.min_observations,
+            group_keys=["line_ref"],
         )
-    else:
-        observations["active_stop_alert"] = False
+        if not by_line.empty:
+            for column, value in group_data.items():
+                by_line[column] = value
+            line_rows.append(by_line)
 
-    if args.alert_kind == "route":
-        observations["active_alert"] = observations["active_route_alert"]
-    elif args.alert_kind == "stop":
-        observations["active_alert"] = observations["active_stop_alert"]
-    else:
-        observations["active_alert"] = (
-            observations["active_route_alert"] | observations["active_stop_alert"]
-        )
-
-    overall = summarize_alert_lift(observations, [], args.min_observations)
-    line = summarize_alert_lift(
-        observations,
-        ["line_ref"],
-        args.min_observations,
+    grouped_result = _format_alert_result(
+        pd.concat(grouped_rows, ignore_index=True) if grouped_rows else pd.DataFrame(),
         args.limit,
     )
-    return overall, line
+    line_result = _format_alert_result(
+        pd.concat(line_rows, ignore_index=True) if line_rows else pd.DataFrame(),
+        args.limit,
+        include_line=True,
+    )
+    return grouped_result, line_result
+
+
+def _format_alert_result(
+    df: pd.DataFrame,
+    limit: int,
+    *,
+    include_line: bool = False,
+) -> pd.DataFrame:
+    if df.empty:
+        return df
+    df = df.sort_values(
+        ["p90_delay_lift_min", "over_5_min_late_pct_point_lift", "bucket_count_alert"],
+        ascending=[False, False, False],
+    ).head(limit)
+
+    ordered = ALERT_GROUP_COLUMNS.copy()
+    if include_line:
+        ordered.extend(["line_ref", "line_name"])
+    ordered.extend(
+        [
+            "bucket_count_control",
+            "bucket_count_alert",
+            "raw_poll_count_control",
+            "raw_poll_count_alert",
+            "median_delay_min_control",
+            "median_delay_min_alert",
+            "median_delay_lift_min",
+            "p90_delay_min_control",
+            "p90_delay_min_alert",
+            "p90_delay_lift_min",
+            "pct_over_5_min_late_control",
+            "pct_over_5_min_late_alert",
+            "over_5_min_late_pct_point_lift",
+            "pct_over_3_min_early_control",
+            "pct_over_3_min_early_alert",
+        ]
+    )
+    return round_numeric(df[ordered])
+
+
+def _clean_alert_value(value: object) -> str:
+    if value is None or pd.isna(value) or str(value).strip() == "":
+        return "Unknown"
+    return str(value)
 
 
 def main() -> None:
     args = parse_args()
-    overall, line = build_correlation(args)
+    grouped, line = build_correlation(args)
 
     csv_frames: list[pd.DataFrame] = []
-    if args.scope in ("both", "overall"):
-        print("Overall alert correlation")
-        print_or_empty(overall)
+    if args.view in ("both", "grouped"):
+        print("Alert matched-control correlation")
+        print_or_empty(grouped)
         print()
-        if not overall.empty:
-            export = overall.copy()
-            export.insert(0, "scope", "overall")
+        if not grouped.empty:
+            export = grouped.copy()
+            export.insert(0, "view", "grouped")
             csv_frames.append(export)
 
-    if args.scope in ("both", "line"):
-        print("Line alert correlation")
+    if args.view in ("both", "line"):
+        print("Alert matched-control correlation by line")
         print_or_empty(line)
         print()
         if not line.empty:
             export = line.copy()
-            export.insert(0, "scope", "line")
+            export.insert(0, "view", "line")
             csv_frames.append(export)
 
     if args.output_csv:

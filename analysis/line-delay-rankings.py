@@ -5,95 +5,133 @@ import argparse
 import pandas as pd
 
 from _shared import (
-    DELAY_FILTER_SQL,
+    QUALIFIED_DELAY_FILTER_SQL,
+    add_bucket_arg,
     add_common_args,
+    add_quality_args,
+    add_timezone_arg,
+    aggregate_delay_buckets,
+    apply_quality_filter,
+    base_quality_query,
     connect_readonly_db,
-    minutes,
     print_or_empty,
     read_sql,
     round_numeric,
+    summarize_delay_metrics,
     write_optional_csv,
 )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Rank lines by late-only and early-only schedule inaccuracy."
+        description="Rank lines by robust late and early schedule inaccuracy."
     )
     add_common_args(parser)
+    add_timezone_arg(parser)
+    add_quality_args(parser)
+    add_bucket_arg(parser)
     parser.add_argument(
         "--ranking",
         choices=("both", "late", "early"),
         default="both",
         help="Which ranking to print. Defaults to both.",
     )
-    parser.set_defaults(limit=10, min_observations=1)
+    parser.set_defaults(limit=10, min_observations=30)
     return parser.parse_args()
 
 
 def load_observations(args: argparse.Namespace) -> pd.DataFrame:
-    query = f"""
-    SELECT
-        line_ref,
-        published_line_name,
-        delay_seconds
-    FROM vehicle_observations
-    WHERE {DELAY_FILTER_SQL}
-    """
+    query = base_quality_query(where=QUALIFIED_DELAY_FILTER_SQL)
     with connect_readonly_db(args.db) as con:
         return read_sql(con, query)
 
 
-def rank_late(df: pd.DataFrame, min_observations: int, limit: int) -> pd.DataFrame:
-    late = df[df["delay_seconds"] > 0].copy()
-    if late.empty:
-        return pd.DataFrame()
-
-    grouped = late.groupby("line_ref", as_index=False).agg(
-        line_name=("published_line_name", "first"),
-        late_obs_count=("delay_seconds", "size"),
-        avg_late_min=("delay_seconds", lambda s: minutes(s).mean()),
-        median_late_min=("delay_seconds", lambda s: minutes(s).median()),
-        max_late_min=("delay_seconds", lambda s: minutes(s).max()),
+def prepare_buckets(args: argparse.Namespace, df: pd.DataFrame) -> pd.DataFrame:
+    df = apply_quality_filter(
+        df,
+        quality_mode=args.quality_mode,
+        exclude_stop_call_disagreement=args.exclude_stop_call_disagreement,
     )
-    grouped = grouped[grouped["late_obs_count"] >= min_observations]
+    return aggregate_delay_buckets(df, bucket=args.bucket, timezone=args.timezone)
+
+
+def line_metrics(df: pd.DataFrame, min_observations: int) -> pd.DataFrame:
+    return summarize_delay_metrics(
+        df,
+        ["line_ref"],
+        min_observations=min_observations,
+        extra_aggs={"line_name": ("published_line_name", "first")},
+    )
+
+
+def rank_late(df: pd.DataFrame, min_observations: int, limit: int) -> pd.DataFrame:
+    grouped = line_metrics(df, min_observations)
+    if grouped.empty:
+        return grouped
     grouped = grouped.sort_values(
-        ["avg_late_min", "late_obs_count", "line_ref"],
-        ascending=[False, False, True],
+        ["p90_delay_min", "pct_over_5_min_late", "bucket_count", "line_ref"],
+        ascending=[False, False, False, True],
     ).head(limit)
-    return round_numeric(grouped)
+    return round_numeric(
+        grouped[
+            [
+                "line_ref",
+                "line_name",
+                "bucket_count",
+                "raw_poll_count",
+                "signed_mean_delay_min",
+                "median_delay_min",
+                "p75_delay_min",
+                "p90_delay_min",
+                "p95_delay_min",
+                "pct_over_3_min_late",
+                "pct_over_5_min_late",
+            ]
+        ]
+    )
 
 
 def rank_early(df: pd.DataFrame, min_observations: int, limit: int) -> pd.DataFrame:
-    early = df[df["delay_seconds"] < 0].copy()
-    if early.empty:
-        return pd.DataFrame()
-
-    early["early_seconds_abs"] = early["delay_seconds"].abs()
-    grouped = early.groupby("line_ref", as_index=False).agg(
-        line_name=("published_line_name", "first"),
-        early_obs_count=("early_seconds_abs", "size"),
-        avg_early_min=("early_seconds_abs", lambda s: minutes(s).mean()),
-        median_early_min=("early_seconds_abs", lambda s: minutes(s).median()),
-        max_early_min=("early_seconds_abs", lambda s: minutes(s).max()),
-    )
-    grouped = grouped[grouped["early_obs_count"] >= min_observations]
+    grouped = line_metrics(df, min_observations)
+    if grouped.empty:
+        return grouped
     grouped = grouped.sort_values(
-        ["avg_early_min", "early_obs_count", "line_ref"],
-        ascending=[False, False, True],
+        ["p90_early_min_abs", "pct_over_3_min_early", "bucket_count", "line_ref"],
+        ascending=[False, False, False, True],
     ).head(limit)
-    return round_numeric(grouped)
+    return round_numeric(
+        grouped[
+            [
+                "line_ref",
+                "line_name",
+                "bucket_count",
+                "raw_poll_count",
+                "signed_mean_delay_min",
+                "median_delay_min",
+                "pct_early",
+                "pct_over_1_min_early",
+                "pct_over_3_min_early",
+                "median_early_min_abs",
+                "p90_early_min_abs",
+            ]
+        ]
+    )
 
 
 def main() -> None:
     args = parse_args()
     df = load_observations(args)
+    buckets = prepare_buckets(args, df)
 
     outputs: list[tuple[str, pd.DataFrame]] = []
     if args.ranking in ("both", "late"):
-        outputs.append(("Most late lines", rank_late(df, args.min_observations, args.limit)))
+        outputs.append(
+            ("Most late lines", rank_late(buckets, args.min_observations, args.limit))
+        )
     if args.ranking in ("both", "early"):
-        outputs.append(("Most early lines", rank_early(df, args.min_observations, args.limit)))
+        outputs.append(
+            ("Most early lines", rank_early(buckets, args.min_observations, args.limit))
+        )
 
     csv_frames: list[pd.DataFrame] = []
     for title, table in outputs:

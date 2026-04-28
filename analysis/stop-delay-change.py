@@ -6,16 +6,21 @@ from pathlib import Path
 import pandas as pd
 
 from _shared import (
-    DELAY_FILTER_SQL,
+    QUALIFIED_DELAY_FILTER_SQL,
+    add_bucket_arg,
     add_common_args,
+    add_quality_args,
     add_timezone_arg,
+    aggregate_delay_buckets,
+    apply_quality_filter,
+    base_quality_query,
     connect_readonly_db,
     latest_gtfs_dir,
-    minutes,
     print_or_empty,
     read_sql,
     resolve_project_path,
     round_numeric,
+    summarize_delay_metrics,
     write_optional_csv,
 )
 
@@ -23,12 +28,14 @@ from _shared import (
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Compare delay changes by next stop, or by city part when a stop "
-            "to city-part CSV is provided."
+            "Compare robust delay changes by next stop, or by city part, using "
+            "explicit matched periods."
         )
     )
     add_common_args(parser)
     add_timezone_arg(parser)
+    add_quality_args(parser)
+    add_bucket_arg(parser)
     parser.add_argument(
         "--gtfs-dir",
         type=Path,
@@ -49,38 +56,40 @@ def parse_args() -> argparse.Namespace:
         "--sort-by",
         choices=("increase", "decrease", "absolute"),
         default="absolute",
-        help="How to rank delay changes. Defaults to absolute.",
+        help="How to rank p90 delay changes. Defaults to absolute.",
     )
     parser.add_argument(
         "--line-ref",
         help="Limit analysis to one line_ref, for example 3 or 10A.",
     )
+    parser.add_argument(
+        "--direction-ref",
+        help="Limit analysis to one direction_ref.",
+    )
     parser.add_argument("--baseline-start", help="Baseline period start timestamp.")
     parser.add_argument("--baseline-end", help="Baseline period end timestamp.")
     parser.add_argument("--comparison-start", help="Comparison period start timestamp.")
     parser.add_argument("--comparison-end", help="Comparison period end timestamp.")
+    parser.add_argument(
+        "--legacy-midpoint",
+        action="store_true",
+        help="Use the old automatic first-half vs second-half split when explicit periods are absent.",
+    )
     parser.set_defaults(limit=20, min_observations=30)
     return parser.parse_args()
 
 
 def load_observations(args: argparse.Namespace) -> pd.DataFrame:
-    where = f"{DELAY_FILTER_SQL} AND next_stop_point_ref IS NOT NULL"
+    where = f"{QUALIFIED_DELAY_FILTER_SQL} AND v.next_stop_point_ref IS NOT NULL"
     params: list[object] = []
     if args.line_ref:
-        where += " AND line_ref = ?"
+        where += " AND v.line_ref = ?"
         params.append(args.line_ref)
+    if args.direction_ref:
+        where += " AND v.direction_ref = ?"
+        params.append(args.direction_ref)
 
-    query = f"""
-    SELECT
-        recorded_at_utc,
-        line_ref,
-        published_line_name,
-        delay_seconds,
-        next_stop_point_ref,
-        next_stop_point_name
-    FROM vehicle_observations
-    WHERE {where}
-    """
+    query = base_quality_query(where=where)
     with connect_readonly_db(args.db) as con:
         return read_sql(con, query, params)
 
@@ -133,12 +142,12 @@ def add_period_column(df: pd.DataFrame, args: argparse.Namespace) -> tuple[pd.Da
         args.comparison_end,
     ]
     result = df.copy()
-    result["recorded_at_utc"] = pd.to_datetime(
-        result["recorded_at_utc"],
+    result["representative_time_utc"] = pd.to_datetime(
+        result["representative_time_utc"],
         utc=True,
         errors="coerce",
     )
-    result = result.dropna(subset=["recorded_at_utc"])
+    result = result.dropna(subset=["representative_time_utc"])
 
     if any(period_args):
         if not all(period_args):
@@ -150,24 +159,30 @@ def add_period_column(df: pd.DataFrame, args: argparse.Namespace) -> tuple[pd.Da
         baseline_end = parse_timestamp(args.baseline_end, args.timezone)
         comparison_start = parse_timestamp(args.comparison_start, args.timezone)
         comparison_end = parse_timestamp(args.comparison_end, args.timezone)
-    else:
-        start = result["recorded_at_utc"].min()
-        end = result["recorded_at_utc"].max()
+    elif args.legacy_midpoint:
+        start = result["representative_time_utc"].min()
+        end = result["representative_time_utc"].max()
         midpoint = start + ((end - start) / 2)
         baseline_start = start
         baseline_end = midpoint
         comparison_start = midpoint
         comparison_end = end + pd.Timedelta(microseconds=1)
+    else:
+        raise SystemExit(
+            "Stop-change analysis now requires explicit matched periods. Provide "
+            "--baseline-start, --baseline-end, --comparison-start, and "
+            "--comparison-end, or pass --legacy-midpoint for the old automatic split."
+        )
 
     result["period"] = pd.NA
     result.loc[
-        (result["recorded_at_utc"] >= baseline_start)
-        & (result["recorded_at_utc"] < baseline_end),
+        (result["representative_time_utc"] >= baseline_start)
+        & (result["representative_time_utc"] < baseline_end),
         "period",
     ] = "baseline"
     result.loc[
-        (result["recorded_at_utc"] >= comparison_start)
-        & (result["recorded_at_utc"] < comparison_end),
+        (result["representative_time_utc"] >= comparison_start)
+        & (result["representative_time_utc"] < comparison_end),
         "period",
     ] = "comparison"
     result = result.dropna(subset=["period"])
@@ -188,6 +203,8 @@ def enrich_stops(
     result["stop_id"] = result["next_stop_point_ref"].astype("string")
 
     if not stops.empty:
+        stops = stops.copy()
+        stops["stop_id"] = stops["stop_id"].astype("string")
         result = result.merge(stops, how="left", on="stop_id")
     else:
         result["gtfs_stop_name"] = pd.NA
@@ -206,19 +223,35 @@ def enrich_stops(
     return result
 
 
+def matched_context_rows(df: pd.DataFrame, group_keys: list[str]) -> pd.DataFrame:
+    context_keys = group_keys + ["line_ref", "direction_ref", "local_weekday", "local_hour"]
+    baseline_contexts = (
+        df[df["period"] == "baseline"][context_keys].drop_duplicates().reset_index(drop=True)
+    )
+    comparison_contexts = (
+        df[df["period"] == "comparison"][context_keys].drop_duplicates().reset_index(drop=True)
+    )
+    matched_contexts = baseline_contexts.merge(
+        comparison_contexts,
+        how="inner",
+        on=context_keys,
+    )
+    if matched_contexts.empty:
+        return pd.DataFrame(columns=df.columns)
+    return df.merge(matched_contexts, how="inner", on=context_keys)
+
+
 def summarize_period(df: pd.DataFrame, keys: list[str], prefix: str) -> pd.DataFrame:
     extra_agg: dict[str, tuple[str, str]] = {}
     for column in ("stop_name", "city_part", "stop_lat", "stop_lon"):
         if column in df.columns and column not in keys:
             extra_agg[column] = (column, "first")
 
-    grouped = df.groupby(keys, dropna=False, as_index=False).agg(
-        obs_count=("delay_seconds", "size"),
-        avg_delay_min=("delay_seconds", lambda s: minutes(s).mean()),
-        median_delay_min=("delay_seconds", lambda s: minutes(s).median()),
-        pct_late=("delay_seconds", lambda s: (s > 0).mean() * 100.0),
-        pct_over_3_min_late=("delay_seconds", lambda s: (s > 180).mean() * 100.0),
-        **extra_agg,
+    grouped = summarize_delay_metrics(
+        df,
+        keys,
+        min_observations=1,
+        extra_aggs=extra_agg,
     )
 
     metric_columns = {
@@ -230,6 +263,15 @@ def summarize_period(df: pd.DataFrame, keys: list[str], prefix: str) -> pd.DataF
 
 
 def build_stop_change(args: argparse.Namespace, df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
+    if df.empty:
+        return pd.DataFrame(), ""
+
+    df = apply_quality_filter(
+        df,
+        quality_mode=args.quality_mode,
+        exclude_stop_call_disagreement=args.exclude_stop_call_disagreement,
+    )
+    df = aggregate_delay_buckets(df, bucket=args.bucket, timezone=args.timezone)
     if df.empty:
         return pd.DataFrame(), ""
 
@@ -246,6 +288,10 @@ def build_stop_change(args: argparse.Namespace, df: pd.DataFrame) -> tuple[pd.Da
         keys = ["stop_id"]
 
     df, period_description = add_period_column(df, args)
+    df = matched_context_rows(df, keys)
+    if df.empty:
+        return pd.DataFrame(), period_description
+
     baseline = summarize_period(df[df["period"] == "baseline"], keys, "baseline")
     comparison = summarize_period(df[df["period"] == "comparison"], keys, "comparison")
     result = baseline.merge(comparison, how="inner", on=keys, suffixes=("", "_comparison"))
@@ -260,33 +306,37 @@ def build_stop_change(args: argparse.Namespace, df: pd.DataFrame) -> tuple[pd.Da
             result = result.drop(columns=[comparison_column])
 
     result = result[
-        (result["baseline_obs_count"] >= args.min_observations)
-        & (result["comparison_obs_count"] >= args.min_observations)
+        (result["baseline_bucket_count"] >= args.min_observations)
+        & (result["comparison_bucket_count"] >= args.min_observations)
     ]
     if result.empty:
         return result, period_description
 
-    result["delay_change_min"] = (
-        result["comparison_avg_delay_min"] - result["baseline_avg_delay_min"]
+    result["median_delay_change_min"] = (
+        result["comparison_median_delay_min"] - result["baseline_median_delay_min"]
     )
-    result["late_pct_point_change"] = (
-        result["comparison_pct_late"] - result["baseline_pct_late"]
+    result["p90_delay_change_min"] = (
+        result["comparison_p90_delay_min"] - result["baseline_p90_delay_min"]
+    )
+    result["over_5_min_late_pct_point_change"] = (
+        result["comparison_pct_over_5_min_late"]
+        - result["baseline_pct_over_5_min_late"]
     )
 
     if args.sort_by == "increase":
         result = result.sort_values(
-            ["delay_change_min", "comparison_obs_count"],
+            ["p90_delay_change_min", "comparison_bucket_count"],
             ascending=[False, False],
         )
     elif args.sort_by == "decrease":
         result = result.sort_values(
-            ["delay_change_min", "comparison_obs_count"],
+            ["p90_delay_change_min", "comparison_bucket_count"],
             ascending=[True, False],
         )
     else:
-        result = result.assign(abs_delay_change=result["delay_change_min"].abs())
+        result = result.assign(abs_delay_change=result["p90_delay_change_min"].abs())
         result = result.sort_values(
-            ["abs_delay_change", "comparison_obs_count"],
+            ["abs_delay_change", "comparison_bucket_count"],
             ascending=[False, False],
         ).drop(columns=["abs_delay_change"])
 
@@ -296,16 +346,21 @@ def build_stop_change(args: argparse.Namespace, df: pd.DataFrame) -> tuple[pd.Da
             ordered_columns.append(column)
     ordered_columns.extend(
         [
-            "baseline_obs_count",
-            "comparison_obs_count",
-            "baseline_avg_delay_min",
-            "comparison_avg_delay_min",
-            "delay_change_min",
-            "baseline_pct_late",
-            "comparison_pct_late",
-            "late_pct_point_change",
-            "baseline_pct_over_3_min_late",
-            "comparison_pct_over_3_min_late",
+            "baseline_bucket_count",
+            "comparison_bucket_count",
+            "baseline_raw_poll_count",
+            "comparison_raw_poll_count",
+            "baseline_median_delay_min",
+            "comparison_median_delay_min",
+            "median_delay_change_min",
+            "baseline_p90_delay_min",
+            "comparison_p90_delay_min",
+            "p90_delay_change_min",
+            "baseline_pct_over_5_min_late",
+            "comparison_pct_over_5_min_late",
+            "over_5_min_late_pct_point_change",
+            "baseline_pct_over_3_min_early",
+            "comparison_pct_over_3_min_early",
         ]
     )
     result = result[ordered_columns].head(args.limit)
