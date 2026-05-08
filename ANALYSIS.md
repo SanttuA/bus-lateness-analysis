@@ -18,6 +18,11 @@ buckets by default.
 - `--bucket trip-stop|vehicle-trip|line-hour|poll` controls pre-metric
   aggregation. `trip-stop` is the default and collapses repeated polls for the
   same vehicle trip and next stop.
+- Stop and route metadata use extracted GTFS directories named
+  `data/gtfs/gtfs_YYYY-MM-DD` by default. Each snapshot applies from that local
+  date until the next snapshot date. Use `--gtfs-dir` on GTFS-aware scripts to
+  force one directory for all rows, or `--gtfs-root` to point at another
+  date-aware snapshot root.
 
 ## Scripts
 

@@ -10,13 +10,15 @@ from _shared import (
     QUALIFIED_DELAY_FILTER_SQL,
     add_bucket_arg,
     add_common_args,
+    add_gtfs_args,
     add_quality_args,
     add_timezone_arg,
     aggregate_delay_buckets,
     apply_quality_filter,
     base_quality_query,
     connect_readonly_db,
-    latest_gtfs_dir,
+    gtfs_feed_date_for_timestamp,
+    load_gtfs_route_metadata,
     print_or_empty,
     read_sql,
     resolve_project_path,
@@ -38,11 +40,7 @@ def parse_args() -> argparse.Namespace:
     add_timezone_arg(parser)
     add_quality_args(parser)
     add_bucket_arg(parser)
-    parser.add_argument(
-        "--gtfs-dir",
-        type=Path,
-        help="GTFS directory containing routes.txt. Defaults to the newest data/gtfs/* directory.",
-    )
+    add_gtfs_args(parser, file_description="routes.txt")
     parser.add_argument(
         "--view",
         choices=("grouped", "line", "both"),
@@ -81,17 +79,44 @@ def json_list(value: object) -> list[str]:
     ]
 
 
-def load_route_map(gtfs_dir_arg: Path | None) -> dict[str, str]:
-    gtfs_dir = resolve_project_path(gtfs_dir_arg) if gtfs_dir_arg else latest_gtfs_dir()
-    if gtfs_dir is None:
-        return {}
+def load_route_metadata(gtfs_dir_arg: Path | None, gtfs_root_arg: Path) -> pd.DataFrame:
+    try:
+        return load_gtfs_route_metadata(
+            gtfs_dir=resolve_project_path(gtfs_dir_arg) if gtfs_dir_arg else None,
+            gtfs_root=resolve_project_path(gtfs_root_arg),
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
 
-    routes_path = gtfs_dir / "routes.txt"
-    if not routes_path.exists():
-        raise SystemExit(f"GTFS routes.txt not found: {routes_path}")
 
-    routes = pd.read_csv(routes_path, dtype={"route_id": "string", "route_short_name": "string"})
-    return dict(zip(routes["route_id"], routes["route_short_name"], strict=False))
+def resolve_route_short_name(
+    routes: pd.DataFrame,
+    route_ref: object,
+    timestamp: object,
+    timezone: str,
+) -> str:
+    route_ref_text = str(route_ref)
+    if routes.empty:
+        return route_ref_text
+
+    routes = routes.copy()
+    routes["route_id"] = routes["route_id"].astype("string")
+    routes["route_short_name"] = routes["route_short_name"].astype("string")
+    candidates = routes
+    if "gtfs_feed_date" in routes.columns:
+        feed_date = gtfs_feed_date_for_timestamp(
+            timestamp,
+            routes[["gtfs_feed_date"]].drop_duplicates().reset_index(drop=True),
+            timezone=timezone,
+        )
+        if pd.isna(feed_date):
+            return route_ref_text
+        candidates = routes[routes["gtfs_feed_date"] == feed_date]
+
+    matches = candidates[candidates["route_id"] == route_ref_text]
+    if matches.empty or pd.isna(matches["route_short_name"].iloc[0]):
+        return route_ref_text
+    return str(matches["route_short_name"].iloc[0])
 
 
 def load_observations(args: argparse.Namespace) -> pd.DataFrame:
@@ -129,12 +154,13 @@ def load_alerts(args: argparse.Namespace) -> pd.DataFrame:
 
 def build_alert_targets(
     alerts: pd.DataFrame,
-    route_map: dict[str, str],
+    routes: pd.DataFrame,
     obs_start: pd.Timestamp,
     obs_end: pd.Timestamp,
     *,
     include_routes: bool,
     include_stops: bool,
+    timezone: str,
 ) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
     if alerts.empty:
@@ -165,7 +191,7 @@ def build_alert_targets(
             if alert.line_ref is not None and not pd.isna(alert.line_ref):
                 lines.add(str(alert.line_ref))
             for route_ref in json_list(alert.affected_routes_json):
-                lines.add(route_map.get(route_ref, route_ref))
+                lines.add(resolve_route_short_name(routes, route_ref, start, timezone))
             for line_ref in lines:
                 rows.append({**base, "alert_scope": "route", "target_ref": line_ref})
 
@@ -318,16 +344,17 @@ def build_correlation(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFr
     observations["next_stop_point_ref"] = observations["next_stop_point_ref"].astype("string")
 
     alerts = load_alerts(args)
-    route_map = load_route_map(args.gtfs_dir)
+    routes = load_route_metadata(args.gtfs_dir, args.gtfs_root)
     include_routes = args.alert_kind in ("route", "any")
     include_stops = args.alert_kind in ("stop", "any")
     targets = build_alert_targets(
         alerts,
-        route_map,
+        routes,
         observations["representative_time_utc"].min(),
         observations["representative_time_utc"].max(),
         include_routes=include_routes,
         include_stops=include_stops,
+        timezone=args.timezone,
     )
     if targets.empty:
         return pd.DataFrame(), pd.DataFrame()

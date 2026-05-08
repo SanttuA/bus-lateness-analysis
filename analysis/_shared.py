@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import argparse
+from bisect import bisect_right
+from datetime import date
+import re
 import sqlite3
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -84,6 +87,8 @@ DELAY_METRIC_COLUMNS = [
     "p90_delay_min",
     "p95_delay_min",
 ]
+
+GTFS_DIR_PATTERN = re.compile(r"^gtfs_(\d{4}-\d{2}-\d{2})$")
 
 
 def add_common_args(parser: argparse.ArgumentParser) -> None:
@@ -175,6 +180,30 @@ def add_bucket_arg(
     )
 
 
+def add_gtfs_args(
+    parser: argparse.ArgumentParser,
+    *,
+    file_description: str,
+) -> None:
+    parser.add_argument(
+        "--gtfs-dir",
+        type=Path,
+        help=(
+            f"Single GTFS directory containing {file_description}. "
+            "Overrides date-aware --gtfs-root behavior."
+        ),
+    )
+    parser.add_argument(
+        "--gtfs-root",
+        type=Path,
+        default=DEFAULT_GTFS_ROOT,
+        help=(
+            "Root containing extracted gtfs_YYYY-MM-DD directories. Defaults to "
+            f"{DEFAULT_GTFS_ROOT}."
+        ),
+    )
+
+
 def resolve_db_path(path: Path) -> Path:
     db_path = path.expanduser()
     if not db_path.is_absolute():
@@ -185,8 +214,8 @@ def resolve_db_path(path: Path) -> Path:
     return db_path
 
 
-def resolve_project_path(path: Path) -> Path:
-    resolved = path.expanduser()
+def resolve_project_path(path: Path | str) -> Path:
+    resolved = Path(path).expanduser()
     if not resolved.is_absolute():
         resolved = PROJECT_ROOT / resolved
     return resolved.resolve()
@@ -205,6 +234,152 @@ def latest_gtfs_dir(root: Path = DEFAULT_GTFS_ROOT) -> Path | None:
     if not candidates:
         return None
     return max(candidates, key=lambda path: path.name)
+
+
+def parse_gtfs_feed_date(path: Path | str) -> date | None:
+    match = GTFS_DIR_PATTERN.match(Path(path).name)
+    if match is None:
+        return None
+    return date.fromisoformat(match.group(1))
+
+
+def discover_gtfs_feeds(
+    root: Path | str = DEFAULT_GTFS_ROOT,
+    *,
+    required_file: str | None = None,
+) -> pd.DataFrame:
+    gtfs_root = resolve_project_path(root)
+    if not gtfs_root.exists():
+        return pd.DataFrame(columns=["gtfs_feed_date", "gtfs_dir"])
+
+    rows: list[dict[str, object]] = []
+    for path in gtfs_root.iterdir():
+        feed_date = parse_gtfs_feed_date(path)
+        if feed_date is None or not path.is_dir():
+            continue
+        if required_file is not None and not (path / required_file).exists():
+            continue
+        rows.append({"gtfs_feed_date": feed_date, "gtfs_dir": path})
+    if not rows:
+        return pd.DataFrame(columns=["gtfs_feed_date", "gtfs_dir"])
+    return pd.DataFrame(rows).sort_values("gtfs_feed_date").reset_index(drop=True)
+
+
+def assign_gtfs_feed_dates(
+    df: pd.DataFrame,
+    feeds: pd.DataFrame,
+    *,
+    local_date_column: str = "local_date",
+) -> pd.Series:
+    assigned = pd.Series(pd.NA, index=df.index, dtype="object")
+    if df.empty or feeds.empty or local_date_column not in df.columns:
+        return assigned
+
+    feed_dates = sorted(
+        pd.to_datetime(feeds["gtfs_feed_date"], errors="coerce")
+        .dt.date.dropna()
+        .unique()
+        .tolist()
+    )
+    if not feed_dates:
+        return assigned
+
+    local_dates = pd.to_datetime(df[local_date_column], errors="coerce").dt.date
+
+    def assign_one(value: object) -> date | object:
+        if pd.isna(value):
+            return pd.NA
+        position = bisect_right(feed_dates, value) - 1
+        if position < 0:
+            return pd.NA
+        return feed_dates[position]
+
+    return local_dates.map(assign_one).astype("object")
+
+
+def gtfs_feed_date_for_timestamp(
+    timestamp: object,
+    feeds: pd.DataFrame,
+    *,
+    timezone: str = DEFAULT_TIMEZONE,
+) -> date | object:
+    if feeds.empty:
+        return pd.NA
+    parsed = pd.to_datetime(timestamp, utc=True, errors="coerce")
+    if pd.isna(parsed):
+        return pd.NA
+    local_date = parsed.tz_convert(ZoneInfo(timezone)).date()
+    row = pd.DataFrame({"local_date": [local_date]})
+    return assign_gtfs_feed_dates(row, feeds).iloc[0]
+
+
+def load_gtfs_stop_metadata(
+    *,
+    gtfs_dir: Path | str | None = None,
+    gtfs_root: Path | str = DEFAULT_GTFS_ROOT,
+) -> pd.DataFrame:
+    if gtfs_dir is not None:
+        stops = _load_one_gtfs_stop_metadata(resolve_project_path(gtfs_dir))
+        return stops
+
+    feeds = discover_gtfs_feeds(gtfs_root, required_file="stops.txt")
+    frames: list[pd.DataFrame] = []
+    for feed in feeds.itertuples(index=False):
+        stops = _load_one_gtfs_stop_metadata(feed.gtfs_dir)
+        stops.insert(0, "gtfs_feed_date", feed.gtfs_feed_date)
+        frames.append(stops)
+    if not frames:
+        return pd.DataFrame(
+            columns=["gtfs_feed_date", "stop_id", "gtfs_stop_name", "stop_lat", "stop_lon"]
+        )
+    return pd.concat(frames, ignore_index=True).drop_duplicates(
+        ["gtfs_feed_date", "stop_id"],
+        keep="first",
+    )
+
+
+def load_gtfs_route_metadata(
+    *,
+    gtfs_dir: Path | str | None = None,
+    gtfs_root: Path | str = DEFAULT_GTFS_ROOT,
+) -> pd.DataFrame:
+    if gtfs_dir is not None:
+        routes = _load_one_gtfs_route_metadata(resolve_project_path(gtfs_dir))
+        return routes
+
+    feeds = discover_gtfs_feeds(gtfs_root, required_file="routes.txt")
+    frames: list[pd.DataFrame] = []
+    for feed in feeds.itertuples(index=False):
+        routes = _load_one_gtfs_route_metadata(feed.gtfs_dir)
+        routes.insert(0, "gtfs_feed_date", feed.gtfs_feed_date)
+        frames.append(routes)
+    if not frames:
+        return pd.DataFrame(columns=["gtfs_feed_date", "route_id", "route_short_name"])
+    return pd.concat(frames, ignore_index=True).drop_duplicates(
+        ["gtfs_feed_date", "route_id"],
+        keep="first",
+    )
+
+
+def gtfs_metadata_fingerprint(
+    root: Path | str = DEFAULT_GTFS_ROOT,
+    *,
+    filenames: tuple[str, ...] = ("stops.txt", "routes.txt"),
+) -> str:
+    parts: list[str] = []
+    feeds = discover_gtfs_feeds(root)
+    for feed in feeds.itertuples(index=False):
+        for filename in filenames:
+            path = Path(feed.gtfs_dir) / filename
+            if not path.exists():
+                parts.append(f"{feed.gtfs_feed_date}|{filename}|missing")
+                continue
+            stat = path.stat()
+            parts.append(
+                f"{feed.gtfs_feed_date}|{filename}|{path.name}|"
+                f"{stat.st_mtime_ns}|{stat.st_size}"
+            )
+    return "||".join(parts)
 
 
 def connect_readonly_db(path: Path) -> sqlite3.Connection:
@@ -630,6 +805,45 @@ def _empty_bucket_frame() -> pd.DataFrame:
             "local_minutes",
         ]
     )
+
+
+def _load_one_gtfs_stop_metadata(gtfs_dir: Path) -> pd.DataFrame:
+    stops_path = gtfs_dir / "stops.txt"
+    if not stops_path.exists():
+        raise FileNotFoundError(f"GTFS stops.txt not found: {stops_path}")
+
+    stops = pd.read_csv(stops_path, dtype={"stop_id": "string"})
+    required = {"stop_id", "stop_name", "stop_lat", "stop_lon"}
+    missing = required.difference(stops.columns)
+    if missing:
+        missing_text = ", ".join(sorted(missing))
+        raise ValueError(f"{stops_path} is missing required column(s): {missing_text}")
+
+    stops = stops[["stop_id", "stop_name", "stop_lat", "stop_lon"]].copy()
+    stops["stop_id"] = stops["stop_id"].astype("string")
+    stops["stop_lat"] = pd.to_numeric(stops["stop_lat"], errors="coerce")
+    stops["stop_lon"] = pd.to_numeric(stops["stop_lon"], errors="coerce")
+    return stops.rename(columns={"stop_name": "gtfs_stop_name"})
+
+
+def _load_one_gtfs_route_metadata(gtfs_dir: Path) -> pd.DataFrame:
+    routes_path = gtfs_dir / "routes.txt"
+    if not routes_path.exists():
+        raise FileNotFoundError(f"GTFS routes.txt not found: {routes_path}")
+
+    routes = pd.read_csv(
+        routes_path,
+        dtype={"route_id": "string", "route_short_name": "string"},
+    )
+    required = {"route_id", "route_short_name"}
+    missing = required.difference(routes.columns)
+    if missing:
+        missing_text = ", ".join(sorted(missing))
+        raise ValueError(f"{routes_path} is missing required column(s): {missing_text}")
+    routes = routes[["route_id", "route_short_name"]].copy()
+    routes["route_id"] = routes["route_id"].astype("string")
+    routes["route_short_name"] = routes["route_short_name"].astype("string")
+    return routes
 
 
 def _empty_metric_frame(group_columns: list[str]) -> pd.DataFrame:

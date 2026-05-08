@@ -9,13 +9,15 @@ from _shared import (
     QUALIFIED_DELAY_FILTER_SQL,
     add_bucket_arg,
     add_common_args,
+    add_gtfs_args,
     add_quality_args,
     add_timezone_arg,
+    assign_gtfs_feed_dates,
     aggregate_delay_buckets,
     apply_quality_filter,
     base_quality_query,
     connect_readonly_db,
-    latest_gtfs_dir,
+    load_gtfs_stop_metadata,
     print_or_empty,
     read_sql,
     resolve_project_path,
@@ -36,11 +38,7 @@ def parse_args() -> argparse.Namespace:
     add_timezone_arg(parser)
     add_quality_args(parser)
     add_bucket_arg(parser)
-    parser.add_argument(
-        "--gtfs-dir",
-        type=Path,
-        help="GTFS directory containing stops.txt. Defaults to the newest data/gtfs/* directory.",
-    )
+    add_gtfs_args(parser, file_description="stops.txt")
     parser.add_argument(
         "--city-parts-csv",
         type=Path,
@@ -94,19 +92,14 @@ def load_observations(args: argparse.Namespace) -> pd.DataFrame:
         return read_sql(con, query, params)
 
 
-def load_stop_metadata(gtfs_dir_arg: Path | None) -> pd.DataFrame:
-    gtfs_dir = resolve_project_path(gtfs_dir_arg) if gtfs_dir_arg else latest_gtfs_dir()
-    if gtfs_dir is None:
-        return pd.DataFrame(columns=["stop_id", "gtfs_stop_name", "stop_lat", "stop_lon"])
-
-    stops_path = gtfs_dir / "stops.txt"
-    if not stops_path.exists():
-        raise SystemExit(f"GTFS stops.txt not found: {stops_path}")
-
-    stops = pd.read_csv(stops_path, dtype={"stop_id": "string"})
-    return stops[["stop_id", "stop_name", "stop_lat", "stop_lon"]].rename(
-        columns={"stop_name": "gtfs_stop_name"}
-    )
+def load_stop_metadata(gtfs_dir_arg: Path | None, gtfs_root_arg: Path) -> pd.DataFrame:
+    try:
+        return load_gtfs_stop_metadata(
+            gtfs_dir=resolve_project_path(gtfs_dir_arg) if gtfs_dir_arg else None,
+            gtfs_root=resolve_project_path(gtfs_root_arg),
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 def load_city_parts(path: Path | None) -> pd.DataFrame:
@@ -205,12 +198,24 @@ def enrich_stops(
     if not stops.empty:
         stops = stops.copy()
         stops["stop_id"] = stops["stop_id"].astype("string")
-        result = result.merge(stops, how="left", on="stop_id")
+        if "gtfs_feed_date" in stops.columns:
+            feeds = stops[["gtfs_feed_date"]].drop_duplicates().reset_index(drop=True)
+            result["gtfs_feed_date"] = assign_gtfs_feed_dates(result, feeds)
+            result = result.merge(
+                stops,
+                how="left",
+                on=["gtfs_feed_date", "stop_id"],
+            )
+        else:
+            result["gtfs_feed_date"] = pd.NA
+            result = result.merge(stops, how="left", on="stop_id")
     else:
+        result["gtfs_feed_date"] = pd.NA
         result["gtfs_stop_name"] = pd.NA
         result["stop_lat"] = pd.NA
         result["stop_lon"] = pd.NA
 
+    result["has_gtfs_stop_metadata"] = result["gtfs_stop_name"].notna()
     result["stop_name"] = result["gtfs_stop_name"].combine_first(
         result["next_stop_point_name"]
     )
@@ -275,7 +280,7 @@ def build_stop_change(args: argparse.Namespace, df: pd.DataFrame) -> tuple[pd.Da
     if df.empty:
         return pd.DataFrame(), ""
 
-    stops = load_stop_metadata(args.gtfs_dir)
+    stops = load_stop_metadata(args.gtfs_dir, args.gtfs_root)
     city_parts = load_city_parts(args.city_parts_csv)
     df = enrich_stops(df, stops, city_parts)
 
