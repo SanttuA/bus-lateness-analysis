@@ -184,6 +184,28 @@ class BucketAndMetricTests(unittest.TestCase):
 
 
 class MatchedAnalysisTests(unittest.TestCase):
+    def test_stop_change_requires_periods_before_database_load(self) -> None:
+        stop_change = load_script_module(
+            "stop_delay_change",
+            "analysis/stop-delay-change.py",
+        )
+
+        class Args:
+            db = PROJECT_ROOT / "does-not-exist.db"
+            timezone = "Europe/Helsinki"
+            line_ref = None
+            direction_ref = None
+            baseline_start = None
+            baseline_end = None
+            comparison_start = None
+            comparison_end = None
+            legacy_midpoint = False
+
+        with self.assertRaises(SystemExit) as raised:
+            stop_change.load_observations(Args)
+
+        self.assertIn("requires explicit matched periods", str(raised.exception))
+
     def test_stop_change_matches_same_line_direction_weekday_and_hour(self) -> None:
         stop_change = load_script_module(
             "stop_delay_change",
@@ -265,6 +287,26 @@ class MatchedAnalysisTests(unittest.TestCase):
 
         self.assertEqual(active["delay_seconds"].to_list(), [60])
         self.assertEqual(controls["delay_seconds"].to_list(), [120])
+
+    def test_alert_window_uses_explicit_start_and_end_without_database_lookup(self) -> None:
+        alerts = load_script_module(
+            "service_alert_delay_correlation",
+            "analysis/service-alert-delay-correlation.py",
+        )
+
+        class Args:
+            db = PROJECT_ROOT / "does-not-exist.db"
+            timezone = "Europe/Helsinki"
+            start = "2026-05-06"
+            end = "2026-05-08"
+            analysis_days = 2
+            full_history = False
+
+        start, end, description = alerts.resolve_analysis_window(Args)
+
+        self.assertEqual(start.isoformat(), "2026-05-05T21:00:00+00:00")
+        self.assertEqual(end.isoformat(), "2026-05-07T21:00:00+00:00")
+        self.assertIn("2026-05-05T21:00:00+00:00", description)
 
     def test_alert_targets_map_routes_by_gtfs_feed_date(self) -> None:
         alerts_module = load_script_module(

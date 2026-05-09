@@ -6,12 +6,14 @@ from pathlib import Path
 import pandas as pd
 
 from _shared import (
+    DEFAULT_GTFS_ROOT,
     QUALIFIED_DELAY_FILTER_SQL,
     add_bucket_arg,
     add_common_args,
     add_gtfs_args,
     add_quality_args,
     add_timezone_arg,
+    append_representative_time_filter,
     assign_gtfs_feed_dates,
     aggregate_delay_buckets,
     apply_quality_filter,
@@ -20,6 +22,7 @@ from _shared import (
     load_gtfs_stop_metadata,
     print_or_empty,
     read_sql,
+    representative_time_sql,
     resolve_project_path,
     round_numeric,
     summarize_delay_metrics,
@@ -86,6 +89,13 @@ def load_observations(args: argparse.Namespace) -> pd.DataFrame:
     if args.direction_ref:
         where += " AND v.direction_ref = ?"
         params.append(args.direction_ref)
+    window_start, window_end = explicit_period_load_window(args)
+    where = append_representative_time_filter(
+        where,
+        params,
+        start_utc=window_start,
+        end_utc=window_end,
+    )
 
     query = base_quality_query(where=where)
     with connect_readonly_db(args.db) as con:
@@ -127,6 +137,78 @@ def parse_timestamp(value: str, timezone: str) -> pd.Timestamp:
     return timestamp.tz_convert("UTC")
 
 
+def _missing_period_message() -> str:
+    return (
+        "Stop-change analysis now requires explicit matched periods. Provide "
+        "--baseline-start, --baseline-end, --comparison-start, and "
+        "--comparison-end, or pass --legacy-midpoint for the old automatic split."
+    )
+
+
+def explicit_period_load_window(
+    args: argparse.Namespace,
+) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
+    period_args = [
+        args.baseline_start,
+        args.baseline_end,
+        args.comparison_start,
+        args.comparison_end,
+    ]
+    if any(period_args):
+        if not all(period_args):
+            raise SystemExit(
+                "Provide all four period arguments: --baseline-start, --baseline-end, "
+                "--comparison-start, and --comparison-end."
+            )
+        baseline_start = parse_timestamp(args.baseline_start, args.timezone)
+        baseline_end = parse_timestamp(args.baseline_end, args.timezone)
+        comparison_start = parse_timestamp(args.comparison_start, args.timezone)
+        comparison_end = parse_timestamp(args.comparison_end, args.timezone)
+        if baseline_start >= baseline_end:
+            raise SystemExit("Baseline period start must be before baseline period end.")
+        if comparison_start >= comparison_end:
+            raise SystemExit("Comparison period start must be before comparison period end.")
+        return min(baseline_start, comparison_start), max(baseline_end, comparison_end)
+
+    if getattr(args, "legacy_midpoint", False):
+        return None, None
+    raise SystemExit(_missing_period_message())
+
+
+def default_recent_periods(
+    db_path: Path,
+    *,
+    timezone: str,
+    period_days: int = 1,
+) -> tuple[str | None, str | None, str | None, str | None]:
+    if period_days <= 0:
+        raise ValueError("period_days must be positive")
+
+    query = f"""
+    SELECT MAX({representative_time_sql()}) AS latest_time_utc
+    FROM vehicle_observations v
+    WHERE {QUALIFIED_DELAY_FILTER_SQL}
+      AND v.next_stop_point_ref IS NOT NULL
+    """
+    with connect_readonly_db(db_path) as con:
+        latest_value = con.execute(query).fetchone()[0]
+
+    latest = pd.to_datetime(latest_value, utc=True, errors="coerce")
+    if pd.isna(latest):
+        return None, None, None, None
+
+    comparison_end = latest.tz_convert(timezone).ceil("s") + pd.Timedelta(seconds=1)
+    comparison_start = comparison_end - pd.Timedelta(days=period_days)
+    baseline_end = comparison_start
+    baseline_start = baseline_end - pd.Timedelta(days=period_days)
+    return (
+        baseline_start.isoformat(),
+        baseline_end.isoformat(),
+        comparison_start.isoformat(),
+        comparison_end.isoformat(),
+    )
+
+
 def add_period_column(df: pd.DataFrame, args: argparse.Namespace) -> tuple[pd.DataFrame, str]:
     period_args = [
         args.baseline_start,
@@ -161,11 +243,7 @@ def add_period_column(df: pd.DataFrame, args: argparse.Namespace) -> tuple[pd.Da
         comparison_start = midpoint
         comparison_end = end + pd.Timedelta(microseconds=1)
     else:
-        raise SystemExit(
-            "Stop-change analysis now requires explicit matched periods. Provide "
-            "--baseline-start, --baseline-end, --comparison-start, and "
-            "--comparison-end, or pass --legacy-midpoint for the old automatic split."
-        )
+        raise SystemExit(_missing_period_message())
 
     result["period"] = pd.NA
     result.loc[
@@ -280,7 +358,10 @@ def build_stop_change(args: argparse.Namespace, df: pd.DataFrame) -> tuple[pd.Da
     if df.empty:
         return pd.DataFrame(), ""
 
-    stops = load_stop_metadata(args.gtfs_dir, args.gtfs_root)
+    stops = load_stop_metadata(
+        args.gtfs_dir,
+        getattr(args, "gtfs_root", DEFAULT_GTFS_ROOT),
+    )
     city_parts = load_city_parts(args.city_parts_csv)
     df = enrich_stops(df, stops, city_parts)
 

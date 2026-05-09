@@ -91,6 +91,37 @@ DELAY_METRIC_COLUMNS = [
 GTFS_DIR_PATTERN = re.compile(r"^gtfs_(\d{4}-\d{2}-\d{2})$")
 
 
+def representative_time_sql(alias: str = "v") -> str:
+    return f"COALESCE({alias}.next_aimed_arrival_time_utc, {alias}.recorded_at_utc)"
+
+
+def utc_sql_timestamp(value: object, *, ceil: bool = False) -> str:
+    timestamp = pd.Timestamp(value)
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.tz_localize("UTC")
+    timestamp = timestamp.tz_convert("UTC")
+    timestamp = timestamp.ceil("s") if ceil else timestamp.floor("s")
+    return timestamp.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def append_representative_time_filter(
+    where: str,
+    params: list[object],
+    *,
+    start_utc: object | None = None,
+    end_utc: object | None = None,
+    alias: str = "v",
+) -> str:
+    representative_time = representative_time_sql(alias)
+    if start_utc is not None:
+        where += f" AND {representative_time} >= ?"
+        params.append(utc_sql_timestamp(start_utc))
+    if end_utc is not None:
+        where += f" AND {representative_time} < ?"
+        params.append(utc_sql_timestamp(end_utc, ceil=True))
+    return where
+
+
 def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--db",

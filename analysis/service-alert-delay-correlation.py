@@ -7,12 +7,14 @@ from pathlib import Path
 import pandas as pd
 
 from _shared import (
+    DEFAULT_GTFS_ROOT,
     QUALIFIED_DELAY_FILTER_SQL,
     add_bucket_arg,
     add_common_args,
     add_gtfs_args,
     add_quality_args,
     add_timezone_arg,
+    append_representative_time_filter,
     aggregate_delay_buckets,
     apply_quality_filter,
     base_quality_query,
@@ -21,15 +23,18 @@ from _shared import (
     load_gtfs_route_metadata,
     print_or_empty,
     read_sql,
+    representative_time_sql,
     resolve_project_path,
     round_numeric,
     summarize_delay_metrics,
+    utc_sql_timestamp,
     write_optional_csv,
 )
 
 
 ALERT_GROUP_COLUMNS = ["cause", "effect", "priority", "alert_scope"]
 MATCH_CONTEXT_COLUMNS = ["line_ref", "direction_ref", "local_hour", "day_type"]
+DEFAULT_ANALYSIS_DAYS = 2
 
 
 def parse_args() -> argparse.Namespace:
@@ -56,6 +61,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--line-ref",
         help="Limit analysis to one line_ref, for example 3 or 10A.",
+    )
+    parser.add_argument(
+        "--start",
+        help=(
+            "Analysis window start timestamp. Naive timestamps use --timezone. "
+            "Defaults to the latest observations minus --analysis-days."
+        ),
+    )
+    parser.add_argument(
+        "--end",
+        help=(
+            "Analysis window end timestamp. Naive timestamps use --timezone. "
+            "Defaults to the latest observation timestamp."
+        ),
+    )
+    parser.add_argument(
+        "--analysis-days",
+        type=int,
+        default=DEFAULT_ANALYSIS_DAYS,
+        help=(
+            "Rolling window size when --start or --end is omitted. Defaults to "
+            f"{DEFAULT_ANALYSIS_DAYS} days to keep notebook memory use bounded."
+        ),
+    )
+    parser.add_argument(
+        "--full-history",
+        action="store_true",
+        help="Analyze the full database history. This can use a large amount of memory.",
     )
     parser.set_defaults(limit=20, min_observations=30)
     return parser.parse_args()
@@ -119,20 +152,47 @@ def resolve_route_short_name(
     return str(matches["route_short_name"].iloc[0])
 
 
-def load_observations(args: argparse.Namespace) -> pd.DataFrame:
+def load_observations(
+    args: argparse.Namespace,
+    window: tuple[pd.Timestamp | None, pd.Timestamp | None] | None = None,
+) -> pd.DataFrame:
     where = QUALIFIED_DELAY_FILTER_SQL
     params: list[object] = []
     if args.line_ref:
         where += " AND v.line_ref = ?"
         params.append(args.line_ref)
+    if window is None:
+        window_start, window_end, _ = resolve_analysis_window(args)
+    else:
+        window_start, window_end = window
+    where = append_representative_time_filter(
+        where,
+        params,
+        start_utc=window_start,
+        end_utc=window_end,
+    )
 
     query = base_quality_query(where=where)
     with connect_readonly_db(args.db) as con:
         return read_sql(con, query, params)
 
 
-def load_alerts(args: argparse.Namespace) -> pd.DataFrame:
-    query = """
+def load_alerts(
+    args: argparse.Namespace,
+    window: tuple[pd.Timestamp | None, pd.Timestamp | None] | None = None,
+) -> pd.DataFrame:
+    where = "is_active = 1"
+    params: list[object] = []
+    if window is not None:
+        window_start, window_end = window
+        if window_end is not None:
+            where += " AND COALESCE(validity_start_utc, created_at_utc) < ?"
+            params.append(utc_sql_timestamp(window_end, ceil=True))
+        if window_start is not None:
+            where += " AND (validity_end_utc IS NULL OR validity_end_utc >= ?)"
+            params.append(utc_sql_timestamp(window_start))
+
+    query = f"""
     SELECT
         source_alert_id,
         line_ref,
@@ -146,10 +206,66 @@ def load_alerts(args: argparse.Namespace) -> pd.DataFrame:
         affected_stops_json,
         created_at_utc
     FROM service_alerts
-    WHERE is_active = 1
+    WHERE {where}
     """
     with connect_readonly_db(args.db) as con:
-        return read_sql(con, query)
+        return read_sql(con, query, params)
+
+
+def parse_timestamp(value: str, timezone: str) -> pd.Timestamp:
+    timestamp = pd.Timestamp(value)
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.tz_localize(timezone)
+    return timestamp.tz_convert("UTC")
+
+
+def _latest_observation_timestamp(args: argparse.Namespace) -> pd.Timestamp | None:
+    where = QUALIFIED_DELAY_FILTER_SQL
+    params: list[object] = []
+    if getattr(args, "line_ref", None):
+        where += " AND v.line_ref = ?"
+        params.append(args.line_ref)
+
+    query = f"""
+    SELECT MAX({representative_time_sql()}) AS latest_time_utc
+    FROM vehicle_observations v
+    WHERE {where}
+    """
+    with connect_readonly_db(args.db) as con:
+        latest_value = con.execute(query, params).fetchone()[0]
+    latest = pd.to_datetime(latest_value, utc=True, errors="coerce")
+    return None if pd.isna(latest) else latest
+
+
+def resolve_analysis_window(
+    args: argparse.Namespace,
+) -> tuple[pd.Timestamp | None, pd.Timestamp | None, str]:
+    if getattr(args, "full_history", False):
+        return None, None, "full history"
+
+    analysis_days = getattr(args, "analysis_days", DEFAULT_ANALYSIS_DAYS)
+    if analysis_days <= 0:
+        raise SystemExit("--analysis-days must be positive.")
+
+    start_arg = getattr(args, "start", None)
+    end_arg = getattr(args, "end", None)
+    start = parse_timestamp(start_arg, args.timezone) if start_arg else None
+    end = parse_timestamp(end_arg, args.timezone) if end_arg else None
+
+    if start is None and end is None:
+        latest = _latest_observation_timestamp(args)
+        if latest is None:
+            return None, None, "no observations"
+        end = latest.ceil("s") + pd.Timedelta(seconds=1)
+        start = end - pd.Timedelta(days=analysis_days)
+    elif start is None:
+        start = end - pd.Timedelta(days=analysis_days)
+    elif end is None:
+        end = start + pd.Timedelta(days=analysis_days)
+
+    if start >= end:
+        raise SystemExit("Analysis window start must be before analysis window end.")
+    return start, end, f"{start.isoformat()}..{end.isoformat()}"
 
 
 def build_alert_targets(
@@ -322,7 +438,8 @@ def summarize_alert_lift(
 
 
 def build_correlation(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
-    observations = load_observations(args)
+    window_start, window_end, _ = resolve_analysis_window(args)
+    observations = load_observations(args, (window_start, window_end))
     if observations.empty:
         return pd.DataFrame(), pd.DataFrame()
 
@@ -343,8 +460,11 @@ def build_correlation(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFr
     observations["direction_ref"] = observations["direction_ref"].astype("string")
     observations["next_stop_point_ref"] = observations["next_stop_point_ref"].astype("string")
 
-    alerts = load_alerts(args)
-    routes = load_route_metadata(args.gtfs_dir, args.gtfs_root)
+    alerts = load_alerts(args, (window_start, window_end))
+    routes = load_route_metadata(
+        args.gtfs_dir,
+        getattr(args, "gtfs_root", DEFAULT_GTFS_ROOT),
+    )
     include_routes = args.alert_kind in ("route", "any")
     include_stops = args.alert_kind in ("stop", "any")
     targets = build_alert_targets(

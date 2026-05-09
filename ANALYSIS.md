@@ -96,7 +96,7 @@ uv run python analysis/stop-delay-change.py \
 
 The comparison only uses contexts present in both periods for the same group,
 line, direction, local weekday, and local hour. The old automatic first-half vs
-second-half split is available only as:
+second-half split scans the full observation history and is available only as:
 
 ```sh
 uv run python analysis/stop-delay-change.py --legacy-midpoint
@@ -124,12 +124,26 @@ stop_id,city_part
 
 Service alert matched-control analysis groups by cause, effect, priority, and
 route/stop scope. Controls come from the same line, direction, local hour, and
-weekday/weekend context:
+weekday/weekend context. By default it analyzes the latest two days so notebooks
+and local scripts do not load the full database into pandas:
 
 ```sh
 uv run python analysis/service-alert-delay-correlation.py --alert-kind any --view grouped
 uv run python analysis/service-alert-delay-correlation.py --alert-kind route --view line
 ```
+
+Use explicit windows for longer or matched alert analyses:
+
+```sh
+uv run python analysis/service-alert-delay-correlation.py \
+  --start 2026-05-06 \
+  --end 2026-05-08 \
+  --alert-kind any \
+  --view both
+```
+
+`--full-history` is available for machines with enough memory, but it can be
+large on multi-gigabyte databases.
 
 Write any script result to CSV with `--output-csv`:
 
