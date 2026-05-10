@@ -9,9 +9,13 @@ import pandas as pd
 from analysis._shared import (
     DELAY_METRIC_COLUMNS,
     QUALIFIED_DELAY_FILTER_SQL,
+    assign_gtfs_feed_dates,
     aggregate_delay_buckets,
     apply_quality_filter,
     base_quality_query,
+    gtfs_metadata_fingerprint,
+    latest_gtfs_dir as shared_latest_gtfs_dir,
+    load_gtfs_stop_metadata,
     summarize_delay_metrics,
 )
 
@@ -47,18 +51,11 @@ def resolve_project_path(path: Path | str) -> Path:
 
 
 def latest_gtfs_dir(root: Path | str = DEFAULT_GTFS_ROOT) -> Path | None:
-    gtfs_root = resolve_project_path(root)
-    if not gtfs_root.exists():
-        return None
+    return shared_latest_gtfs_dir(resolve_project_path(root))
 
-    candidates = [
-        path
-        for path in gtfs_root.iterdir()
-        if path.is_dir() and (path / "stops.txt").exists()
-    ]
-    if not candidates:
-        return None
-    return max(candidates, key=lambda path: path.name)
+
+def gtfs_stop_metadata_fingerprint(root: Path | str = DEFAULT_GTFS_ROOT) -> str:
+    return gtfs_metadata_fingerprint(resolve_project_path(root), filenames=("stops.txt",))
 
 
 def connect_readonly_db(path: Path | str = DEFAULT_DB_PATH) -> sqlite3.Connection:
@@ -84,27 +81,19 @@ def load_observations(
         return pd.read_sql_query(query, con, params=params)
 
 
-def load_stop_metadata(gtfs_dir: Path | str | None = None) -> pd.DataFrame:
-    resolved_gtfs_dir = resolve_project_path(gtfs_dir) if gtfs_dir else latest_gtfs_dir()
-    if resolved_gtfs_dir is None:
-        raise FileNotFoundError(f"No GTFS stops.txt found below {DEFAULT_GTFS_ROOT}")
-
-    stops_path = resolved_gtfs_dir / "stops.txt"
-    if not stops_path.exists():
-        raise FileNotFoundError(f"GTFS stops.txt not found: {stops_path}")
-
-    stops = pd.read_csv(stops_path, dtype={"stop_id": "string"})
-    required = {"stop_id", "stop_name", "stop_lat", "stop_lon"}
-    missing = required.difference(stops.columns)
-    if missing:
-        missing_text = ", ".join(sorted(missing))
-        raise ValueError(f"{stops_path} is missing required column(s): {missing_text}")
-
-    stops = stops[["stop_id", "stop_name", "stop_lat", "stop_lon"]].copy()
-    stops["stop_id"] = stops["stop_id"].astype("string")
-    stops["stop_lat"] = pd.to_numeric(stops["stop_lat"], errors="coerce")
-    stops["stop_lon"] = pd.to_numeric(stops["stop_lon"], errors="coerce")
-    return stops.rename(columns={"stop_name": "gtfs_stop_name"})
+def load_stop_metadata(
+    gtfs_dir: Path | str | None = None,
+    *,
+    gtfs_root: Path | str = DEFAULT_GTFS_ROOT,
+) -> pd.DataFrame:
+    stops = load_gtfs_stop_metadata(
+        gtfs_dir=resolve_project_path(gtfs_dir) if gtfs_dir else None,
+        gtfs_root=resolve_project_path(gtfs_root),
+    )
+    if stops.empty:
+        source = gtfs_dir if gtfs_dir is not None else gtfs_root
+        raise FileNotFoundError(f"No date-aware GTFS stops.txt found below {source}")
+    return stops
 
 
 def prepare_observations(
@@ -138,21 +127,52 @@ def prepare_observations(
     result["stop_id"] = result["next_stop_point_ref"].astype("string")
     result["local_minute_of_day"] = result["local_minutes"]
 
-    stop_columns = ["stop_id", "gtfs_stop_name", "stop_lat", "stop_lon"]
-    if stops.empty:
-        stop_metadata = pd.DataFrame(columns=stop_columns)
-    else:
-        stop_metadata = stops[stop_columns].copy()
-        stop_metadata["stop_id"] = stop_metadata["stop_id"].astype("string")
-
-    result = result.merge(stop_metadata, how="left", on="stop_id")
+    result, date_aware_stop_metadata = _join_stop_metadata(result, stops)
     result["next_stop_point_name"] = result["next_stop_point_name"].astype("string")
     result["stop_name"] = result["gtfs_stop_name"].combine_first(
         result["next_stop_point_name"]
     )
     result["stop_lat"] = pd.to_numeric(result["stop_lat"], errors="coerce")
     result["stop_lon"] = pd.to_numeric(result["stop_lon"], errors="coerce")
+    result["has_gtfs_stop_metadata"] = result["gtfs_stop_name"].notna()
+    if not date_aware_stop_metadata and "gtfs_feed_date" not in result.columns:
+        result["gtfs_feed_date"] = pd.NA
     return result
+
+
+def _join_stop_metadata(
+    observations: pd.DataFrame,
+    stops: pd.DataFrame,
+) -> tuple[pd.DataFrame, bool]:
+    stop_columns = ["stop_id", "gtfs_stop_name", "stop_lat", "stop_lon"]
+    date_aware = "gtfs_feed_date" in stops.columns
+    if observations.empty:
+        return observations.copy(), date_aware
+
+    result = observations.copy()
+    if stops.empty:
+        result["gtfs_feed_date"] = pd.NA
+        result["gtfs_stop_name"] = pd.NA
+        result["stop_lat"] = pd.NA
+        result["stop_lon"] = pd.NA
+        return result, date_aware
+
+    if date_aware:
+        metadata = stops[["gtfs_feed_date", *stop_columns]].copy()
+        metadata["stop_id"] = metadata["stop_id"].astype("string")
+        metadata = metadata.drop_duplicates(["gtfs_feed_date", "stop_id"], keep="first")
+        feeds = metadata[["gtfs_feed_date"]].drop_duplicates().reset_index(drop=True)
+        result["gtfs_feed_date"] = assign_gtfs_feed_dates(result, feeds)
+        return (
+            result.merge(metadata, how="left", on=["gtfs_feed_date", "stop_id"]),
+            True,
+        )
+
+    metadata = stops[stop_columns].copy()
+    metadata["stop_id"] = metadata["stop_id"].astype("string")
+    metadata = metadata.drop_duplicates(["stop_id"], keep="first")
+    result["gtfs_feed_date"] = pd.NA
+    return result.merge(metadata, how="left", on="stop_id"), False
 
 
 def filter_observations(
@@ -321,6 +341,8 @@ def _empty_prepared_frame() -> pd.DataFrame:
             "local_weekday",
             "is_weekday",
             "day_type",
+            "gtfs_feed_date",
+            "has_gtfs_stop_metadata",
             "gtfs_stop_name",
             "stop_lat",
             "stop_lon",

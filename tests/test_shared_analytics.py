@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date
 import importlib.util
 from pathlib import Path
 import sys
@@ -183,6 +184,28 @@ class BucketAndMetricTests(unittest.TestCase):
 
 
 class MatchedAnalysisTests(unittest.TestCase):
+    def test_stop_change_requires_periods_before_database_load(self) -> None:
+        stop_change = load_script_module(
+            "stop_delay_change",
+            "analysis/stop-delay-change.py",
+        )
+
+        class Args:
+            db = PROJECT_ROOT / "does-not-exist.db"
+            timezone = "Europe/Helsinki"
+            line_ref = None
+            direction_ref = None
+            baseline_start = None
+            baseline_end = None
+            comparison_start = None
+            comparison_end = None
+            legacy_midpoint = False
+
+        with self.assertRaises(SystemExit) as raised:
+            stop_change.load_observations(Args)
+
+        self.assertIn("requires explicit matched periods", str(raised.exception))
+
     def test_stop_change_matches_same_line_direction_weekday_and_hour(self) -> None:
         stop_change = load_script_module(
             "stop_delay_change",
@@ -204,6 +227,46 @@ class MatchedAnalysisTests(unittest.TestCase):
 
         self.assertEqual(matched["delay_seconds"].to_list(), [60, 120])
 
+    def test_stop_change_enriches_stops_by_gtfs_feed_date(self) -> None:
+        stop_change = load_script_module(
+            "stop_delay_change",
+            "analysis/stop-delay-change.py",
+        )
+        rows = pd.DataFrame(
+            {
+                "local_date": [
+                    date(2026, 4, 22),
+                    date(2026, 4, 23),
+                    date(2026, 4, 30),
+                ],
+                "next_stop_point_ref": ["10", "10", "10"],
+                "next_stop_point_name": ["Fallback before", "Fallback first", "Fallback second"],
+            }
+        )
+        stops = pd.DataFrame(
+            {
+                "gtfs_feed_date": [date(2026, 4, 23), date(2026, 4, 30)],
+                "stop_id": pd.Series(["10", "10"], dtype="string"),
+                "gtfs_stop_name": ["First feed", "Second feed"],
+                "stop_lat": [60.45, 60.46],
+                "stop_lon": [22.27, 22.28],
+            }
+        )
+
+        enriched = stop_change.enrich_stops(
+            rows,
+            stops,
+            pd.DataFrame(columns=["stop_id", "city_part"]),
+        )
+
+        self.assertTrue(pd.isna(enriched.loc[0, "gtfs_feed_date"]))
+        self.assertEqual(enriched.loc[0, "stop_name"], "Fallback before")
+        self.assertFalse(enriched.loc[0, "has_gtfs_stop_metadata"])
+        self.assertEqual(enriched.loc[1, "gtfs_feed_date"], date(2026, 4, 23))
+        self.assertEqual(enriched.loc[1, "stop_name"], "First feed")
+        self.assertEqual(enriched.loc[2, "gtfs_feed_date"], date(2026, 4, 30))
+        self.assertEqual(enriched.loc[2, "stop_name"], "Second feed")
+
     def test_alert_controls_match_active_line_direction_hour_and_day_type(self) -> None:
         alerts = load_script_module(
             "service_alert_delay_correlation",
@@ -224,6 +287,74 @@ class MatchedAnalysisTests(unittest.TestCase):
 
         self.assertEqual(active["delay_seconds"].to_list(), [60])
         self.assertEqual(controls["delay_seconds"].to_list(), [120])
+
+    def test_alert_window_uses_explicit_start_and_end_without_database_lookup(self) -> None:
+        alerts = load_script_module(
+            "service_alert_delay_correlation",
+            "analysis/service-alert-delay-correlation.py",
+        )
+
+        class Args:
+            db = PROJECT_ROOT / "does-not-exist.db"
+            timezone = "Europe/Helsinki"
+            start = "2026-05-06"
+            end = "2026-05-08"
+            analysis_days = 2
+            full_history = False
+
+        start, end, description = alerts.resolve_analysis_window(Args)
+
+        self.assertEqual(start.isoformat(), "2026-05-05T21:00:00+00:00")
+        self.assertEqual(end.isoformat(), "2026-05-07T21:00:00+00:00")
+        self.assertIn("2026-05-05T21:00:00+00:00", description)
+
+    def test_alert_targets_map_routes_by_gtfs_feed_date(self) -> None:
+        alerts_module = load_script_module(
+            "service_alert_delay_correlation",
+            "analysis/service-alert-delay-correlation.py",
+        )
+        alert_rows = pd.DataFrame(
+            {
+                "source_alert_id": ["before", "first", "second"],
+                "line_ref": [pd.NA, pd.NA, pd.NA],
+                "cause": ["Unknown"] * 3,
+                "effect": ["Delay"] * 3,
+                "priority": [1, 1, 1],
+                "is_active": [1, 1, 1],
+                "validity_start_utc": [
+                    "2026-04-22T08:00:00Z",
+                    "2026-04-23T08:00:00Z",
+                    "2026-04-30T08:00:00Z",
+                ],
+                "validity_end_utc": [pd.NA, pd.NA, pd.NA],
+                "affected_routes_json": ['["route-a"]', '["route-a"]', '["route-a"]'],
+                "affected_stops_json": ["[]", "[]", "[]"],
+                "created_at_utc": [
+                    "2026-04-22T08:00:00Z",
+                    "2026-04-23T08:00:00Z",
+                    "2026-04-30T08:00:00Z",
+                ],
+            }
+        )
+        routes = pd.DataFrame(
+            {
+                "gtfs_feed_date": [date(2026, 4, 23), date(2026, 4, 30)],
+                "route_id": pd.Series(["route-a", "route-a"], dtype="string"),
+                "route_short_name": pd.Series(["3", "4"], dtype="string"),
+            }
+        )
+
+        targets = alerts_module.build_alert_targets(
+            alert_rows,
+            routes,
+            pd.Timestamp("2026-04-22T08:00:00Z"),
+            pd.Timestamp("2026-04-30T08:00:00Z"),
+            include_routes=True,
+            include_stops=False,
+            timezone="Europe/Helsinki",
+        ).sort_values("start_utc")
+
+        self.assertEqual(targets["target_ref"].to_list(), ["route-a", "3", "4"])
 
 
 if __name__ == "__main__":

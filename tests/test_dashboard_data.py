@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from datetime import time
+from datetime import date, time
+from pathlib import Path
+import tempfile
 import unittest
 
 import pandas as pd
@@ -70,6 +72,16 @@ def sample_stop_metrics() -> pd.DataFrame:
             "median_early_min_abs": [0.0, 2.0, 0.0, 0.0],
             "p90_early_min_abs": [0.0, 3.0, 0.0, 0.0],
         }
+    )
+
+
+def write_gtfs_stops(root: Path, feed_date: str, name: str, lat: float, lon: float) -> None:
+    feed_dir = root / f"gtfs_{feed_date}"
+    feed_dir.mkdir()
+    (feed_dir / "stops.txt").write_text(
+        "stop_id,stop_name,stop_lat,stop_lon\n"
+        f"10,{name},{lat},{lon}\n",
+        encoding="utf-8",
     )
 
 
@@ -176,11 +188,74 @@ class DashboardDataTests(unittest.TestCase):
         self.assertTrue(heat["stop_lat"].notna().all())
         self.assertTrue(heat["stop_lon"].notna().all())
 
+    def test_load_stop_metadata_reads_date_named_gtfs_feeds(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            gtfs_root = Path(temp_dir)
+            write_gtfs_stops(gtfs_root, "2026-04-23", "First feed", 60.45, 22.27)
+            write_gtfs_stops(gtfs_root, "2026-04-30", "Second feed", 60.46, 22.28)
+
+            stops = load_stop_metadata(gtfs_root=gtfs_root)
+
+        self.assertEqual(
+            stops["gtfs_feed_date"].to_list(),
+            [date(2026, 4, 23), date(2026, 4, 30)],
+        )
+        self.assertEqual(stops["gtfs_stop_name"].to_list(), ["First feed", "Second feed"])
+
+    def test_prepare_observations_uses_stop_metadata_by_feed_date(self) -> None:
+        observations = pd.DataFrame(
+            {
+                "recorded_at_utc": [
+                    "2026-04-22T08:00:00Z",
+                    "2026-04-23T08:00:00Z",
+                    "2026-04-30T08:00:00Z",
+                ],
+                "vehicle_id": ["v-before", "v-first", "v-second"],
+                "trip_match_key": ["before", "first", "second"],
+                "line_ref": ["3", "3", "3"],
+                "direction_ref": ["1", "1", "1"],
+                "published_line_name": ["3", "3", "3"],
+                "delay_seconds": [60, 120, 180],
+                "next_stop_point_ref": ["10", "10", "10"],
+                "next_stop_point_name": ["Fallback before", "Fallback first", "Fallback second"],
+            }
+        )
+        stops = pd.DataFrame(
+            {
+                "gtfs_feed_date": [date(2026, 4, 23), date(2026, 4, 30)],
+                "stop_id": pd.Series(["10", "10"], dtype="string"),
+                "gtfs_stop_name": ["First feed", "Second feed"],
+                "stop_lat": [60.45, 60.46],
+                "stop_lon": [22.27, 22.28],
+            }
+        )
+
+        prepared = prepare_observations(observations, stops)
+        by_date = {str(row.local_date): row for row in prepared.itertuples(index=False)}
+
+        self.assertTrue(pd.isna(by_date["2026-04-22"].gtfs_feed_date))
+        self.assertFalse(by_date["2026-04-22"].has_gtfs_stop_metadata)
+        self.assertEqual(by_date["2026-04-22"].stop_name, "Fallback before")
+        self.assertTrue(pd.isna(by_date["2026-04-22"].stop_lat))
+
+        self.assertEqual(by_date["2026-04-23"].gtfs_feed_date, date(2026, 4, 23))
+        self.assertTrue(by_date["2026-04-23"].has_gtfs_stop_metadata)
+        self.assertEqual(by_date["2026-04-23"].stop_name, "First feed")
+        self.assertEqual(by_date["2026-04-23"].stop_lat, 60.45)
+
+        self.assertEqual(by_date["2026-04-30"].gtfs_feed_date, date(2026, 4, 30))
+        self.assertTrue(by_date["2026-04-30"].has_gtfs_stop_metadata)
+        self.assertEqual(by_date["2026-04-30"].stop_name, "Second feed")
+        self.assertEqual(by_date["2026-04-30"].stop_lat, 60.46)
+
     def test_real_data_smoke_loads_and_joins_stops(self) -> None:
         if not DEFAULT_DB_PATH.exists():
             self.skipTest("data/foli.db is not available")
 
-        observations = load_observations(limit=10_000)
+        try:
+            observations = load_observations(limit=10_000)
+        except Exception as exc:
+            self.skipTest(f"data/foli.db is not readable: {exc}")
         stops = load_stop_metadata()
         prepared = prepare_observations(observations, stops)
 

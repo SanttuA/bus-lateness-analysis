@@ -14,7 +14,9 @@ data/foli.db
 The database is not committed to this repository. It should contain a
 `vehicle_observations` table with fields such as `line_ref`, `delay_seconds`,
 and `is_gtfs_matchable`. Some analyses also use `service_alerts`,
-`collector_polls`, and the newest local GTFS archive under `data/gtfs/`.
+`collector_polls`, and extracted local GTFS snapshots under `data/gtfs/`.
+GTFS directories should be named `gtfs_YYYY-MM-DD`; each snapshot is used from
+that local date until the next snapshot date.
 
 ## Setup
 
@@ -37,10 +39,11 @@ Run the local interactive dashboard with:
 uv run streamlit run streamlit_app.py
 ```
 
-The dashboard reads `data/foli.db`, joins observations to the newest local GTFS
+The dashboard reads `data/foli.db`, joins observations to the date-matched GTFS
 snapshot under `data/gtfs/`, applies conservative quality filtering, collapses
 repeated polls into trip-stop buckets, and visualizes robust delay by line,
-local hour, and next-stop location.
+local hour, and next-stop location. Observations before the first local GTFS
+snapshot keep SIRI stop names but have no GTFS coordinates.
 
 ## Data Caveats
 

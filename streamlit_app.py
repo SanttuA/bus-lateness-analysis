@@ -11,6 +11,7 @@ import streamlit as st
 
 from dashboard_data import (
     DEFAULT_DB_PATH,
+    DEFAULT_GTFS_ROOT,
     DEFAULT_TIMEZONE,
     DIVERGING_METRICS,
     METRIC_LABELS,
@@ -18,6 +19,7 @@ from dashboard_data import (
     build_stop_heatmap_weights,
     build_stop_metrics,
     filter_observations,
+    gtfs_stop_metadata_fingerprint,
     latest_gtfs_dir,
     load_observations,
     load_stop_metadata,
@@ -70,9 +72,9 @@ DELAY_AUTO_QUANTILE = 0.95
 
 
 @st.cache_data(show_spinner="Loading Föli observations")
-def cached_dataset(db_path: str, gtfs_dir: str, timezone: str):
+def cached_dataset(db_path: str, gtfs_root: str, gtfs_fingerprint: str, timezone: str):
     observations = load_observations(Path(db_path))
-    stops = load_stop_metadata(Path(gtfs_dir))
+    stops = load_stop_metadata(gtfs_root=Path(gtfs_root))
     return prepare_observations(observations, stops, timezone=timezone)
 
 
@@ -506,14 +508,27 @@ def main() -> None:
         st.error("Database not found at data/foli.db.")
         st.stop()
 
-    df = cached_dataset(
-        str(DEFAULT_DB_PATH),
-        str(gtfs_dir),
-        DEFAULT_TIMEZONE,
-    )
+    try:
+        gtfs_fingerprint = gtfs_stop_metadata_fingerprint(DEFAULT_GTFS_ROOT)
+        df = cached_dataset(
+            str(DEFAULT_DB_PATH),
+            str(DEFAULT_GTFS_ROOT),
+            gtfs_fingerprint,
+            DEFAULT_TIMEZONE,
+        )
+    except FileNotFoundError as exc:
+        st.error(str(exc))
+        st.stop()
     if df.empty:
         st.warning("No analysis-ready observations found.")
         st.stop()
+    unmatched_gtfs_count = int((~df["has_gtfs_stop_metadata"]).sum())
+    if unmatched_gtfs_count:
+        st.warning(
+            f"{unmatched_gtfs_count:,} of {len(df):,} buckets do not have "
+            "date-matched GTFS stop metadata. Those rows keep SIRI stop names and "
+            "are omitted from coordinate-based maps."
+        )
 
     min_date = min(df["local_date"])
     max_date = max(df["local_date"])
