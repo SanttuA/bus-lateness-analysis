@@ -21,6 +21,22 @@ buckets by default.
 
 ## Scripts
 
+Generate the overall Markdown results report:
+
+```sh
+uv run python analysis/build-results-report.py
+```
+
+The report is written to `reports/generated/overall-results.md`. The command
+builds a disk-backed DuckDB cache in `outputs/report-cache/`, including compact
+CSV outputs for each report table. It reuses the cache when the database
+metadata and report settings match, and rebuilds it when they change. Use
+`--force` to rebuild manually:
+
+```sh
+uv run python analysis/build-results-report.py --force
+```
+
 Data-quality summary before delay metrics:
 
 ```sh
@@ -97,6 +113,10 @@ second-half split is available only as:
 uv run python analysis/stop-delay-change.py --legacy-midpoint
 ```
 
+The overall results report uses this automatic midpoint idea internally: it
+splits the cached representative observation range into first half vs second
+half, then compares matched stop contexts.
+
 Aggregate stop changes by city part with a mapping CSV:
 
 ```sh
@@ -131,6 +151,9 @@ Write any script result to CSV with `--output-csv`:
 ```sh
 uv run python analysis/context-delay-metrics.py --output-csv outputs/context-delay-metrics.csv
 ```
+
+Generated report artifacts under `reports/generated/` and cached analysis
+outputs under `outputs/` are intentionally ignored by git.
 
 ## Metrics
 

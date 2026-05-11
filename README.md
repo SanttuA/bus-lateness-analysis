@@ -29,6 +29,20 @@ uv sync
 See [ANALYSIS.md](ANALYSIS.md) for script commands, notebook usage, and metric
 definitions.
 
+## Overall Results Report
+
+Build one generated Markdown report that collects the main research outputs:
+
+```sh
+uv run python analysis/build-results-report.py
+```
+
+The report is written to `reports/generated/overall-results.md`. Intermediate
+DuckDB tables and compact CSVs are stored under `outputs/report-cache/` so later
+runs can reuse midpoint calculations and other summaries instead of loading the
+full SQLite database into pandas. The cache is rebuilt when `data/foli.db` or
+report settings change; pass `--force` to rebuild it manually.
+
 ## Dashboard
 
 Run the local interactive dashboard with:
