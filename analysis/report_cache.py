@@ -1745,16 +1745,11 @@ def _table_exists_sqlite(con: sqlite3.Connection, table_name: str) -> bool:
 
 
 def _sqlite_table_exists(con: duckdb.DuckDBPyConnection, table_name: str) -> bool:
-    return bool(
-        con.execute(
-            """
-            SELECT COUNT(*)
-            FROM information_schema.tables
-            WHERE table_schema = 'source_db' AND table_name = ?
-            """,
-            [table_name],
-        ).fetchone()[0]
-    )
+    try:
+        con.execute(f"SELECT 1 FROM source_db.{_sql_identifier(table_name)} LIMIT 0")
+    except duckdb.CatalogException:
+        return False
+    return True
 
 
 def _duckdb_table_exists(con: duckdb.DuckDBPyConnection, table_name: str) -> bool:
@@ -1776,6 +1771,10 @@ def _create_empty_table(con: duckdb.DuckDBPyConnection, table_name: str) -> None
 
 def _sql_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
+
+
+def _sql_identifier(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
 
 
 def _utc_now_iso() -> str:
