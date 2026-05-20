@@ -79,6 +79,39 @@ class ResultsReportCacheTests(unittest.TestCase):
             self.assertAlmostEqual(row[2], 10.0)
             self.assertAlmostEqual(row[3], 8.0)
 
+    def test_cache_builds_collector_coverage_tables(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "foli.db"
+            cache_dir = Path(temp_dir) / "cache"
+            create_report_db(db_path)
+            settings = report_settings(db_path, cache_dir)
+
+            result = ensure_report_cache(settings, force=True)
+
+            with duckdb.connect(str(result.cache_db), read_only=True) as con:
+                blackout = con.execute(
+                    """
+                    SELECT source, blackout_count
+                    FROM collector_blackouts
+                    WHERE source = 'siri_vm'
+                    """
+                ).fetchone()
+                missing_spots = con.execute(
+                    """
+                    SELECT missing_spot_count
+                    FROM collector_missing_summary
+                    WHERE source = 'siri_vm'
+                    """
+                ).fetchone()[0]
+
+            csv_header = (cache_dir / "collector_blackouts.csv").read_text().splitlines()[0]
+
+            self.assertEqual(blackout, ("siri_vm", 1))
+            self.assertEqual(missing_spots, 1)
+            self.assertIn("source", csv_header)
+            self.assertIn("blackout_count", csv_header)
+            self.assertNotEqual(csv_header, "note")
+
     def test_cache_reuses_matching_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "foli.db"
