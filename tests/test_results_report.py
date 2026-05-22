@@ -15,6 +15,12 @@ from unittest import mock
 import duckdb
 import pandas as pd
 
+from analysis._shared import (
+    aggregate_delay_buckets,
+    apply_quality_filter,
+    sort_robust_delay_metrics,
+    summarize_delay_metrics,
+)
 from analysis.cached_queries import alert_observation_buckets
 from analysis.cached_queries import line_rankings as cached_line_rankings
 from analysis.report_cache import (
@@ -321,9 +327,26 @@ class ResultsReportCacheTests(unittest.TestCase):
                 CachedArgs(db_path, cache_dir, limit=5, min_observations=1),
                 "robust",
             )
+            with sqlite3.connect(db_path) as con:
+                observations = pd.read_sql_query("SELECT * FROM vehicle_observations", con)
+            legacy_buckets = aggregate_delay_buckets(
+                apply_quality_filter(observations),
+                bucket="trip-stop",
+            )
+            legacy_metrics = summarize_delay_metrics(
+                legacy_buckets,
+                ["line_ref"],
+                min_observations=1,
+                extra_aggs={"line_name": ("published_line_name", "first")},
+            )
+            legacy_result = sort_robust_delay_metrics(legacy_metrics, limit=5)
 
             self.assertEqual(result["line_ref"].to_list(), ["alpha", "small", "large"])
             self.assertEqual(result["bucket_count"].to_list(), [1, 1, 2])
+            self.assertEqual(
+                result["line_ref"].to_list(),
+                legacy_result["line_ref"].astype(str).to_list(),
+            )
 
     def test_windowed_cached_buckets_filter_before_aggregation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
