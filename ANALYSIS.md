@@ -18,6 +18,10 @@ buckets by default.
 - `--bucket trip-stop|vehicle-trip|line-hour|poll` controls pre-metric
   aggregation. `trip-stop` is the default and collapses repeated polls for the
   same vehicle trip and next stop.
+- Most delay-analysis scripts reuse the DuckDB cache under
+  `outputs/report-cache/` by default. Use `--no-cache` for the legacy pandas
+  path, `--force-cache` to rebuild reusable base tables, or `--cache-dir` to
+  point at a different cache directory.
 - Stop and route metadata use extracted GTFS directories named
   `data/gtfs/gtfs_YYYY-MM-DD` by default. Each snapshot applies from that local
   date until the next snapshot date. Use `--gtfs-dir` on GTFS-aware scripts to

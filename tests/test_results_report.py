@@ -1,22 +1,73 @@
 from __future__ import annotations
 
+import contextlib
+import importlib.util
+import io
+import json
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import duckdb
+import pandas as pd
 
+from analysis._shared import (
+    aggregate_delay_buckets,
+    apply_quality_filter,
+    sort_robust_delay_metrics,
+    summarize_delay_metrics,
+)
+from analysis.cached_queries import alert_observation_buckets
+from analysis.cached_queries import context_delay_metrics as cached_context_delay_metrics
+from analysis.cached_queries import line_rankings as cached_line_rankings
 from analysis.report_cache import (
+    CACHE_VERSION,
     ReportSettings,
+    ensure_analysis_cache,
     ensure_report_cache,
     write_markdown_report,
 )
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def load_script_module(name: str, relative_path: str):
+    analysis_path = str(PROJECT_ROOT / "analysis")
+    if analysis_path not in sys.path:
+        sys.path.insert(0, analysis_path)
+    spec = importlib.util.spec_from_file_location(name, PROJECT_ROOT / relative_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+class CachedArgs:
+    def __init__(
+        self,
+        db: Path,
+        cache_dir: Path,
+        *,
+        limit: int,
+        min_observations: int,
+    ) -> None:
+        self.db = db
+        self.cache_dir = cache_dir
+        self.limit = limit
+        self.min_observations = min_observations
+        self.quality_mode = "conservative"
+        self.bucket = "trip-stop"
+        self.timezone = "Europe/Helsinki"
+        self.exclude_stop_call_disagreement = False
+        self.force_cache = False
+        self.rush_window = None
+        self.include_weekends = False
+        self.gtfs_dir = None
 
 
 class ResultsReportCacheTests(unittest.TestCase):
@@ -124,6 +175,434 @@ class ResultsReportCacheTests(unittest.TestCase):
             self.assertEqual(first.status, "rebuilt")
             self.assertEqual(second.status, "reused")
 
+    def test_base_cache_reuse_ignores_result_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "foli.db"
+            cache_dir = Path(temp_dir) / "cache"
+            create_report_db(db_path)
+
+            first = ensure_analysis_cache(
+                ReportSettings(
+                    db=db_path,
+                    cache_dir=cache_dir,
+                    limit=5,
+                    min_observations=1,
+                ),
+                force=True,
+            )
+            second = ensure_analysis_cache(
+                ReportSettings(
+                    db=db_path,
+                    cache_dir=cache_dir,
+                    limit=2,
+                    min_observations=1,
+                )
+            )
+
+            self.assertEqual(first.status, "rebuilt")
+            self.assertEqual(second.status, "reused")
+
+    def test_base_cache_rebuilds_stale_cache_version(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "foli.db"
+            cache_dir = Path(temp_dir) / "cache"
+            create_report_db(db_path)
+            settings = ReportSettings(
+                db=db_path,
+                cache_dir=cache_dir,
+                min_observations=1,
+            )
+
+            first = ensure_analysis_cache(settings)
+            manifest_path = cache_dir / "manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["cache_version"] = CACHE_VERSION - 1
+            manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+
+            second = ensure_analysis_cache(settings)
+
+            self.assertEqual(first.status, "rebuilt")
+            self.assertEqual(second.status, "rebuilt")
+            self.assertEqual(second.manifest["cache_version"], CACHE_VERSION)
+
+    def test_cached_line_rankings_match_report_fixture(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "foli.db"
+            cache_dir = Path(temp_dir) / "cache"
+            create_report_db(db_path)
+
+            result = cached_line_rankings(
+                CachedArgs(db_path, cache_dir, limit=5, min_observations=1),
+                "late",
+            )
+
+            self.assertEqual(result["line_ref"].to_list(), ["3", "4"])
+            self.assertEqual(result.loc[0, "bucket_count"], 2)
+            self.assertEqual(result.loc[0, "raw_poll_count"], 3)
+            self.assertAlmostEqual(result.loc[0, "median_delay_min"], 6.0)
+            self.assertAlmostEqual(result.loc[0, "p90_delay_min"], 9.2)
+
+    def test_cached_robust_line_ranking_matches_legacy_bucket_tie_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "foli.db"
+            cache_dir = Path(temp_dir) / "cache"
+            create_report_db(db_path)
+            with sqlite3.connect(db_path) as con:
+                con.execute("DELETE FROM vehicle_observations")
+                rows = [
+                    observation_row(
+                        1,
+                        1,
+                        "alpha-bus",
+                        "2026-04-23T08:00:00Z",
+                        "alpha-trip",
+                        0,
+                        "10",
+                        "Market",
+                        line_ref="alpha",
+                    ),
+                    observation_row(
+                        2,
+                        1,
+                        "small-bus",
+                        "2026-04-23T08:00:30Z",
+                        "small-trip",
+                        0,
+                        "10",
+                        "Market",
+                        line_ref="small",
+                    ),
+                    observation_row(
+                        3,
+                        1,
+                        "large-bus-1",
+                        "2026-04-23T08:01:00Z",
+                        "large-trip-1",
+                        0,
+                        "10",
+                        "Market",
+                        line_ref="large",
+                    ),
+                    observation_row(
+                        4,
+                        1,
+                        "large-bus-2",
+                        "2026-04-23T08:02:00Z",
+                        "large-trip-2",
+                        0,
+                        "10",
+                        "Market",
+                        line_ref="large",
+                    ),
+                ]
+                con.executemany(
+                    """
+                    INSERT INTO vehicle_observations (
+                        id,
+                        poll_id,
+                        vehicle_id,
+                        recorded_at_utc,
+                        valid_until_utc,
+                        line_ref,
+                        direction_ref,
+                        origin_aimed_departure_time_utc,
+                        trip_match_key,
+                        is_gtfs_matchable,
+                        published_line_name,
+                        delay_seconds,
+                        next_stop_point_ref,
+                        next_stop_point_name,
+                        next_aimed_arrival_time_utc,
+                        next_expected_arrival_time_utc,
+                        next_aimed_departure_time_utc,
+                        next_expected_departure_time_utc,
+                        destination_aimed_arrival_time_utc,
+                        created_at_utc
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    rows,
+                )
+
+            result = cached_line_rankings(
+                CachedArgs(db_path, cache_dir, limit=5, min_observations=1),
+                "robust",
+            )
+            with sqlite3.connect(db_path) as con:
+                observations = pd.read_sql_query("SELECT * FROM vehicle_observations", con)
+            legacy_buckets = aggregate_delay_buckets(
+                apply_quality_filter(observations),
+                bucket="trip-stop",
+            )
+            legacy_metrics = summarize_delay_metrics(
+                legacy_buckets,
+                ["line_ref"],
+                min_observations=1,
+                extra_aggs={"line_name": ("published_line_name", "first")},
+            )
+            legacy_result = sort_robust_delay_metrics(legacy_metrics, limit=5)
+
+            self.assertEqual(result["line_ref"].to_list(), ["alpha", "small", "large"])
+            self.assertEqual(result["bucket_count"].to_list(), [1, 1, 2])
+            self.assertEqual(
+                result["line_ref"].to_list(),
+                legacy_result["line_ref"].astype(str).to_list(),
+            )
+
+    def test_cached_context_ranking_matches_legacy_bucket_tie_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "foli.db"
+            cache_dir = Path(temp_dir) / "cache"
+            create_report_db(db_path)
+            with sqlite3.connect(db_path) as con:
+                con.execute("DELETE FROM vehicle_observations")
+                rows = [
+                    observation_row(
+                        1,
+                        1,
+                        "small-bus",
+                        "2026-04-23T08:00:00Z",
+                        "small-trip",
+                        0,
+                        "10",
+                        "Market",
+                        line_ref="small",
+                    ),
+                    observation_row(
+                        2,
+                        1,
+                        "large-bus-1",
+                        "2026-04-23T08:01:00Z",
+                        "large-trip-1",
+                        0,
+                        "10",
+                        "Market",
+                        line_ref="large",
+                    ),
+                    observation_row(
+                        3,
+                        1,
+                        "large-bus-2",
+                        "2026-04-23T08:02:00Z",
+                        "large-trip-2",
+                        0,
+                        "10",
+                        "Market",
+                        line_ref="large",
+                    ),
+                ]
+                con.executemany(
+                    """
+                    INSERT INTO vehicle_observations (
+                        id,
+                        poll_id,
+                        vehicle_id,
+                        recorded_at_utc,
+                        valid_until_utc,
+                        line_ref,
+                        direction_ref,
+                        origin_aimed_departure_time_utc,
+                        trip_match_key,
+                        is_gtfs_matchable,
+                        published_line_name,
+                        delay_seconds,
+                        next_stop_point_ref,
+                        next_stop_point_name,
+                        next_aimed_arrival_time_utc,
+                        next_expected_arrival_time_utc,
+                        next_aimed_departure_time_utc,
+                        next_expected_departure_time_utc,
+                        destination_aimed_arrival_time_utc,
+                        created_at_utc
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    rows,
+                )
+
+            args = CachedArgs(db_path, cache_dir, limit=5, min_observations=1)
+            cached = cached_context_delay_metrics(args)
+            with sqlite3.connect(db_path) as con:
+                observations = pd.read_sql_query("SELECT * FROM vehicle_observations", con)
+            legacy_buckets = aggregate_delay_buckets(
+                apply_quality_filter(observations),
+                bucket="trip-stop",
+            )
+            legacy_metrics = summarize_delay_metrics(
+                legacy_buckets,
+                ["line_ref", "direction_ref", "local_hour", "day_type"],
+                min_observations=1,
+                extra_aggs={"line_name": ("published_line_name", "first")},
+            )
+            legacy = sort_robust_delay_metrics(legacy_metrics, limit=5)
+
+            self.assertEqual(cached["line_ref"].to_list(), ["small", "large"])
+            self.assertEqual(cached["bucket_count"].to_list(), [1, 2])
+            self.assertEqual(
+                cached["line_ref"].to_list(),
+                legacy["line_ref"].astype(str).to_list(),
+            )
+
+    def test_windowed_cached_buckets_filter_before_aggregation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "foli.db"
+            cache_dir = Path(temp_dir) / "cache"
+            create_report_db(db_path)
+            with sqlite3.connect(db_path) as con:
+                con.execute("DELETE FROM vehicle_observations")
+                rows = [
+                    observation_row(
+                        1,
+                        1,
+                        "boundary-bus",
+                        "2026-04-23T23:59:00Z",
+                        "boundary-trip",
+                        60,
+                        "10",
+                        "Market",
+                    ),
+                    observation_row(
+                        2,
+                        1,
+                        "boundary-bus",
+                        "2026-04-24T00:01:00Z",
+                        "boundary-trip",
+                        600,
+                        "10",
+                        "Market",
+                    ),
+                ]
+                con.executemany(
+                    """
+                    INSERT INTO vehicle_observations (
+                        id,
+                        poll_id,
+                        vehicle_id,
+                        recorded_at_utc,
+                        valid_until_utc,
+                        line_ref,
+                        direction_ref,
+                        origin_aimed_departure_time_utc,
+                        trip_match_key,
+                        is_gtfs_matchable,
+                        published_line_name,
+                        delay_seconds,
+                        next_stop_point_ref,
+                        next_stop_point_name,
+                        next_aimed_arrival_time_utc,
+                        next_expected_arrival_time_utc,
+                        next_aimed_departure_time_utc,
+                        next_expected_departure_time_utc,
+                        destination_aimed_arrival_time_utc,
+                        created_at_utc
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    rows,
+                )
+
+            result = alert_observation_buckets(
+                CachedArgs(db_path, cache_dir, limit=5, min_observations=1),
+                (
+                    pd.Timestamp("2026-04-24T00:00:00Z"),
+                    pd.Timestamp("2026-04-25T00:00:00Z"),
+                ),
+            )
+
+            self.assertEqual(len(result), 1)
+            self.assertEqual(result.loc[0, "raw_poll_count"], 1)
+            self.assertEqual(result.loc[0, "delay_seconds"], 600)
+
+    def test_cached_buckets_keep_missing_recorded_at_with_representative_time(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "foli.db"
+            cache_dir = Path(temp_dir) / "cache"
+            create_report_db(db_path)
+            with sqlite3.connect(db_path) as con:
+                con.execute("DELETE FROM vehicle_observations")
+                con.execute(
+                    """
+                    INSERT INTO vehicle_observations (
+                        id,
+                        poll_id,
+                        vehicle_id,
+                        recorded_at_utc,
+                        valid_until_utc,
+                        line_ref,
+                        direction_ref,
+                        origin_aimed_departure_time_utc,
+                        trip_match_key,
+                        is_gtfs_matchable,
+                        published_line_name,
+                        delay_seconds,
+                        next_stop_point_ref,
+                        next_stop_point_name,
+                        next_aimed_arrival_time_utc,
+                        next_expected_arrival_time_utc,
+                        next_aimed_departure_time_utc,
+                        next_expected_departure_time_utc,
+                        destination_aimed_arrival_time_utc,
+                        created_at_utc
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        1,
+                        1,
+                        "missing-recorded",
+                        None,
+                        "2026-04-24T00:02:30Z",
+                        "3",
+                        "1",
+                        None,
+                        "missing-recorded-trip",
+                        1,
+                        "3",
+                        300,
+                        "10",
+                        "Market",
+                        "2026-04-24T00:01:00Z",
+                        "2026-04-24T00:06:00Z",
+                        None,
+                        None,
+                        "2026-04-24T01:00:00Z",
+                        "2026-04-24T00:00:30Z",
+                    ),
+                )
+
+            cache = ensure_analysis_cache(
+                ReportSettings(
+                    db=db_path,
+                    cache_dir=cache_dir,
+                    min_observations=1,
+                )
+            )
+            with duckdb.connect(str(cache.cache_db), read_only=True) as con:
+                base_row = con.execute(
+                    """
+                    SELECT
+                        raw_poll_count,
+                        delay_seconds,
+                        representative_time_utc IS NOT NULL AS has_representative_time
+                    FROM delay_buckets
+                    """
+                ).fetchone()
+
+            windowed = alert_observation_buckets(
+                CachedArgs(db_path, cache_dir, limit=5, min_observations=1),
+                (
+                    pd.Timestamp("2026-04-24T00:00:00Z"),
+                    pd.Timestamp("2026-04-24T00:02:00Z"),
+                ),
+            )
+
+            self.assertEqual(base_row[0], 1)
+            self.assertEqual(base_row[1], 300)
+            self.assertTrue(base_row[2])
+            self.assertEqual(len(windowed), 1)
+            self.assertEqual(windowed.loc[0, "raw_poll_count"], 1)
+            self.assertEqual(windowed.loc[0, "delay_seconds"], 300)
+
     def test_cli_smoke_writes_report_and_compact_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "foli.db"
@@ -157,6 +636,82 @@ class ResultsReportCacheTests(unittest.TestCase):
             self.assertIn("# Overall Bus Lateness Results", report_path.read_text())
             self.assertTrue((cache_dir / "manifest.json").exists())
             self.assertTrue((cache_dir / "line_late_rankings.csv").exists())
+
+    def test_line_ranking_cli_uses_cache_and_writes_csv(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "foli.db"
+            cache_dir = Path(temp_dir) / "cache"
+            output_csv = Path(temp_dir) / "line-rankings.csv"
+            create_report_db(db_path)
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "analysis/line-delay-rankings.py",
+                    "--db",
+                    str(db_path),
+                    "--cache-dir",
+                    str(cache_dir),
+                    "--output-csv",
+                    str(output_csv),
+                    "--min-observations",
+                    "1",
+                    "--limit",
+                    "5",
+                    "--ranking",
+                    "late",
+                ],
+                cwd=PROJECT_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertIn("Most late lines", completed.stdout)
+            self.assertTrue((cache_dir / "manifest.json").exists())
+            csv_header = output_csv.read_text().splitlines()[0]
+            self.assertTrue(csv_header.startswith("ranking,line_ref,line_name"))
+
+    def test_line_ranking_both_forces_cache_once(self) -> None:
+        line_rankings = load_script_module(
+            "line_delay_rankings_cache_once",
+            "analysis/line-delay-rankings.py",
+        )
+
+        class Args:
+            no_cache = False
+            force_cache = True
+            ranking = "both"
+            min_observations = 1
+            limit = 5
+            output_csv = None
+
+        cache_db = Path("cache.duckdb")
+        queried_rankings: list[str] = []
+
+        def fake_cached_line_rankings(args, ranking, *, cache_db=None):
+            queried_rankings.append(ranking)
+            self.assertEqual(cache_db, Path("cache.duckdb"))
+            return pd.DataFrame({"line_ref": ["3"]})
+
+        with (
+            mock.patch.object(line_rankings, "parse_args", return_value=Args),
+            mock.patch.object(
+                line_rankings,
+                "ensure_cache_from_args",
+                return_value=cache_db,
+            ) as ensure_cache,
+            mock.patch.object(
+                line_rankings,
+                "cached_line_rankings",
+                side_effect=fake_cached_line_rankings,
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            line_rankings.main()
+
+        ensure_cache.assert_called_once_with(Args)
+        self.assertEqual(queried_rankings, ["late", "early"])
 
     def test_report_renderer_includes_cache_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

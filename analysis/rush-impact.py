@@ -7,6 +7,7 @@ import pandas as pd
 from _shared import (
     QUALIFIED_DELAY_FILTER_SQL,
     add_bucket_arg,
+    add_cache_args,
     add_common_args,
     add_quality_args,
     add_rush_window_args,
@@ -24,6 +25,7 @@ from _shared import (
     summarize_delay_metrics,
     write_optional_csv,
 )
+from cached_queries import rush_impact as cached_rush_impact
 
 
 def parse_args() -> argparse.Namespace:
@@ -35,6 +37,7 @@ def parse_args() -> argparse.Namespace:
     add_quality_args(parser)
     add_bucket_arg(parser)
     add_rush_window_args(parser)
+    add_cache_args(parser)
     parser.set_defaults(limit=10, min_observations=30)
     return parser.parse_args()
 
@@ -124,8 +127,11 @@ def build_rush_impact(args: argparse.Namespace, df: pd.DataFrame) -> pd.DataFram
 
 def main() -> None:
     args = parse_args()
-    df = load_observations(args)
-    impact = build_rush_impact(args, df)
+    if args.no_cache:
+        df = load_observations(args)
+        impact = build_rush_impact(args, df)
+    else:
+        impact = cached_rush_impact(args)
 
     print_or_empty(impact)
     write_optional_csv(impact, args.output_csv)

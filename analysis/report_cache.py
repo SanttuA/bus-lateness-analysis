@@ -13,6 +13,7 @@ import pandas as pd
 try:
     from ._shared import (
         BUCKET_MODES,
+        DEFAULT_ANALYSIS_CACHE_DIR,
         DEFAULT_BUCKET_MODE,
         DEFAULT_DB_PATH,
         DEFAULT_QUALITY_MODE,
@@ -25,6 +26,7 @@ try:
 except ImportError:  # pragma: no cover - used when called as analysis/*.py script.
     from _shared import (
         BUCKET_MODES,
+        DEFAULT_ANALYSIS_CACHE_DIR,
         DEFAULT_BUCKET_MODE,
         DEFAULT_DB_PATH,
         DEFAULT_QUALITY_MODE,
@@ -36,11 +38,17 @@ except ImportError:  # pragma: no cover - used when called as analysis/*.py scri
     )
 
 
-CACHE_VERSION = 1
-DEFAULT_CACHE_DIR = Path("outputs/report-cache")
+CACHE_VERSION = 2
+DEFAULT_CACHE_DIR = DEFAULT_ANALYSIS_CACHE_DIR
 DEFAULT_REPORT_PATH = Path("reports/generated/overall-results.md")
 MANIFEST_NAME = "manifest.json"
 CACHE_DB_NAME = "report-cache.duckdb"
+
+BASE_TABLES = [
+    "quality_rows",
+    "delay_buckets",
+    "delay_cache_summary",
+]
 
 RESULT_TABLES = [
     "quality_summary",
@@ -56,6 +64,13 @@ RESULT_TABLES = [
     "collector_blackouts",
     "collector_missing_summary",
     "collector_missing_spots",
+]
+
+DERIVED_RESULT_TABLES = [
+    "line_metrics",
+    "midpoint_summary",
+    "alert_targets",
+    *RESULT_TABLES,
 ]
 
 
@@ -113,35 +128,86 @@ def ensure_report_cache(settings: ReportSettings, *, force: bool = False) -> Cac
     settings.validate()
     settings.cache_dir.mkdir(parents=True, exist_ok=True)
 
-    db_metadata = collect_db_metadata(settings.db)
-    expected = _expected_manifest(settings, db_metadata)
     manifest_path = settings.cache_dir / MANIFEST_NAME
     cache_db = settings.cache_dir / CACHE_DB_NAME
-
     current = _read_manifest(manifest_path)
-    if not force and cache_db.exists() and _manifest_matches(current, expected):
+
+    if (
+        not force
+        and cache_db.exists()
+        and _manifest_file_matches(current, collect_db_file_metadata(settings.db))
+        and _manifest_settings_match(current, settings)
+        and _cache_has_tables(cache_db, RESULT_TABLES)
+    ):
         return CacheResult(status="reused", cache_db=cache_db, manifest=current)
 
-    if cache_db.exists():
-        cache_db.unlink()
-    _build_cache(settings, cache_db)
+    base_result = ensure_analysis_cache(settings, force=force)
+    db_metadata = _current_or_collected_db_metadata(base_result.manifest, settings.db)
+    expected = _expected_manifest(settings, db_metadata)
+    _build_result_cache(settings, cache_db)
 
     manifest = {
         **expected,
+        **_expected_base_manifest(settings, db_metadata),
         "built_at_utc": _utc_now_iso(),
         "cache_db": str(cache_db),
+        "base_tables": BASE_TABLES,
         "result_tables": RESULT_TABLES,
     }
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     return CacheResult(status="rebuilt", cache_db=cache_db, manifest=manifest)
 
 
-def collect_db_metadata(db_path: Path) -> dict[str, Any]:
+def ensure_analysis_cache(settings: ReportSettings, *, force: bool = False) -> CacheResult:
+    settings = settings.resolved()
+    settings.validate()
+    settings.cache_dir.mkdir(parents=True, exist_ok=True)
+
+    manifest_path = settings.cache_dir / MANIFEST_NAME
+    cache_db = settings.cache_dir / CACHE_DB_NAME
+    current = _read_manifest(manifest_path)
+    file_metadata = collect_db_file_metadata(settings.db)
+    if (
+        not force
+        and cache_db.exists()
+        and _manifest_file_matches(current, file_metadata)
+        and _manifest_base_settings_match(current, settings)
+        and _cache_has_tables(cache_db, BASE_TABLES)
+    ):
+        return CacheResult(status="reused", cache_db=cache_db, manifest=current)
+
+    if cache_db.exists():
+        cache_db.unlink()
+    db_metadata = collect_db_metadata(settings.db)
+    expected = _expected_base_manifest(settings, db_metadata)
+    _build_base_cache(settings, cache_db)
+
+    manifest = {
+        **expected,
+        "built_at_utc": _utc_now_iso(),
+        "cache_db": str(cache_db),
+        "base_tables": BASE_TABLES,
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    return CacheResult(status="rebuilt", cache_db=cache_db, manifest=manifest)
+
+
+def collect_db_file_metadata(db_path: Path) -> dict[str, Any]:
     db_path = resolve_project_path(db_path)
     if not db_path.exists():
         raise FileNotFoundError(f"Database not found: {db_path}")
 
     stat = db_path.stat()
+    return {
+        "db_path": str(db_path),
+        "db_size_bytes": stat.st_size,
+        "db_mtime_ns": stat.st_mtime_ns,
+    }
+
+
+def collect_db_metadata(db_path: Path) -> dict[str, Any]:
+    file_metadata = collect_db_file_metadata(db_path)
+    db_path = Path(file_metadata["db_path"])
     with sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True) as con:
         vehicle = con.execute(
             """
@@ -171,9 +237,7 @@ def collect_db_metadata(db_path: Path) -> dict[str, Any]:
         alert_count = _table_count(con, "service_alerts")
 
     return {
-        "db_path": str(db_path),
-        "db_size_bytes": stat.st_size,
-        "db_mtime_ns": stat.st_mtime_ns,
+        **file_metadata,
         "vehicle_observation_count": int(vehicle[0] or 0),
         "vehicle_observation_max_id": int(vehicle[1] or 0),
         "vehicle_observation_start_utc": vehicle[2],
@@ -209,6 +273,11 @@ def read_result_table(cache_db: Path, table_name: str) -> pd.DataFrame:
 
 
 def _build_cache(settings: ReportSettings, cache_db: Path) -> None:
+    _build_base_cache(settings, cache_db)
+    _build_result_cache(settings, cache_db)
+
+
+def _build_base_cache(settings: ReportSettings, cache_db: Path) -> None:
     with duckdb.connect(str(cache_db)) as con:
         con.execute("LOAD sqlite")
         con.execute(
@@ -218,6 +287,16 @@ def _build_cache(settings: ReportSettings, cache_db: Path) -> None:
         _build_quality_rows(con, settings)
         _build_delay_buckets(con, settings)
         _build_delay_cache_summary(con)
+
+
+def _build_result_cache(settings: ReportSettings, cache_db: Path) -> None:
+    with duckdb.connect(str(cache_db)) as con:
+        con.execute("LOAD sqlite")
+        con.execute(
+            f"ATTACH {_sql_literal(settings.db.as_posix())} AS source_db "
+            "(TYPE SQLITE, READ_ONLY)"
+        )
+        _drop_tables(con, DERIVED_RESULT_TABLES)
         _build_quality_results(con, settings)
         _build_delay_metric_results(con, settings)
         _build_rush_impact(con, settings)
@@ -372,7 +451,7 @@ def _build_delay_buckets(con: duckdb.DuckDBPyConnection, settings: ReportSetting
             FROM quality_rows
             WHERE quality_pass
                 AND delay_seconds IS NOT NULL
-                AND recorded_at_utc IS NOT NULL
+                AND COALESCE(next_aimed_arrival_time_utc, recorded_at_utc) IS NOT NULL
                 AND line_ref IS NOT NULL
             """
         )
@@ -409,7 +488,7 @@ def _build_delay_buckets(con: duckdb.DuckDBPyConnection, settings: ReportSetting
         FROM quality_rows
         WHERE quality_pass
             AND delay_seconds IS NOT NULL
-            AND recorded_at_utc IS NOT NULL
+            AND COALESCE(next_aimed_arrival_time_utc, recorded_at_utc) IS NOT NULL
             AND line_ref IS NOT NULL
     """
     if settings.bucket == "line-hour":
@@ -1483,7 +1562,7 @@ def _markdown_table(df: pd.DataFrame) -> list[str]:
 def _metric_select(prefix: str = "") -> str:
     return f"""
         COUNT(*) AS {prefix}bucket_count,
-        COALESCE(SUM(raw_poll_count), 0) AS {prefix}raw_poll_count,
+        CAST(COALESCE(SUM(raw_poll_count), 0) AS BIGINT) AS {prefix}raw_poll_count,
         AVG(delay_seconds) / 60.0 AS {prefix}signed_mean_delay_min,
         AVG(delay_seconds) / 60.0 AS {prefix}avg_delay_min,
         MEDIAN(delay_seconds) / 60.0 AS {prefix}median_delay_min,
@@ -1689,17 +1768,41 @@ def _expected_manifest(
     return {
         "cache_version": CACHE_VERSION,
         "db_metadata": db_metadata,
-        "settings": {
-            "quality_mode": settings.quality_mode,
-            "bucket": settings.bucket,
-            "timezone": settings.timezone,
-            "limit": settings.limit,
-            "min_observations": settings.min_observations,
-            "exclude_stop_call_disagreement": settings.exclude_stop_call_disagreement,
-            "rush_windows": list(settings.rush_windows),
-            "include_weekends": settings.include_weekends,
-            "gtfs_dir": str(settings.gtfs_dir) if settings.gtfs_dir else None,
-        },
+        "settings": _settings_manifest(settings),
+    }
+
+
+def _expected_base_manifest(
+    settings: ReportSettings,
+    db_metadata: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "cache_version": CACHE_VERSION,
+        "db_metadata": db_metadata,
+        "base_settings": _base_settings_manifest(settings),
+    }
+
+
+def _settings_manifest(settings: ReportSettings) -> dict[str, Any]:
+    return {
+        "quality_mode": settings.quality_mode,
+        "bucket": settings.bucket,
+        "timezone": settings.timezone,
+        "limit": settings.limit,
+        "min_observations": settings.min_observations,
+        "exclude_stop_call_disagreement": settings.exclude_stop_call_disagreement,
+        "rush_windows": list(settings.rush_windows),
+        "include_weekends": settings.include_weekends,
+        "gtfs_dir": str(settings.gtfs_dir) if settings.gtfs_dir else None,
+    }
+
+
+def _base_settings_manifest(settings: ReportSettings) -> dict[str, Any]:
+    return {
+        "quality_mode": settings.quality_mode,
+        "bucket": settings.bucket,
+        "timezone": settings.timezone,
+        "exclude_stop_call_disagreement": settings.exclude_stop_call_disagreement,
     }
 
 
@@ -1713,6 +1816,78 @@ def _manifest_matches(
         if current.get(key) != expected.get(key):
             return False
     return True
+
+
+def _manifest_base_matches(
+    current: dict[str, Any] | None,
+    expected: dict[str, Any],
+) -> bool:
+    if current is None:
+        return False
+    if current.get("cache_version") != expected.get("cache_version"):
+        return False
+    if current.get("db_metadata") != expected.get("db_metadata"):
+        return False
+
+    current_base = current.get("base_settings")
+    if current_base is None:
+        current_settings = current.get("settings", {})
+        current_base = {
+            key: current_settings.get(key)
+            for key in expected.get("base_settings", {})
+        }
+    return current_base == expected.get("base_settings")
+
+
+def _manifest_file_matches(
+    current: dict[str, Any] | None,
+    file_metadata: dict[str, Any],
+) -> bool:
+    if current is None:
+        return False
+    if current.get("cache_version") != CACHE_VERSION:
+        return False
+    db_metadata = current.get("db_metadata", {})
+    return all(db_metadata.get(key) == value for key, value in file_metadata.items())
+
+
+def _manifest_settings_match(
+    current: dict[str, Any] | None,
+    settings: ReportSettings,
+) -> bool:
+    if current is None:
+        return False
+    return current.get("settings") == _settings_manifest(settings)
+
+
+def _manifest_base_settings_match(
+    current: dict[str, Any] | None,
+    settings: ReportSettings,
+) -> bool:
+    if current is None:
+        return False
+    current_base = current.get("base_settings")
+    if current_base is None:
+        current_settings = current.get("settings", {})
+        current_base = {
+            key: current_settings.get(key)
+            for key in _base_settings_manifest(settings)
+        }
+    return current_base == _base_settings_manifest(settings)
+
+
+def _current_or_collected_db_metadata(
+    current: dict[str, Any] | None,
+    db_path: Path,
+) -> dict[str, Any]:
+    if current is not None:
+        metadata = current.get("db_metadata")
+        if isinstance(metadata, dict) and _manifest_file_matches(
+            current,
+            collect_db_file_metadata(db_path),
+        ):
+            return metadata
+    return collect_db_metadata(db_path)
 
 
 def _read_manifest(path: Path) -> dict[str, Any] | None:
@@ -1763,6 +1938,19 @@ def _duckdb_table_exists(con: duckdb.DuckDBPyConnection, table_name: str) -> boo
             [table_name],
         ).fetchone()[0]
     )
+
+
+def _cache_has_tables(cache_db: Path, table_names: list[str]) -> bool:
+    try:
+        with duckdb.connect(str(cache_db), read_only=True) as con:
+            return all(_duckdb_table_exists(con, table_name) for table_name in table_names)
+    except duckdb.Error:
+        return False
+
+
+def _drop_tables(con: duckdb.DuckDBPyConnection, table_names: list[str]) -> None:
+    for table_name in table_names:
+        con.execute(f"DROP TABLE IF EXISTS {_sql_identifier(table_name)}")
 
 
 def _create_empty_table(con: duckdb.DuckDBPyConnection, table_name: str) -> None:

@@ -10,6 +10,7 @@ from _shared import (
     DEFAULT_GTFS_ROOT,
     QUALIFIED_DELAY_FILTER_SQL,
     add_bucket_arg,
+    add_cache_args,
     add_common_args,
     add_gtfs_args,
     add_quality_args,
@@ -30,6 +31,7 @@ from _shared import (
     utc_sql_timestamp,
     write_optional_csv,
 )
+from cached_queries import alert_observation_buckets as cached_alert_observation_buckets
 
 
 ALERT_GROUP_COLUMNS = ["cause", "effect", "priority", "alert_scope"]
@@ -45,6 +47,7 @@ def parse_args() -> argparse.Namespace:
     add_timezone_arg(parser)
     add_quality_args(parser)
     add_bucket_arg(parser)
+    add_cache_args(parser)
     add_gtfs_args(parser, file_description="routes.txt")
     parser.add_argument(
         "--view",
@@ -453,6 +456,15 @@ def build_correlation(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFr
         bucket=args.bucket,
         timezone=args.timezone,
     )
+    return build_correlation_from_buckets(args, observations, window_start, window_end)
+
+
+def build_correlation_from_buckets(
+    args: argparse.Namespace,
+    observations: pd.DataFrame,
+    window_start: pd.Timestamp | None,
+    window_end: pd.Timestamp | None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     if observations.empty:
         return pd.DataFrame(), pd.DataFrame()
 
@@ -567,7 +579,17 @@ def _clean_alert_value(value: object) -> str:
 
 def main() -> None:
     args = parse_args()
-    grouped, line = build_correlation(args)
+    if args.no_cache:
+        grouped, line = build_correlation(args)
+    else:
+        window_start, window_end, _ = resolve_analysis_window(args)
+        buckets = cached_alert_observation_buckets(args, (window_start, window_end))
+        grouped, line = build_correlation_from_buckets(
+            args,
+            buckets,
+            window_start,
+            window_end,
+        )
 
     csv_frames: list[pd.DataFrame] = []
     if args.view in ("both", "grouped"):

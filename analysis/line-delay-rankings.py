@@ -7,6 +7,7 @@ import pandas as pd
 from _shared import (
     QUALIFIED_DELAY_FILTER_SQL,
     add_bucket_arg,
+    add_cache_args,
     add_common_args,
     add_quality_args,
     add_timezone_arg,
@@ -20,6 +21,7 @@ from _shared import (
     summarize_delay_metrics,
     write_optional_csv,
 )
+from cached_queries import ensure_cache_from_args, line_rankings as cached_line_rankings
 
 
 def parse_args() -> argparse.Namespace:
@@ -30,6 +32,7 @@ def parse_args() -> argparse.Namespace:
     add_timezone_arg(parser)
     add_quality_args(parser)
     add_bucket_arg(parser)
+    add_cache_args(parser)
     parser.add_argument(
         "--ranking",
         choices=("both", "late", "early"),
@@ -120,18 +123,29 @@ def rank_early(df: pd.DataFrame, min_observations: int, limit: int) -> pd.DataFr
 
 def main() -> None:
     args = parse_args()
-    df = load_observations(args)
-    buckets = prepare_buckets(args, df)
+    buckets = None
+    cache_db = None
+    if args.no_cache:
+        df = load_observations(args)
+        buckets = prepare_buckets(args, df)
+    else:
+        cache_db = ensure_cache_from_args(args)
 
     outputs: list[tuple[str, pd.DataFrame]] = []
     if args.ranking in ("both", "late"):
-        outputs.append(
-            ("Most late lines", rank_late(buckets, args.min_observations, args.limit))
+        table = (
+            rank_late(buckets, args.min_observations, args.limit)
+            if args.no_cache
+            else cached_line_rankings(args, "late", cache_db=cache_db)
         )
+        outputs.append(("Most late lines", table))
     if args.ranking in ("both", "early"):
-        outputs.append(
-            ("Most early lines", rank_early(buckets, args.min_observations, args.limit))
+        table = (
+            rank_early(buckets, args.min_observations, args.limit)
+            if args.no_cache
+            else cached_line_rankings(args, "early", cache_db=cache_db)
         )
+        outputs.append(("Most early lines", table))
 
     csv_frames: list[pd.DataFrame] = []
     for title, table in outputs:

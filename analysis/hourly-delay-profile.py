@@ -8,6 +8,7 @@ from _shared import (
     QUALIFIED_DELAY_FILTER_SQL,
     add_common_args,
     add_bucket_arg,
+    add_cache_args,
     add_quality_args,
     add_timezone_arg,
     aggregate_delay_buckets,
@@ -21,6 +22,7 @@ from _shared import (
     summarize_delay_metrics,
     write_optional_csv,
 )
+from cached_queries import hourly_delay_profile as cached_hourly_delay_profile
 
 
 def parse_args() -> argparse.Namespace:
@@ -31,6 +33,7 @@ def parse_args() -> argparse.Namespace:
     add_timezone_arg(parser)
     add_quality_args(parser)
     add_bucket_arg(parser)
+    add_cache_args(parser)
     parser.add_argument(
         "--line-ref",
         help="Limit the hourly profile to one line_ref, for example 3 or 10A.",
@@ -90,8 +93,11 @@ def build_profile(args: argparse.Namespace, df: pd.DataFrame) -> pd.DataFrame:
 
 def main() -> None:
     args = parse_args()
-    df = load_observations(args)
-    profile = build_profile(args, df)
+    if args.no_cache:
+        df = load_observations(args)
+        profile = build_profile(args, df)
+    else:
+        profile = cached_hourly_delay_profile(args)
 
     print_or_empty(profile)
     write_optional_csv(profile, args.output_csv)
