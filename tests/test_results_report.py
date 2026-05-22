@@ -22,6 +22,7 @@ from analysis._shared import (
     summarize_delay_metrics,
 )
 from analysis.cached_queries import alert_observation_buckets
+from analysis.cached_queries import context_delay_metrics as cached_context_delay_metrics
 from analysis.cached_queries import line_rankings as cached_line_rankings
 from analysis.report_cache import (
     CACHE_VERSION,
@@ -346,6 +347,100 @@ class ResultsReportCacheTests(unittest.TestCase):
             self.assertEqual(
                 result["line_ref"].to_list(),
                 legacy_result["line_ref"].astype(str).to_list(),
+            )
+
+    def test_cached_context_ranking_matches_legacy_bucket_tie_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "foli.db"
+            cache_dir = Path(temp_dir) / "cache"
+            create_report_db(db_path)
+            with sqlite3.connect(db_path) as con:
+                con.execute("DELETE FROM vehicle_observations")
+                rows = [
+                    observation_row(
+                        1,
+                        1,
+                        "small-bus",
+                        "2026-04-23T08:00:00Z",
+                        "small-trip",
+                        0,
+                        "10",
+                        "Market",
+                        line_ref="small",
+                    ),
+                    observation_row(
+                        2,
+                        1,
+                        "large-bus-1",
+                        "2026-04-23T08:01:00Z",
+                        "large-trip-1",
+                        0,
+                        "10",
+                        "Market",
+                        line_ref="large",
+                    ),
+                    observation_row(
+                        3,
+                        1,
+                        "large-bus-2",
+                        "2026-04-23T08:02:00Z",
+                        "large-trip-2",
+                        0,
+                        "10",
+                        "Market",
+                        line_ref="large",
+                    ),
+                ]
+                con.executemany(
+                    """
+                    INSERT INTO vehicle_observations (
+                        id,
+                        poll_id,
+                        vehicle_id,
+                        recorded_at_utc,
+                        valid_until_utc,
+                        line_ref,
+                        direction_ref,
+                        origin_aimed_departure_time_utc,
+                        trip_match_key,
+                        is_gtfs_matchable,
+                        published_line_name,
+                        delay_seconds,
+                        next_stop_point_ref,
+                        next_stop_point_name,
+                        next_aimed_arrival_time_utc,
+                        next_expected_arrival_time_utc,
+                        next_aimed_departure_time_utc,
+                        next_expected_departure_time_utc,
+                        destination_aimed_arrival_time_utc,
+                        created_at_utc
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    rows,
+                )
+
+            args = CachedArgs(db_path, cache_dir, limit=5, min_observations=1)
+            cached = cached_context_delay_metrics(args)
+            with sqlite3.connect(db_path) as con:
+                observations = pd.read_sql_query("SELECT * FROM vehicle_observations", con)
+            legacy_buckets = aggregate_delay_buckets(
+                apply_quality_filter(observations),
+                bucket="trip-stop",
+            )
+            legacy_metrics = summarize_delay_metrics(
+                legacy_buckets,
+                ["line_ref", "direction_ref", "local_hour", "day_type"],
+                min_observations=1,
+                extra_aggs={"line_name": ("published_line_name", "first")},
+            )
+            legacy = sort_robust_delay_metrics(legacy_metrics, limit=5)
+
+            self.assertEqual(cached["line_ref"].to_list(), ["small", "large"])
+            self.assertEqual(cached["bucket_count"].to_list(), [1, 2])
+            self.assertEqual(
+                cached["line_ref"].to_list(),
+                legacy["line_ref"].astype(str).to_list(),
             )
 
     def test_windowed_cached_buckets_filter_before_aggregation(self) -> None:
