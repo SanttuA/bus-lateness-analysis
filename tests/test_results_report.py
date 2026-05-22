@@ -9,14 +9,39 @@ from pathlib import Path
 
 import duckdb
 
+from analysis.cached_queries import line_rankings as cached_line_rankings
 from analysis.report_cache import (
     ReportSettings,
+    ensure_analysis_cache,
     ensure_report_cache,
     write_markdown_report,
 )
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+class CachedArgs:
+    def __init__(
+        self,
+        db: Path,
+        cache_dir: Path,
+        *,
+        limit: int,
+        min_observations: int,
+    ) -> None:
+        self.db = db
+        self.cache_dir = cache_dir
+        self.limit = limit
+        self.min_observations = min_observations
+        self.quality_mode = "conservative"
+        self.bucket = "trip-stop"
+        self.timezone = "Europe/Helsinki"
+        self.exclude_stop_call_disagreement = False
+        self.force_cache = False
+        self.rush_window = None
+        self.include_weekends = False
+        self.gtfs_dir = None
 
 
 class ResultsReportCacheTests(unittest.TestCase):
@@ -124,6 +149,50 @@ class ResultsReportCacheTests(unittest.TestCase):
             self.assertEqual(first.status, "rebuilt")
             self.assertEqual(second.status, "reused")
 
+    def test_base_cache_reuse_ignores_result_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "foli.db"
+            cache_dir = Path(temp_dir) / "cache"
+            create_report_db(db_path)
+
+            first = ensure_analysis_cache(
+                ReportSettings(
+                    db=db_path,
+                    cache_dir=cache_dir,
+                    limit=5,
+                    min_observations=1,
+                ),
+                force=True,
+            )
+            second = ensure_analysis_cache(
+                ReportSettings(
+                    db=db_path,
+                    cache_dir=cache_dir,
+                    limit=2,
+                    min_observations=1,
+                )
+            )
+
+            self.assertEqual(first.status, "rebuilt")
+            self.assertEqual(second.status, "reused")
+
+    def test_cached_line_rankings_match_report_fixture(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "foli.db"
+            cache_dir = Path(temp_dir) / "cache"
+            create_report_db(db_path)
+
+            result = cached_line_rankings(
+                CachedArgs(db_path, cache_dir, limit=5, min_observations=1),
+                "late",
+            )
+
+            self.assertEqual(result["line_ref"].to_list(), ["3", "4"])
+            self.assertEqual(result.loc[0, "bucket_count"], 2)
+            self.assertEqual(result.loc[0, "raw_poll_count"], 3)
+            self.assertAlmostEqual(result.loc[0, "median_delay_min"], 6.0)
+            self.assertAlmostEqual(result.loc[0, "p90_delay_min"], 9.2)
+
     def test_cli_smoke_writes_report_and_compact_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "foli.db"
@@ -157,6 +226,41 @@ class ResultsReportCacheTests(unittest.TestCase):
             self.assertIn("# Overall Bus Lateness Results", report_path.read_text())
             self.assertTrue((cache_dir / "manifest.json").exists())
             self.assertTrue((cache_dir / "line_late_rankings.csv").exists())
+
+    def test_line_ranking_cli_uses_cache_and_writes_csv(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "foli.db"
+            cache_dir = Path(temp_dir) / "cache"
+            output_csv = Path(temp_dir) / "line-rankings.csv"
+            create_report_db(db_path)
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "analysis/line-delay-rankings.py",
+                    "--db",
+                    str(db_path),
+                    "--cache-dir",
+                    str(cache_dir),
+                    "--output-csv",
+                    str(output_csv),
+                    "--min-observations",
+                    "1",
+                    "--limit",
+                    "5",
+                    "--ranking",
+                    "late",
+                ],
+                cwd=PROJECT_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertIn("Most late lines", completed.stdout)
+            self.assertTrue((cache_dir / "manifest.json").exists())
+            csv_header = output_csv.read_text().splitlines()[0]
+            self.assertTrue(csv_header.startswith("ranking,line_ref,line_name"))
 
     def test_report_renderer_includes_cache_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

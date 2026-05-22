@@ -7,6 +7,7 @@ import pandas as pd
 from _shared import (
     QUALIFIED_DELAY_FILTER_SQL,
     add_bucket_arg,
+    add_cache_args,
     add_common_args,
     add_quality_args,
     add_timezone_arg,
@@ -21,6 +22,7 @@ from _shared import (
     summarize_delay_metrics,
     write_optional_csv,
 )
+from cached_queries import context_delay_metrics as cached_context_delay_metrics
 
 
 def parse_args() -> argparse.Namespace:
@@ -34,6 +36,7 @@ def parse_args() -> argparse.Namespace:
     add_timezone_arg(parser)
     add_quality_args(parser)
     add_bucket_arg(parser)
+    add_cache_args(parser)
     parser.add_argument(
         "--line-ref",
         help="Limit analysis to one line_ref, for example 3 or 10A.",
@@ -115,8 +118,11 @@ def build_context_metrics(args: argparse.Namespace, df: pd.DataFrame) -> pd.Data
 
 def main() -> None:
     args = parse_args()
-    df = load_observations(args)
-    result = build_context_metrics(args, df)
+    if args.no_cache:
+        df = load_observations(args)
+        result = build_context_metrics(args, df)
+    else:
+        result = cached_context_delay_metrics(args)
 
     print_or_empty(result)
     write_optional_csv(result, args.output_csv)

@@ -8,6 +8,7 @@ from _shared import (
     CONSERVATIVE_EXCLUSION_COLUMNS,
     QUALIFIED_DELAY_FILTER_SQL,
     QUALITY_FLAG_COLUMNS,
+    add_cache_args,
     add_common_args,
     add_timezone_arg,
     add_quality_flags,
@@ -18,6 +19,7 @@ from _shared import (
     round_numeric,
     write_optional_csv,
 )
+from cached_queries import quality_report as cached_quality_report
 
 
 def parse_args() -> argparse.Namespace:
@@ -26,6 +28,7 @@ def parse_args() -> argparse.Namespace:
     )
     add_common_args(parser)
     add_timezone_arg(parser)
+    add_cache_args(parser)
     parser.add_argument(
         "--view",
         choices=("summary", "line", "examples"),
@@ -143,14 +146,17 @@ def build_examples(df: pd.DataFrame, limit: int) -> pd.DataFrame:
 
 def main() -> None:
     args = parse_args()
-    df = add_quality_flags(load_observations(args))
+    if args.no_cache:
+        df = add_quality_flags(load_observations(args))
 
-    if args.view == "summary":
-        result = build_summary(df)
-    elif args.view == "line":
-        result = build_line_report(df, args.min_observations, args.limit)
+        if args.view == "summary":
+            result = build_summary(df)
+        elif args.view == "line":
+            result = build_line_report(df, args.min_observations, args.limit)
+        else:
+            result = build_examples(df, args.limit)
     else:
-        result = build_examples(df, args.limit)
+        result = cached_quality_report(args)
 
     print_or_empty(result)
     write_optional_csv(result, args.output_csv)

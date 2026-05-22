@@ -14,6 +14,7 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "foli.db"
 DEFAULT_GTFS_ROOT = PROJECT_ROOT / "data" / "gtfs"
+DEFAULT_ANALYSIS_CACHE_DIR = PROJECT_ROOT / "outputs" / "report-cache"
 DEFAULT_TIMEZONE = "Europe/Helsinki"
 DEFAULT_RUSH_WINDOWS = ("07:00-09:00", "15:00-18:00")
 QUALITY_MODES = ("conservative", "diagnostic", "raw")
@@ -232,6 +233,28 @@ def add_gtfs_args(
             "Root containing extracted gtfs_YYYY-MM-DD directories. Defaults to "
             f"{DEFAULT_GTFS_ROOT}."
         ),
+    )
+
+
+def add_cache_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=DEFAULT_ANALYSIS_CACHE_DIR,
+        help=(
+            "Directory for reusable DuckDB analysis cache. Defaults to "
+            f"{DEFAULT_ANALYSIS_CACHE_DIR}."
+        ),
+    )
+    parser.add_argument(
+        "--force-cache",
+        action="store_true",
+        help="Rebuild reusable DuckDB analysis cache before running.",
+    )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Use the legacy pandas path instead of the reusable DuckDB cache.",
     )
 
 

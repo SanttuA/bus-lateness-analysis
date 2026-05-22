@@ -9,6 +9,7 @@ from _shared import (
     DEFAULT_GTFS_ROOT,
     QUALIFIED_DELAY_FILTER_SQL,
     add_bucket_arg,
+    add_cache_args,
     add_common_args,
     add_gtfs_args,
     add_quality_args,
@@ -28,6 +29,7 @@ from _shared import (
     summarize_delay_metrics,
     write_optional_csv,
 )
+from cached_queries import stop_change_buckets as cached_stop_change_buckets
 
 
 def parse_args() -> argparse.Namespace:
@@ -41,6 +43,7 @@ def parse_args() -> argparse.Namespace:
     add_timezone_arg(parser)
     add_quality_args(parser)
     add_bucket_arg(parser)
+    add_cache_args(parser)
     add_gtfs_args(parser, file_description="stops.txt")
     parser.add_argument(
         "--city-parts-csv",
@@ -358,6 +361,16 @@ def build_stop_change(args: argparse.Namespace, df: pd.DataFrame) -> tuple[pd.Da
     if df.empty:
         return pd.DataFrame(), ""
 
+    return build_stop_change_from_buckets(args, df)
+
+
+def build_stop_change_from_buckets(
+    args: argparse.Namespace,
+    df: pd.DataFrame,
+) -> tuple[pd.DataFrame, str]:
+    if df.empty:
+        return pd.DataFrame(), ""
+
     stops = load_stop_metadata(
         args.gtfs_dir,
         getattr(args, "gtfs_root", DEFAULT_GTFS_ROOT),
@@ -455,8 +468,12 @@ def build_stop_change(args: argparse.Namespace, df: pd.DataFrame) -> tuple[pd.Da
 
 def main() -> None:
     args = parse_args()
-    observations = load_observations(args)
-    result, period_description = build_stop_change(args, observations)
+    if args.no_cache:
+        observations = load_observations(args)
+        result, period_description = build_stop_change(args, observations)
+    else:
+        buckets = cached_stop_change_buckets(args)
+        result, period_description = build_stop_change_from_buckets(args, buckets)
 
     if period_description:
         print(period_description)
