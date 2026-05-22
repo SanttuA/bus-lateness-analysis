@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import contextlib
+import importlib.util
+import io
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import duckdb
 import pandas as pd
@@ -21,6 +25,17 @@ from analysis.report_cache import (
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def load_script_module(name: str, relative_path: str):
+    analysis_path = str(PROJECT_ROOT / "analysis")
+    if analysis_path not in sys.path:
+        sys.path.insert(0, analysis_path)
+    spec = importlib.util.spec_from_file_location(name, PROJECT_ROOT / relative_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
 
 
 class CachedArgs:
@@ -333,6 +348,47 @@ class ResultsReportCacheTests(unittest.TestCase):
             self.assertTrue((cache_dir / "manifest.json").exists())
             csv_header = output_csv.read_text().splitlines()[0]
             self.assertTrue(csv_header.startswith("ranking,line_ref,line_name"))
+
+    def test_line_ranking_both_forces_cache_once(self) -> None:
+        line_rankings = load_script_module(
+            "line_delay_rankings_cache_once",
+            "analysis/line-delay-rankings.py",
+        )
+
+        class Args:
+            no_cache = False
+            force_cache = True
+            ranking = "both"
+            min_observations = 1
+            limit = 5
+            output_csv = None
+
+        cache_db = Path("cache.duckdb")
+        queried_rankings: list[str] = []
+
+        def fake_cached_line_rankings(args, ranking, *, cache_db=None):
+            queried_rankings.append(ranking)
+            self.assertEqual(cache_db, Path("cache.duckdb"))
+            return pd.DataFrame({"line_ref": ["3"]})
+
+        with (
+            mock.patch.object(line_rankings, "parse_args", return_value=Args),
+            mock.patch.object(
+                line_rankings,
+                "ensure_cache_from_args",
+                return_value=cache_db,
+            ) as ensure_cache,
+            mock.patch.object(
+                line_rankings,
+                "cached_line_rankings",
+                side_effect=fake_cached_line_rankings,
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            line_rankings.main()
+
+        ensure_cache.assert_called_once_with(Args)
+        self.assertEqual(queried_rankings, ["late", "early"])
 
     def test_report_renderer_includes_cache_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

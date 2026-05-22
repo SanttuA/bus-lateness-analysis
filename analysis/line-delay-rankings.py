@@ -21,7 +21,7 @@ from _shared import (
     summarize_delay_metrics,
     write_optional_csv,
 )
-from cached_queries import line_rankings as cached_line_rankings
+from cached_queries import ensure_cache_from_args, line_rankings as cached_line_rankings
 
 
 def parse_args() -> argparse.Namespace:
@@ -124,23 +124,26 @@ def rank_early(df: pd.DataFrame, min_observations: int, limit: int) -> pd.DataFr
 def main() -> None:
     args = parse_args()
     buckets = None
+    cache_db = None
     if args.no_cache:
         df = load_observations(args)
         buckets = prepare_buckets(args, df)
+    else:
+        cache_db = ensure_cache_from_args(args)
 
     outputs: list[tuple[str, pd.DataFrame]] = []
     if args.ranking in ("both", "late"):
         table = (
             rank_late(buckets, args.min_observations, args.limit)
             if args.no_cache
-            else cached_line_rankings(args, "late")
+            else cached_line_rankings(args, "late", cache_db=cache_db)
         )
         outputs.append(("Most late lines", table))
     if args.ranking in ("both", "early"):
         table = (
             rank_early(buckets, args.min_observations, args.limit)
             if args.no_cache
-            else cached_line_rankings(args, "early")
+            else cached_line_rankings(args, "early", cache_db=cache_db)
         )
         outputs.append(("Most early lines", table))
 

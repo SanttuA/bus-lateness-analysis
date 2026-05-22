@@ -57,8 +57,14 @@ def ensure_cache_from_args(args: object) -> Path:
     return result.cache_db
 
 
-def line_rankings(args: object, ranking: str) -> pd.DataFrame:
-    cache_db = ensure_cache_from_args(args)
+def line_rankings(
+    args: object,
+    ranking: str,
+    *,
+    cache_db: Path | None = None,
+) -> pd.DataFrame:
+    if cache_db is None:
+        cache_db = ensure_cache_from_args(args)
     line_metrics = f"""
         WITH line_metrics AS (
             SELECT
