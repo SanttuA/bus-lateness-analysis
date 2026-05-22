@@ -146,7 +146,7 @@ def line_rankings(
             FROM line_metrics
             ORDER BY p90_delay_min DESC,
                 pct_over_5_min_late DESC,
-                bucket_count DESC
+                bucket_count ASC
             LIMIT ?
             """
         )
@@ -179,7 +179,7 @@ def context_delay_metrics(args: object) -> pd.DataFrame:
         {where_sql}
         GROUP BY line_ref, direction_ref, local_hour, day_type
         HAVING COUNT(*) >= ?
-        ORDER BY p90_delay_min DESC, pct_over_5_min_late DESC, bucket_count DESC
+        ORDER BY p90_delay_min DESC, pct_over_5_min_late DESC, bucket_count ASC
         LIMIT ?
     """
     params.extend([args.min_observations, args.limit])
@@ -222,7 +222,7 @@ def hourly_delay_profile(args: object) -> pd.DataFrame:
         {where_sql}
         GROUP BY local_hour
         HAVING COUNT(*) >= ?
-        ORDER BY p90_delay_min DESC, pct_over_5_min_late DESC, bucket_count DESC
+        ORDER BY p90_delay_min DESC, pct_over_5_min_late DESC, bucket_count ASC
         LIMIT ?
     """
     params.extend([args.min_observations, args.limit])

@@ -210,6 +210,85 @@ class ResultsReportCacheTests(unittest.TestCase):
             self.assertAlmostEqual(result.loc[0, "median_delay_min"], 6.0)
             self.assertAlmostEqual(result.loc[0, "p90_delay_min"], 9.2)
 
+    def test_cached_robust_line_ranking_matches_legacy_bucket_tie_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "foli.db"
+            cache_dir = Path(temp_dir) / "cache"
+            create_report_db(db_path)
+            with sqlite3.connect(db_path) as con:
+                con.execute("DELETE FROM vehicle_observations")
+                rows = [
+                    observation_row(
+                        1,
+                        1,
+                        "small-bus",
+                        "2026-04-23T08:00:00Z",
+                        "small-trip",
+                        0,
+                        "10",
+                        "Market",
+                        line_ref="small",
+                    ),
+                    observation_row(
+                        2,
+                        1,
+                        "large-bus-1",
+                        "2026-04-23T08:01:00Z",
+                        "large-trip-1",
+                        0,
+                        "10",
+                        "Market",
+                        line_ref="large",
+                    ),
+                    observation_row(
+                        3,
+                        1,
+                        "large-bus-2",
+                        "2026-04-23T08:02:00Z",
+                        "large-trip-2",
+                        0,
+                        "10",
+                        "Market",
+                        line_ref="large",
+                    ),
+                ]
+                con.executemany(
+                    """
+                    INSERT INTO vehicle_observations (
+                        id,
+                        poll_id,
+                        vehicle_id,
+                        recorded_at_utc,
+                        valid_until_utc,
+                        line_ref,
+                        direction_ref,
+                        origin_aimed_departure_time_utc,
+                        trip_match_key,
+                        is_gtfs_matchable,
+                        published_line_name,
+                        delay_seconds,
+                        next_stop_point_ref,
+                        next_stop_point_name,
+                        next_aimed_arrival_time_utc,
+                        next_expected_arrival_time_utc,
+                        next_aimed_departure_time_utc,
+                        next_expected_departure_time_utc,
+                        destination_aimed_arrival_time_utc,
+                        created_at_utc
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    rows,
+                )
+
+            result = cached_line_rankings(
+                CachedArgs(db_path, cache_dir, limit=5, min_observations=1),
+                "robust",
+            )
+
+            self.assertEqual(result["line_ref"].to_list(), ["small", "large"])
+            self.assertEqual(result["bucket_count"].to_list(), [1, 2])
+
     def test_windowed_cached_buckets_filter_before_aggregation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "foli.db"
