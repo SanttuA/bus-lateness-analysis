@@ -221,8 +221,19 @@ class ResultsReportCacheTests(unittest.TestCase):
                     observation_row(
                         1,
                         1,
-                        "small-bus",
+                        "alpha-bus",
                         "2026-04-23T08:00:00Z",
+                        "alpha-trip",
+                        0,
+                        "10",
+                        "Market",
+                        line_ref="alpha",
+                    ),
+                    observation_row(
+                        2,
+                        1,
+                        "small-bus",
+                        "2026-04-23T08:00:30Z",
                         "small-trip",
                         0,
                         "10",
@@ -230,7 +241,7 @@ class ResultsReportCacheTests(unittest.TestCase):
                         line_ref="small",
                     ),
                     observation_row(
-                        2,
+                        3,
                         1,
                         "large-bus-1",
                         "2026-04-23T08:01:00Z",
@@ -241,7 +252,7 @@ class ResultsReportCacheTests(unittest.TestCase):
                         line_ref="large",
                     ),
                     observation_row(
-                        3,
+                        4,
                         1,
                         "large-bus-2",
                         "2026-04-23T08:02:00Z",
@@ -286,8 +297,8 @@ class ResultsReportCacheTests(unittest.TestCase):
                 "robust",
             )
 
-            self.assertEqual(result["line_ref"].to_list(), ["small", "large"])
-            self.assertEqual(result["bucket_count"].to_list(), [1, 2])
+            self.assertEqual(result["line_ref"].to_list(), ["alpha", "small", "large"])
+            self.assertEqual(result["bucket_count"].to_list(), [1, 1, 2])
 
     def test_windowed_cached_buckets_filter_before_aggregation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

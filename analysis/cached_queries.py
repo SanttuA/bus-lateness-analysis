@@ -146,7 +146,8 @@ def line_rankings(
             FROM line_metrics
             ORDER BY p90_delay_min DESC,
                 pct_over_5_min_late DESC,
-                bucket_count ASC
+                bucket_count ASC,
+                line_ref
             LIMIT ?
             """
         )
