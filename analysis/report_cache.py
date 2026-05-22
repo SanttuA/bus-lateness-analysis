@@ -38,7 +38,7 @@ except ImportError:  # pragma: no cover - used when called as analysis/*.py scri
     )
 
 
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 DEFAULT_CACHE_DIR = DEFAULT_ANALYSIS_CACHE_DIR
 DEFAULT_REPORT_PATH = Path("reports/generated/overall-results.md")
 MANIFEST_NAME = "manifest.json"

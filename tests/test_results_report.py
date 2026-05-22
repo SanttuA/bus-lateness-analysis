@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import importlib.util
 import io
+import json
 import sqlite3
 import subprocess
 import sys
@@ -17,6 +18,7 @@ import pandas as pd
 from analysis.cached_queries import alert_observation_buckets
 from analysis.cached_queries import line_rankings as cached_line_rankings
 from analysis.report_cache import (
+    CACHE_VERSION,
     ReportSettings,
     ensure_analysis_cache,
     ensure_report_cache,
@@ -192,6 +194,29 @@ class ResultsReportCacheTests(unittest.TestCase):
 
             self.assertEqual(first.status, "rebuilt")
             self.assertEqual(second.status, "reused")
+
+    def test_base_cache_rebuilds_stale_cache_version(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "foli.db"
+            cache_dir = Path(temp_dir) / "cache"
+            create_report_db(db_path)
+            settings = ReportSettings(
+                db=db_path,
+                cache_dir=cache_dir,
+                min_observations=1,
+            )
+
+            first = ensure_analysis_cache(settings)
+            manifest_path = cache_dir / "manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["cache_version"] = CACHE_VERSION - 1
+            manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+
+            second = ensure_analysis_cache(settings)
+
+            self.assertEqual(first.status, "rebuilt")
+            self.assertEqual(second.status, "rebuilt")
+            self.assertEqual(second.manifest["cache_version"], CACHE_VERSION)
 
     def test_cached_line_rankings_match_report_fixture(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
