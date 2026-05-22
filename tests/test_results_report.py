@@ -8,7 +8,9 @@ import unittest
 from pathlib import Path
 
 import duckdb
+import pandas as pd
 
+from analysis.cached_queries import alert_observation_buckets
 from analysis.cached_queries import line_rankings as cached_line_rankings
 from analysis.report_cache import (
     ReportSettings,
@@ -192,6 +194,76 @@ class ResultsReportCacheTests(unittest.TestCase):
             self.assertEqual(result.loc[0, "raw_poll_count"], 3)
             self.assertAlmostEqual(result.loc[0, "median_delay_min"], 6.0)
             self.assertAlmostEqual(result.loc[0, "p90_delay_min"], 9.2)
+
+    def test_windowed_cached_buckets_filter_before_aggregation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "foli.db"
+            cache_dir = Path(temp_dir) / "cache"
+            create_report_db(db_path)
+            with sqlite3.connect(db_path) as con:
+                con.execute("DELETE FROM vehicle_observations")
+                rows = [
+                    observation_row(
+                        1,
+                        1,
+                        "boundary-bus",
+                        "2026-04-23T23:59:00Z",
+                        "boundary-trip",
+                        60,
+                        "10",
+                        "Market",
+                    ),
+                    observation_row(
+                        2,
+                        1,
+                        "boundary-bus",
+                        "2026-04-24T00:01:00Z",
+                        "boundary-trip",
+                        600,
+                        "10",
+                        "Market",
+                    ),
+                ]
+                con.executemany(
+                    """
+                    INSERT INTO vehicle_observations (
+                        id,
+                        poll_id,
+                        vehicle_id,
+                        recorded_at_utc,
+                        valid_until_utc,
+                        line_ref,
+                        direction_ref,
+                        origin_aimed_departure_time_utc,
+                        trip_match_key,
+                        is_gtfs_matchable,
+                        published_line_name,
+                        delay_seconds,
+                        next_stop_point_ref,
+                        next_stop_point_name,
+                        next_aimed_arrival_time_utc,
+                        next_expected_arrival_time_utc,
+                        next_aimed_departure_time_utc,
+                        next_expected_departure_time_utc,
+                        destination_aimed_arrival_time_utc,
+                        created_at_utc
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    rows,
+                )
+
+            result = alert_observation_buckets(
+                CachedArgs(db_path, cache_dir, limit=5, min_observations=1),
+                (
+                    pd.Timestamp("2026-04-24T00:00:00Z"),
+                    pd.Timestamp("2026-04-25T00:00:00Z"),
+                ),
+            )
+
+            self.assertEqual(len(result), 1)
+            self.assertEqual(result.loc[0, "raw_poll_count"], 1)
+            self.assertEqual(result.loc[0, "delay_seconds"], 600)
 
     def test_cli_smoke_writes_report_and_compact_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

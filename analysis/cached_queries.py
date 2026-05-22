@@ -9,16 +9,20 @@ try:
     from ._shared import DEFAULT_RUSH_WINDOWS, round_numeric, rush_window_values
     from .report_cache import (
         ReportSettings,
+        _local_time_select,
         _metric_select,
         _rush_condition,
+        _sql_literal,
         ensure_analysis_cache,
     )
 except ImportError:  # pragma: no cover - used when called as analysis/*.py script.
     from _shared import DEFAULT_RUSH_WINDOWS, round_numeric, rush_window_values
     from report_cache import (
         ReportSettings,
+        _local_time_select,
         _metric_select,
         _rush_condition,
+        _sql_literal,
         ensure_analysis_cache,
     )
 
@@ -420,12 +424,14 @@ def stop_change_buckets(args: object) -> pd.DataFrame:
     if getattr(args, "direction_ref", None):
         where_parts.append("direction_ref = ?")
         params.append(args.direction_ref)
-    _append_representative_time_filters(where_parts, params, start, end)
-    query = f"""
-        SELECT *
-        FROM delay_buckets
-        WHERE {" AND ".join(where_parts)}
-    """
+    _append_representative_time_filters(
+        where_parts,
+        params,
+        start,
+        end,
+        column="COALESCE(next_aimed_arrival_time_utc, recorded_at_utc)",
+    )
+    query = _bucketed_quality_rows_query(args, where_parts)
     return _read_cache(cache_db, query, params)
 
 
@@ -439,13 +445,14 @@ def alert_observation_buckets(
     if getattr(args, "line_ref", None):
         where_parts.append("line_ref = ?")
         params.append(args.line_ref)
-    _append_representative_time_filters(where_parts, params, window[0], window[1])
-    where_sql = "WHERE " + " AND ".join(where_parts) if where_parts else ""
-    query = f"""
-        SELECT *
-        FROM delay_buckets
-        {where_sql}
-    """
+    _append_representative_time_filters(
+        where_parts,
+        params,
+        window[0],
+        window[1],
+        column="COALESCE(next_aimed_arrival_time_utc, recorded_at_utc)",
+    )
+    query = _bucketed_quality_rows_query(args, where_parts)
     return _read_cache(cache_db, query, params)
 
 
@@ -488,12 +495,14 @@ def _append_representative_time_filters(
     params: list[object],
     start_utc: object | None,
     end_utc: object | None,
+    *,
+    column: str = "representative_time_utc",
 ) -> None:
     if start_utc is not None:
-        where_parts.append("representative_time_utc >= ?")
+        where_parts.append(f"{column} >= ?")
         params.append(start_utc)
     if end_utc is not None:
-        where_parts.append("representative_time_utc < ?")
+        where_parts.append(f"{column} < ?")
         params.append(end_utc)
 
 
@@ -502,6 +511,126 @@ def _parse_timestamp(value: str, timezone: str) -> pd.Timestamp:
     if timestamp.tzinfo is None:
         timestamp = timestamp.tz_localize(timezone)
     return timestamp.tz_convert("UTC")
+
+
+def _bucketed_quality_rows_query(args: object, extra_where_parts: list[str]) -> str:
+    settings = settings_from_args(args)
+    where_parts = [
+        "quality_pass",
+        "delay_seconds IS NOT NULL",
+        "recorded_at_utc IS NOT NULL",
+        "line_ref IS NOT NULL",
+        *extra_where_parts,
+    ]
+    where_sql = " AND ".join(where_parts)
+
+    if settings.bucket == "poll":
+        return f"""
+            SELECT
+                COALESCE(CAST(id AS VARCHAR), CAST(row_number() OVER () AS VARCHAR))
+                    AS bucket_id,
+                'poll' AS bucket_mode,
+                CAST(line_ref AS VARCHAR) AS line_ref,
+                COALESCE(CAST(direction_ref AS VARCHAR), 'Unknown') AS direction_ref,
+                COALESCE(CAST(published_line_name AS VARCHAR), CAST(line_ref AS VARCHAR))
+                    AS published_line_name,
+                delay_seconds,
+                delay_seconds / 60.0 AS delay_min,
+                1::BIGINT AS raw_poll_count,
+                CAST(next_stop_point_ref AS VARCHAR) AS next_stop_point_ref,
+                CAST(next_stop_point_name AS VARCHAR) AS next_stop_point_name,
+                COALESCE(next_aimed_arrival_time_utc, recorded_at_utc)
+                    AS representative_time_utc,
+                recorded_at_utc,
+                recorded_at_utc AS first_recorded_at_utc,
+                recorded_at_utc AS last_recorded_at_utc,
+                {_local_time_select(settings.timezone)}
+            FROM quality_rows
+            WHERE {where_sql}
+        """
+
+    if settings.bucket == "trip-stop":
+        group_keys = [
+            "trip_match_key",
+            "vehicle_id",
+            "line_ref",
+            "direction_ref",
+            "next_stop_point_ref",
+        ]
+    elif settings.bucket == "vehicle-trip":
+        group_keys = ["trip_match_key", "vehicle_id", "line_ref", "direction_ref"]
+    else:
+        group_keys = ["line_ref", "direction_ref", "local_date", "local_hour", "day_type"]
+
+    base = f"""
+        SELECT
+            id,
+            trip_match_key,
+            vehicle_id,
+            CAST(line_ref AS VARCHAR) AS line_ref,
+            COALESCE(CAST(direction_ref AS VARCHAR), 'Unknown') AS direction_ref,
+            CAST(next_stop_point_ref AS VARCHAR) AS next_stop_point_ref,
+            COALESCE(CAST(published_line_name AS VARCHAR), CAST(line_ref AS VARCHAR))
+                AS published_line_name,
+            CAST(next_stop_point_name AS VARCHAR) AS next_stop_point_name,
+            delay_seconds,
+            recorded_at_utc,
+            COALESCE(next_aimed_arrival_time_utc, recorded_at_utc)
+                AS representative_time_utc
+        FROM quality_rows
+        WHERE {where_sql}
+    """
+    if settings.bucket == "line-hour":
+        base = f"""
+            SELECT *, {_local_time_select(settings.timezone)}
+            FROM ({base}) base_rows
+            WHERE representative_time_utc IS NOT NULL
+        """
+
+    group_sql = ", ".join(group_keys)
+    bucket_id_sql = " || '|' || ".join(
+        f"COALESCE(CAST({column} AS VARCHAR), '<NA>')" for column in group_keys
+    )
+    return f"""
+        WITH base_rows AS (
+            {base}
+        ),
+        grouped AS (
+            SELECT
+                {group_sql},
+                MEDIAN(delay_seconds) AS delay_seconds,
+                COUNT(*) AS raw_poll_count,
+                FIRST(published_line_name ORDER BY representative_time_utc)
+                    AS published_line_name,
+                FIRST(next_stop_point_name ORDER BY representative_time_utc)
+                    AS next_stop_point_name,
+                MIN(representative_time_utc) AS representative_time_utc,
+                MIN(recorded_at_utc) AS recorded_at_utc,
+                MIN(recorded_at_utc) AS first_recorded_at_utc,
+                MAX(recorded_at_utc) AS last_recorded_at_utc
+            FROM base_rows
+            WHERE representative_time_utc IS NOT NULL
+            GROUP BY {group_sql}
+        )
+        SELECT
+            {bucket_id_sql} AS bucket_id,
+            {_sql_literal(settings.bucket)} AS bucket_mode,
+            line_ref,
+            direction_ref,
+            published_line_name,
+            delay_seconds,
+            delay_seconds / 60.0 AS delay_min,
+            raw_poll_count,
+            {'next_stop_point_ref' if 'next_stop_point_ref' in group_keys else 'NULL::VARCHAR'}
+                AS next_stop_point_ref,
+            next_stop_point_name,
+            representative_time_utc,
+            recorded_at_utc,
+            first_recorded_at_utc,
+            last_recorded_at_utc,
+            {_local_time_select(settings.timezone)}
+        FROM grouped
+    """
 
 
 def _read_cache(
