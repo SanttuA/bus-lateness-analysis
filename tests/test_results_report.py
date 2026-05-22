@@ -359,6 +359,96 @@ class ResultsReportCacheTests(unittest.TestCase):
             self.assertEqual(result.loc[0, "raw_poll_count"], 1)
             self.assertEqual(result.loc[0, "delay_seconds"], 600)
 
+    def test_cached_buckets_keep_missing_recorded_at_with_representative_time(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "foli.db"
+            cache_dir = Path(temp_dir) / "cache"
+            create_report_db(db_path)
+            with sqlite3.connect(db_path) as con:
+                con.execute("DELETE FROM vehicle_observations")
+                con.execute(
+                    """
+                    INSERT INTO vehicle_observations (
+                        id,
+                        poll_id,
+                        vehicle_id,
+                        recorded_at_utc,
+                        valid_until_utc,
+                        line_ref,
+                        direction_ref,
+                        origin_aimed_departure_time_utc,
+                        trip_match_key,
+                        is_gtfs_matchable,
+                        published_line_name,
+                        delay_seconds,
+                        next_stop_point_ref,
+                        next_stop_point_name,
+                        next_aimed_arrival_time_utc,
+                        next_expected_arrival_time_utc,
+                        next_aimed_departure_time_utc,
+                        next_expected_departure_time_utc,
+                        destination_aimed_arrival_time_utc,
+                        created_at_utc
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        1,
+                        1,
+                        "missing-recorded",
+                        None,
+                        "2026-04-24T00:02:30Z",
+                        "3",
+                        "1",
+                        None,
+                        "missing-recorded-trip",
+                        1,
+                        "3",
+                        300,
+                        "10",
+                        "Market",
+                        "2026-04-24T00:01:00Z",
+                        "2026-04-24T00:06:00Z",
+                        None,
+                        None,
+                        "2026-04-24T01:00:00Z",
+                        "2026-04-24T00:00:30Z",
+                    ),
+                )
+
+            cache = ensure_analysis_cache(
+                ReportSettings(
+                    db=db_path,
+                    cache_dir=cache_dir,
+                    min_observations=1,
+                )
+            )
+            with duckdb.connect(str(cache.cache_db), read_only=True) as con:
+                base_row = con.execute(
+                    """
+                    SELECT
+                        raw_poll_count,
+                        delay_seconds,
+                        representative_time_utc IS NOT NULL AS has_representative_time
+                    FROM delay_buckets
+                    """
+                ).fetchone()
+
+            windowed = alert_observation_buckets(
+                CachedArgs(db_path, cache_dir, limit=5, min_observations=1),
+                (
+                    pd.Timestamp("2026-04-24T00:00:00Z"),
+                    pd.Timestamp("2026-04-24T00:02:00Z"),
+                ),
+            )
+
+            self.assertEqual(base_row[0], 1)
+            self.assertEqual(base_row[1], 300)
+            self.assertTrue(base_row[2])
+            self.assertEqual(len(windowed), 1)
+            self.assertEqual(windowed.loc[0, "raw_poll_count"], 1)
+            self.assertEqual(windowed.loc[0, "delay_seconds"], 300)
+
     def test_cli_smoke_writes_report_and_compact_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "foli.db"

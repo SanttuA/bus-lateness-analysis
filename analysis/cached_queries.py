@@ -524,7 +524,7 @@ def _bucketed_quality_rows_query(args: object, extra_where_parts: list[str]) -> 
     where_parts = [
         "quality_pass",
         "delay_seconds IS NOT NULL",
-        "recorded_at_utc IS NOT NULL",
+        "COALESCE(next_aimed_arrival_time_utc, recorded_at_utc) IS NOT NULL",
         "line_ref IS NOT NULL",
         *extra_where_parts,
     ]

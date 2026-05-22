@@ -451,7 +451,7 @@ def _build_delay_buckets(con: duckdb.DuckDBPyConnection, settings: ReportSetting
             FROM quality_rows
             WHERE quality_pass
                 AND delay_seconds IS NOT NULL
-                AND recorded_at_utc IS NOT NULL
+                AND COALESCE(next_aimed_arrival_time_utc, recorded_at_utc) IS NOT NULL
                 AND line_ref IS NOT NULL
             """
         )
@@ -488,7 +488,7 @@ def _build_delay_buckets(con: duckdb.DuckDBPyConnection, settings: ReportSetting
         FROM quality_rows
         WHERE quality_pass
             AND delay_seconds IS NOT NULL
-            AND recorded_at_utc IS NOT NULL
+            AND COALESCE(next_aimed_arrival_time_utc, recorded_at_utc) IS NOT NULL
             AND line_ref IS NOT NULL
     """
     if settings.bucket == "line-hour":
