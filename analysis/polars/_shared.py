@@ -249,6 +249,25 @@ def base_quality_query(*, where: str = QUALIFIED_DELAY_FILTER_SQL, extra_columns
     """
 
 
+def base_quality_query_without_collector(
+    *,
+    where: str = QUALIFIED_DELAY_FILTER_SQL,
+    extra_columns: str = "",
+) -> str:
+    columns = QUALITY_SELECT_SQL.replace(
+        "    p.collected_at_utc,",
+        "    NULL AS collected_at_utc,",
+    )
+    if extra_columns:
+        columns = f"{columns},\n{extra_columns}"
+    return f"""
+    SELECT
+{columns}
+    FROM vehicle_observations v
+    WHERE {where}
+    """
+
+
 def utc_sql_timestamp(value: object, *, ceil: bool = False) -> str:
     timestamp = parse_timestamp(value, "UTC")
     if ceil and timestamp.microsecond:

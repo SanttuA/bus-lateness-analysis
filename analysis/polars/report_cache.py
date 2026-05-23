@@ -26,6 +26,7 @@ try:
         aggregate_delay_buckets,
         assign_gtfs_feed_dates,
         base_quality_query,
+        base_quality_query_without_collector,
         gtfs_feed_date_for_timestamp,
         gtfs_metadata_fingerprint,
         load_gtfs_route_metadata,
@@ -59,6 +60,7 @@ except ImportError:  # pragma: no cover - used when called as analysis/polars/*.
         aggregate_delay_buckets,
         assign_gtfs_feed_dates,
         base_quality_query,
+        base_quality_query_without_collector,
         gtfs_feed_date_for_timestamp,
         gtfs_metadata_fingerprint,
         load_gtfs_route_metadata,
@@ -819,6 +821,9 @@ def summarize_period(df: pl.DataFrame, keys: list[str], prefix: str) -> pl.DataF
 
 
 def load_collector_polls(settings: ReportSettings, *, source: str | None = None) -> pl.DataFrame:
+    if not _db_table_exists(settings.db, "collector_polls"):
+        return _empty_collector_polls()
+
     where = "1 = 1"
     params: list[object] = []
     if source:
@@ -993,6 +998,9 @@ def load_alerts(
     settings: ReportSettings,
     window: tuple[datetime | None, datetime | None] | None = None,
 ) -> pl.DataFrame:
+    if not _db_table_exists(settings.db, "service_alerts"):
+        return _empty_alerts()
+
     where = "is_active = 1"
     params: list[object] = []
     if window is not None:
@@ -1350,7 +1358,12 @@ def _build_result_tables(
 
 
 def _build_quality_rows(settings: ReportSettings) -> pl.DataFrame:
-    rows = read_sql(settings.db, base_quality_query())
+    query = (
+        base_quality_query()
+        if _db_table_exists(settings.db, "collector_polls")
+        else base_quality_query_without_collector()
+    )
+    rows = read_sql(settings.db, query)
     return add_quality_pass(
         rows,
         quality_mode=settings.quality_mode,
@@ -1574,6 +1587,12 @@ def _table_count(con: sqlite3.Connection, table_name: str) -> int:
     return int(con.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0])
 
 
+def _db_table_exists(db_path: Path, table_name: str) -> bool:
+    db_path = resolve_project_path(db_path)
+    with sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True) as con:
+        return _table_exists_sqlite(con, table_name)
+
+
 def _table_exists_sqlite(con: sqlite3.Connection, table_name: str) -> bool:
     return (
         con.execute(
@@ -1581,6 +1600,38 @@ def _table_exists_sqlite(con: sqlite3.Connection, table_name: str) -> bool:
             [table_name],
         ).fetchone()
         is not None
+    )
+
+
+def _empty_collector_polls() -> pl.DataFrame:
+    return pl.DataFrame(
+        schema={
+            "source": pl.Utf8,
+            "attempted_at_utc": pl.Utf8,
+            "collected_at_utc": pl.Utf8,
+            "status": pl.Utf8,
+            "ok": pl.Int64,
+            "row_count": pl.Int64,
+            "gap_seconds_since_previous_success": pl.Float64,
+        }
+    )
+
+
+def _empty_alerts() -> pl.DataFrame:
+    return pl.DataFrame(
+        schema={
+            "source_alert_id": pl.Utf8,
+            "line_ref": pl.Utf8,
+            "cause": pl.Utf8,
+            "effect": pl.Utf8,
+            "priority": pl.Int64,
+            "is_active": pl.Int64,
+            "validity_start_utc": pl.Utf8,
+            "validity_end_utc": pl.Utf8,
+            "affected_routes_json": pl.Utf8,
+            "affected_stops_json": pl.Utf8,
+            "created_at_utc": pl.Utf8,
+        }
     )
 
 

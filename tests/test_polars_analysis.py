@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -294,7 +295,28 @@ class PolarsReportParityTests(unittest.TestCase):
             self.assertIn("Most late lines", completed.stdout)
             self.assertTrue(output_csv.read_text().splitlines()[0].startswith("ranking,line_ref,line_name"))
 
+    def test_polars_report_handles_missing_optional_ingestion_tables(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            db_path = temp / "foli.db"
+            create_report_db(db_path)
+            with sqlite3.connect(db_path) as con:
+                con.execute("DROP TABLE collector_polls")
+                con.execute("DROP TABLE service_alerts")
+
+            settings = PolarsReportSettings(
+                db=db_path,
+                cache_dir=temp / "polars-cache",
+                min_observations=1,
+                limit=5,
+            )
+            result = ensure_polars_report_cache(settings, force=True)
+
+            self.assertEqual(result.status, "rebuilt")
+            self.assertTrue((settings.cache_dir / "quality_rows.parquet").exists())
+            self.assertTrue(read_polars_result_table(settings.cache_dir, "collector_blackouts").is_empty())
+            self.assertTrue(read_polars_result_table(settings.cache_dir, "service_alert_grouped").is_empty())
+
 
 if __name__ == "__main__":
     unittest.main()
-
