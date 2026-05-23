@@ -45,6 +45,27 @@ runs can reuse midpoint calculations and other summaries instead of loading the
 full SQLite database into pandas. The cache is rebuilt when `data/foli.db` or
 report settings change; pass `--force` to rebuild it manually.
 
+## Polars Analysis Option
+
+The default analysis path above is unchanged. A secondary Polars CLI path is
+available under `analysis/polars/` for performance comparisons:
+
+```sh
+uv run python analysis/polars/build-results-report.py
+```
+
+The Polars report is written to
+`reports/generated/overall-results-polars.md`. Its Parquet cache and compact
+CSVs are written separately under `outputs/polars-report-cache/`, so the
+existing DuckDB/pandas outputs remain comparable.
+
+Example Polars CLI commands:
+
+```sh
+uv run python analysis/polars/line-delay-rankings.py --ranking both --limit 10
+uv run python analysis/polars/hourly-delay-profile.py --line-ref 3 --limit 24
+```
+
 ## Dashboard
 
 Run the local interactive dashboard with:
