@@ -887,6 +887,25 @@ def gtfs_metadata_fingerprint(
     return "||".join(parts)
 
 
+def gtfs_dir_fingerprint(
+    gtfs_dir: Path | str | None,
+    *,
+    filenames: tuple[str, ...] = ("stops.txt", "routes.txt"),
+) -> str | None:
+    if gtfs_dir is None:
+        return None
+    resolved = resolve_project_path(gtfs_dir)
+    parts: list[str] = []
+    for filename in filenames:
+        path = resolved / filename
+        if not path.exists():
+            parts.append(f"{filename}|missing")
+            continue
+        stat = path.stat()
+        parts.append(f"{filename}|{stat.st_mtime_ns}|{stat.st_size}")
+    return "||".join(parts)
+
+
 def empty_bucket_frame() -> pl.DataFrame:
     return pl.DataFrame(
         schema={

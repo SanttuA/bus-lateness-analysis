@@ -5,6 +5,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -316,6 +317,43 @@ class PolarsReportParityTests(unittest.TestCase):
             self.assertTrue((settings.cache_dir / "quality_rows.parquet").exists())
             self.assertTrue(read_polars_result_table(settings.cache_dir, "collector_blackouts").is_empty())
             self.assertTrue(read_polars_result_table(settings.cache_dir, "service_alert_grouped").is_empty())
+
+    def test_polars_report_cache_invalidates_when_explicit_gtfs_dir_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            db_path = temp / "foli.db"
+            gtfs_dir = temp / "gtfs"
+            gtfs_dir.mkdir()
+            (gtfs_dir / "stops.txt").write_text(
+                "stop_id,stop_name,stop_lat,stop_lon\n"
+                "10,Market,60.45,22.27\n",
+                encoding="utf-8",
+            )
+            (gtfs_dir / "routes.txt").write_text(
+                "route_id,route_short_name\n"
+                "route-a,3\n",
+                encoding="utf-8",
+            )
+            create_report_db(db_path)
+            settings = PolarsReportSettings(
+                db=db_path,
+                cache_dir=temp / "polars-cache",
+                gtfs_dir=gtfs_dir,
+                min_observations=1,
+                limit=5,
+            )
+
+            first = ensure_polars_report_cache(settings)
+            time.sleep(0.01)
+            (gtfs_dir / "stops.txt").write_text(
+                "stop_id,stop_name,stop_lat,stop_lon\n"
+                "10,Corrected Market,60.45,22.27\n",
+                encoding="utf-8",
+            )
+            second = ensure_polars_report_cache(settings)
+
+            self.assertEqual(first.status, "rebuilt")
+            self.assertEqual(second.status, "rebuilt")
 
 
 if __name__ == "__main__":

@@ -27,6 +27,7 @@ try:
         assign_gtfs_feed_dates,
         base_quality_query,
         base_quality_query_without_collector,
+        gtfs_dir_fingerprint,
         gtfs_feed_date_for_timestamp,
         gtfs_metadata_fingerprint,
         load_gtfs_route_metadata,
@@ -61,6 +62,7 @@ except ImportError:  # pragma: no cover - used when called as analysis/polars/*.
         assign_gtfs_feed_dates,
         base_quality_query,
         base_quality_query_without_collector,
+        gtfs_dir_fingerprint,
         gtfs_feed_date_for_timestamp,
         gtfs_metadata_fingerprint,
         load_gtfs_route_metadata,
@@ -1536,6 +1538,7 @@ def _settings_manifest(settings: ReportSettings, *, base_only: bool) -> dict[str
                 "rush_windows": list(settings.rush_windows),
                 "include_weekends": settings.include_weekends,
                 "gtfs_dir": str(settings.gtfs_dir) if settings.gtfs_dir else None,
+                "gtfs_dir_metadata": gtfs_dir_fingerprint(settings.gtfs_dir),
                 "gtfs_root": str(settings.gtfs_root),
                 "gtfs_metadata": gtfs_metadata_fingerprint(settings.gtfs_root),
             }
