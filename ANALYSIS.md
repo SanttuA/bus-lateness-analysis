@@ -22,6 +22,9 @@ buckets by default.
   `outputs/report-cache/` by default. Use `--no-cache` for the legacy pandas
   path, `--force-cache` to rebuild reusable base tables, or `--cache-dir` to
   point at a different cache directory.
+- A secondary Polars CLI path lives under `analysis/polars/`. It keeps separate
+  Parquet and CSV outputs under `outputs/polars-report-cache/` and does not
+  replace the default analysis scripts.
 - Stop and route metadata use extracted GTFS directories named
   `data/gtfs/gtfs_YYYY-MM-DD` by default. Each snapshot applies from that local
   date until the next snapshot date. Use `--gtfs-dir` on GTFS-aware scripts to
@@ -46,10 +49,25 @@ metadata and report settings match, and rebuilds it when they change. Use
 uv run python analysis/build-results-report.py --force
 ```
 
+Generate the separate Polars report and cache:
+
+```sh
+uv run python analysis/polars/build-results-report.py
+```
+
+The report is written to `reports/generated/overall-results-polars.md`, with
+Parquet intermediates and matching CSVs under `outputs/polars-report-cache/`.
+Use `--force` to rebuild manually:
+
+```sh
+uv run python analysis/polars/build-results-report.py --force
+```
+
 Data-quality summary before delay metrics:
 
 ```sh
 uv run python analysis/data-quality-report.py --view summary
+uv run python analysis/polars/data-quality-report.py --view summary
 ```
 
 Show quality issues by line or example flagged rows:
@@ -63,6 +81,7 @@ Robust line delay ranking:
 
 ```sh
 uv run python analysis/avg-line-delay.py --limit 20 --min-observations 50
+uv run python analysis/polars/avg-line-delay.py --limit 20 --min-observations 50
 ```
 
 Context-aware robust metrics by `line_ref + direction_ref + local hour +
@@ -77,12 +96,14 @@ Hourly delay profile:
 ```sh
 uv run python analysis/hourly-delay-profile.py --limit 24
 uv run python analysis/hourly-delay-profile.py --line-ref 3 --limit 24
+uv run python analysis/polars/hourly-delay-profile.py --line-ref 3 --limit 24
 ```
 
 Late and early line rankings:
 
 ```sh
 uv run python analysis/line-delay-rankings.py --ranking both --limit 10
+uv run python analysis/polars/line-delay-rankings.py --ranking both --limit 10
 ```
 
 Rush-time impact with the default weekday windows of 07:00-09:00 and
