@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date
+import importlib.util
 import sqlite3
 import subprocess
 import sys
@@ -10,6 +11,7 @@ import unittest
 from pathlib import Path
 
 import polars as pl
+import nbformat
 
 from analysis.polars._shared import (
     add_quality_flags,
@@ -34,6 +36,28 @@ from tests.test_results_report import create_report_db, report_settings
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+POLARS_NOTEBOOK_NAMES = [
+    "01_hourly_delay_profile.ipynb",
+    "02_line_delay_rankings.ipynb",
+    "03_rush_impact.ipynb",
+    "04_collector_blackouts.ipynb",
+    "05_stop_delay_change.ipynb",
+    "06_service_alert_delay_correlation.ipynb",
+    "07_collector_missing_data_spots.ipynb",
+    "08_data_quality_report.ipynb",
+    "09_context_delay_metrics.ipynb",
+]
+
+
+def load_polars_script_module(name: str, relative_path: str):
+    analysis_path = str(PROJECT_ROOT / "analysis" / "polars")
+    if analysis_path not in sys.path:
+        sys.path.insert(0, analysis_path)
+    spec = importlib.util.spec_from_file_location(name, PROJECT_ROOT / relative_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
 
 
 def quality_sample() -> pl.DataFrame:
@@ -191,6 +215,54 @@ class PolarsSharedAnalyticsTests(unittest.TestCase):
 
 
 class PolarsReportParityTests(unittest.TestCase):
+    def test_polars_notebooks_are_present_valid_and_clear(self) -> None:
+        notebook_dir = PROJECT_ROOT / "notebooks" / "polars"
+        notebooks = sorted(notebook_dir.glob("*.ipynb"))
+
+        self.assertEqual([path.name for path in notebooks], POLARS_NOTEBOOK_NAMES)
+
+        for path in notebooks:
+            with self.subTest(notebook=path.name):
+                notebook = nbformat.read(path, as_version=4)
+                nbformat.validate(notebook)
+                source = "\n".join(
+                    "".join(cell.get("source", ""))
+                    for cell in notebook.cells
+                ).lower()
+                self.assertIn("analysis\" / \"polars", source)
+                self.assertIn("plotly.express", source)
+                self.assertNotIn("import pandas", source)
+                for cell in notebook.cells:
+                    if cell.cell_type != "code":
+                        continue
+                    self.assertIsNone(cell.execution_count)
+                    self.assertEqual(cell.outputs, [])
+
+    def test_stop_change_default_recent_periods_use_latest_qualifying_stop_observation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "foli.db"
+            create_report_db(db_path)
+            stop_delay_change = load_polars_script_module(
+                "polars_stop_delay_change_test",
+                "analysis/polars/stop-delay-change.py",
+            )
+
+            periods = stop_delay_change.default_recent_periods(
+                db_path,
+                timezone="Europe/Helsinki",
+                period_days=1,
+            )
+
+            self.assertEqual(
+                periods,
+                (
+                    "2026-04-28T11:15:01+03:00",
+                    "2026-04-29T11:15:01+03:00",
+                    "2026-04-29T11:15:01+03:00",
+                    "2026-04-30T11:15:01+03:00",
+                ),
+            )
+
     def test_polars_report_tables_match_duckdb_fixture_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)

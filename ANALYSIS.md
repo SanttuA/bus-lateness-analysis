@@ -243,3 +243,7 @@ notebooks/07_collector_missing_data_spots.ipynb
 notebooks/08_data_quality_report.ipynb
 notebooks/09_context_delay_metrics.ipynb
 ```
+
+Polars notebook counterparts live in `notebooks/polars/` with the same
+filenames. They use `analysis/polars/` and the separate
+`outputs/polars-report-cache/` cache path.

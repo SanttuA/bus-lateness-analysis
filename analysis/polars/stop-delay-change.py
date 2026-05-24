@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import argparse
+from datetime import timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import polars as pl
 
 from _shared import (
     DEFAULT_GTFS_ROOT,
+    QUALIFIED_DELAY_FILTER_SQL,
     add_bucket_arg,
     add_cache_args,
     add_common_args,
@@ -16,6 +19,8 @@ from _shared import (
     load_gtfs_stop_metadata,
     parse_timestamp,
     print_or_empty,
+    read_sql,
+    representative_time_sql,
     resolve_project_path,
     round_numeric,
     summarize_delay_metrics,
@@ -60,6 +65,41 @@ def load_city_parts(path: Path | None) -> pl.DataFrame:
     if missing:
         raise SystemExit(f"{mapping_path} is missing required column(s): {', '.join(sorted(missing))}")
     return mapping.select("stop_id", "city_part")
+
+
+def default_recent_periods(
+    db_path: Path,
+    *,
+    timezone: str,
+    period_days: int = 1,
+) -> tuple[str | None, str | None, str | None, str | None]:
+    if period_days <= 0:
+        raise ValueError("period_days must be positive")
+
+    query = f"""
+    SELECT MAX({representative_time_sql()}) AS latest_time_utc
+    FROM vehicle_observations v
+    WHERE {QUALIFIED_DELAY_FILTER_SQL}
+      AND v.next_stop_point_ref IS NOT NULL
+    """
+    rows = read_sql(db_path, query)
+    latest_value = rows["latest_time_utc"][0] if not rows.is_empty() else None
+    if latest_value is None:
+        return None, None, None, None
+
+    latest = parse_timestamp(latest_value, "UTC").astimezone(ZoneInfo(timezone))
+    if latest.microsecond:
+        latest = latest.replace(microsecond=0) + timedelta(seconds=1)
+    comparison_end = latest + timedelta(seconds=1)
+    comparison_start = comparison_end - timedelta(days=period_days)
+    baseline_end = comparison_start
+    baseline_start = baseline_end - timedelta(days=period_days)
+    return (
+        baseline_start.isoformat(),
+        baseline_end.isoformat(),
+        comparison_start.isoformat(),
+        comparison_end.isoformat(),
+    )
 
 
 def add_period_column(df: pl.DataFrame, args: argparse.Namespace) -> tuple[pl.DataFrame, str]:
@@ -217,4 +257,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
