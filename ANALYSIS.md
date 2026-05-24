@@ -43,7 +43,8 @@ The report is written to `reports/generated/overall-results.md`. The command
 builds a disk-backed DuckDB cache in `outputs/report-cache/`, including compact
 CSV outputs for each report table. It reuses the cache when the database
 metadata and report settings match, and rebuilds it when they change. Use
-`--force` to rebuild manually:
+`--force` to rebuild manually. The command prints progress updates and writes
+cache/build, render, and total run timings into the generated report:
 
 ```sh
 uv run python analysis/build-results-report.py --force
@@ -57,7 +58,8 @@ uv run python analysis/polars/build-results-report.py
 
 The report is written to `reports/generated/overall-results-polars.md`, with
 Parquet intermediates and matching CSVs under `outputs/polars-report-cache/`.
-Use `--force` to rebuild manually:
+It prints the same progress updates and timing section for side-by-side
+comparison with the DuckDB/pandas report. Use `--force` to rebuild manually:
 
 ```sh
 uv run python analysis/polars/build-results-report.py --force

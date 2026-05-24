@@ -235,6 +235,25 @@ class PolarsReportParityTests(unittest.TestCase):
             stop_10 = stop_change.filter(pl.col("stop_id") == "10").row(0, named=True)
             self.assertAlmostEqual(stop_10["p90_delay_change_min"], 8.0)
 
+    def test_polars_report_cache_reuses_matching_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            db_path = temp / "foli.db"
+            create_report_db(db_path)
+            settings = PolarsReportSettings(
+                db=db_path,
+                cache_dir=temp / "polars-cache",
+                min_observations=1,
+                limit=5,
+            )
+
+            first = ensure_polars_report_cache(settings)
+            second = ensure_polars_report_cache(settings)
+
+            self.assertEqual(first.status, "rebuilt")
+            self.assertEqual(second.status, "reused")
+            self.assertIn("cache_build_seconds", second.timings)
+
     def test_polars_report_and_line_ranking_cli_smoke(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)
@@ -264,9 +283,18 @@ class PolarsReportParityTests(unittest.TestCase):
                 capture_output=True,
                 text=True,
             )
+            self.assertIn("[report] Checking report cache", completed.stdout)
+            self.assertIn("[report] Building result tables", completed.stdout)
+            self.assertIn("[report] Rendering Markdown report", completed.stdout)
+            self.assertRegex(completed.stdout, r"\[report\] Finished in \d+\.\d{2}s")
             self.assertIn("Wrote report:", completed.stdout)
             self.assertTrue(report_path.exists())
-            self.assertIn("# Overall Bus Lateness Results (Polars)", report_path.read_text())
+            report_text = report_path.read_text()
+            self.assertIn("# Overall Bus Lateness Results (Polars)", report_text)
+            self.assertIn("## Run Timing", report_text)
+            self.assertRegex(report_text, r"- Cache/build: \d+\.\d{2}s")
+            self.assertRegex(report_text, r"- Report render: \d+\.\d{2}s")
+            self.assertRegex(report_text, r"- Total report run: \d+\.\d{2}s")
             self.assertTrue((cache_dir / "manifest.json").exists())
             self.assertTrue((cache_dir / "quality_rows.parquet").exists())
             self.assertTrue((cache_dir / "line_late_rankings.csv").exists())

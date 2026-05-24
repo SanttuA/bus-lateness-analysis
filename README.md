@@ -43,7 +43,9 @@ The report is written to `reports/generated/overall-results.md`. Intermediate
 DuckDB tables and compact CSVs are stored under `outputs/report-cache/` so later
 runs can reuse midpoint calculations and other summaries instead of loading the
 full SQLite database into pandas. The cache is rebuilt when `data/foli.db` or
-report settings change; pass `--force` to rebuild it manually.
+report settings change; pass `--force` to rebuild it manually. The command
+prints simple progress updates and includes cache/build, render, and total run
+timings in the generated report.
 
 ## Polars Analysis Option
 
@@ -58,6 +60,8 @@ The Polars report is written to
 `reports/generated/overall-results-polars.md`. Its Parquet cache and compact
 CSVs are written separately under `outputs/polars-report-cache/`, so the
 existing DuckDB/pandas outputs remain comparable.
+The Polars command prints the same progress updates and timing section for
+side-by-side runtime comparisons.
 
 Example Polars CLI commands:
 

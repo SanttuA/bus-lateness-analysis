@@ -174,6 +174,7 @@ class ResultsReportCacheTests(unittest.TestCase):
 
             self.assertEqual(first.status, "rebuilt")
             self.assertEqual(second.status, "reused")
+            self.assertIn("cache_build_seconds", second.timings)
 
     def test_base_cache_reuse_ignores_result_limit(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -631,9 +632,18 @@ class ResultsReportCacheTests(unittest.TestCase):
                 text=True,
             )
 
+            self.assertIn("[report] Checking report cache", completed.stdout)
+            self.assertIn("[report] Building result tables", completed.stdout)
+            self.assertIn("[report] Rendering Markdown report", completed.stdout)
+            self.assertRegex(completed.stdout, r"\[report\] Finished in \d+\.\d{2}s")
             self.assertIn("Wrote report:", completed.stdout)
             self.assertTrue(report_path.exists())
-            self.assertIn("# Overall Bus Lateness Results", report_path.read_text())
+            report_text = report_path.read_text()
+            self.assertIn("# Overall Bus Lateness Results", report_text)
+            self.assertIn("## Run Timing", report_text)
+            self.assertRegex(report_text, r"- Cache/build: \d+\.\d{2}s")
+            self.assertRegex(report_text, r"- Report render: \d+\.\d{2}s")
+            self.assertRegex(report_text, r"- Total report run: \d+\.\d{2}s")
             self.assertTrue((cache_dir / "manifest.json").exists())
             self.assertTrue((cache_dir / "line_late_rankings.csv").exists())
 
@@ -726,6 +736,10 @@ class ResultsReportCacheTests(unittest.TestCase):
             text = written.read_text()
 
             self.assertIn("Cache status: rebuilt", text)
+            self.assertIn("## Run Timing", text)
+            self.assertRegex(text, r"- Cache/build: \d+\.\d{2}s")
+            self.assertRegex(text, r"- Report render: \d+\.\d{2}s")
+            self.assertRegex(text, r"- Total report run: \d+\.\d{2}s")
             self.assertIn("## Stop-Level Midpoint Changes", text)
             self.assertIn("Cached CSV:", text)
 

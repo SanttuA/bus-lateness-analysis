@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import polars as pl
 
@@ -154,6 +155,7 @@ class CacheResult:
     status: str
     cache_db: Path
     manifest: dict[str, Any]
+    timings: dict[str, float] = field(default_factory=dict)
 
 
 def settings_from_args(args: object) -> ReportSettings:
@@ -173,10 +175,17 @@ def settings_from_args(args: object) -> ReportSettings:
     )
 
 
-def ensure_analysis_cache(settings: ReportSettings, *, force: bool = False) -> CacheResult:
+def ensure_analysis_cache(
+    settings: ReportSettings,
+    *,
+    force: bool = False,
+    progress: Callable[[str], None] | None = None,
+) -> CacheResult:
+    started = time.perf_counter()
     settings = settings.resolved()
     settings.validate()
     settings.cache_dir.mkdir(parents=True, exist_ok=True)
+    _progress(progress, "Checking base cache")
     manifest_path = settings.cache_dir / MANIFEST_NAME
     current = _read_manifest(manifest_path)
     file_metadata = collect_db_file_metadata(settings.db)
@@ -186,8 +195,15 @@ def ensure_analysis_cache(settings: ReportSettings, *, force: bool = False) -> C
         and _manifest_settings_match(current, settings, base_only=True)
         and _has_tables(settings.cache_dir, [QUALITY_ROWS_NAME, DELAY_BUCKETS_NAME])
     ):
-        return CacheResult("reused", settings.cache_dir, current)
+        _progress(progress, "Reusing base cache")
+        return CacheResult(
+            "reused",
+            settings.cache_dir,
+            current,
+            timings={"base_cache_seconds": time.perf_counter() - started},
+        )
 
+    _progress(progress, "Building base cache")
     db_metadata = collect_db_metadata(settings.db)
     quality_rows = _build_quality_rows(settings)
     delay_buckets = aggregate_delay_buckets(
@@ -206,13 +222,25 @@ def ensure_analysis_cache(settings: ReportSettings, *, force: bool = False) -> C
         "base_tables": [QUALITY_ROWS_NAME, DELAY_BUCKETS_NAME, DELAY_CACHE_SUMMARY_NAME],
     }
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
-    return CacheResult("rebuilt", settings.cache_dir, manifest)
+    return CacheResult(
+        "rebuilt",
+        settings.cache_dir,
+        manifest,
+        timings={"base_cache_seconds": time.perf_counter() - started},
+    )
 
 
-def ensure_report_cache(settings: ReportSettings, *, force: bool = False) -> CacheResult:
+def ensure_report_cache(
+    settings: ReportSettings,
+    *,
+    force: bool = False,
+    progress: Callable[[str], None] | None = None,
+) -> CacheResult:
+    started = time.perf_counter()
     settings = settings.resolved()
     settings.validate()
     settings.cache_dir.mkdir(parents=True, exist_ok=True)
+    _progress(progress, "Checking report cache")
     manifest_path = settings.cache_dir / MANIFEST_NAME
     current = _read_manifest(manifest_path)
     file_metadata = collect_db_file_metadata(settings.db)
@@ -222,12 +250,20 @@ def ensure_report_cache(settings: ReportSettings, *, force: bool = False) -> Cac
         and _manifest_settings_match(current, settings, base_only=False)
         and _has_tables(settings.cache_dir, [QUALITY_ROWS_NAME, DELAY_BUCKETS_NAME, *RESULT_TABLES])
     ):
-        return CacheResult("reused", settings.cache_dir, current)
+        _progress(progress, "Reusing report cache")
+        return CacheResult(
+            "reused",
+            settings.cache_dir,
+            current,
+            timings={"cache_build_seconds": time.perf_counter() - started},
+        )
 
-    base = ensure_analysis_cache(settings, force=force)
+    _progress(progress, "Rebuilding report cache")
+    base = ensure_analysis_cache(settings, force=force, progress=progress)
     db_metadata = base.manifest.get("db_metadata") or collect_db_metadata(settings.db)
     quality_rows = read_table(settings.cache_dir, QUALITY_ROWS_NAME)
     delay_buckets = read_table(settings.cache_dir, DELAY_BUCKETS_NAME)
+    _progress(progress, "Building result tables")
     _build_result_tables(settings, quality_rows, delay_buckets)
 
     manifest = {
@@ -238,7 +274,12 @@ def ensure_report_cache(settings: ReportSettings, *, force: bool = False) -> Cac
         "result_tables": RESULT_TABLES,
     }
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
-    return CacheResult("rebuilt", settings.cache_dir, manifest)
+    return CacheResult(
+        "rebuilt",
+        settings.cache_dir,
+        manifest,
+        timings={"cache_build_seconds": time.perf_counter() - started},
+    )
 
 
 def read_table(cache_dir: Path, table_name: str) -> pl.DataFrame:
@@ -262,6 +303,11 @@ def write_markdown_report(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text("\n".join(_render_report_lines(settings, cache_result)).rstrip() + "\n")
     return output_path
+
+
+def _progress(callback: Callable[[str], None] | None, message: str) -> None:
+    if callback is not None:
+        callback(message)
 
 
 def collect_db_file_metadata(db_path: Path) -> dict[str, Any]:
@@ -1384,6 +1430,7 @@ def _write_csv(cache_dir: Path, table_name: str, df: pl.DataFrame) -> None:
 
 
 def _render_report_lines(settings: ReportSettings, cache_result: CacheResult) -> list[str]:
+    render_started = time.perf_counter()
     manifest = cache_result.manifest
     db_meta = manifest["db_metadata"]
     lines = [
@@ -1409,6 +1456,7 @@ def _render_report_lines(settings: ReportSettings, cache_result: CacheResult) ->
         ),
         "",
     ]
+    timing_index = len(lines) - 1
     summary = read_table(settings.cache_dir, DELAY_CACHE_SUMMARY_NAME)
     if not summary.is_empty():
         row = summary.row(0, named=True)
@@ -1477,7 +1525,31 @@ def _render_report_lines(settings: ReportSettings, cache_result: CacheResult) ->
             "",
         ]
     )
+    _record_render_timing(cache_result, time.perf_counter() - render_started)
+    lines[timing_index : timing_index + 1] = _render_run_timing(cache_result)
     return lines
+
+
+def _record_render_timing(cache_result: CacheResult, elapsed_seconds: float) -> None:
+    cache_result.timings["report_render_seconds"] = elapsed_seconds
+    cache_seconds = cache_result.timings.get("cache_build_seconds")
+    if cache_seconds is None:
+        cache_result.timings["total_report_seconds"] = elapsed_seconds
+    else:
+        cache_result.timings["total_report_seconds"] = cache_seconds + elapsed_seconds
+
+
+def _render_run_timing(cache_result: CacheResult) -> list[str]:
+    timings = cache_result.timings
+    return [
+        "",
+        "## Run Timing",
+        "",
+        f"- Cache/build: {_format_seconds(timings.get('cache_build_seconds'))}",
+        f"- Report render: {_format_seconds(timings.get('report_render_seconds'))}",
+        f"- Total report run: {_format_seconds(timings.get('total_report_seconds'))}",
+        "",
+    ]
 
 
 def _render_table_section(cache_dir: Path, title: str, table_name: str) -> list[str]:
@@ -1678,6 +1750,15 @@ def _format_value(value: object) -> str:
     if isinstance(value, datetime):
         return value.isoformat()
     return str(value)
+
+
+def _format_seconds(value: object) -> str:
+    if value is None:
+        return "not recorded"
+    try:
+        return f"{float(value):.2f}s"
+    except (TypeError, ValueError):
+        return "not recorded"
 
 
 def _escape_markdown(value: object) -> str:

@@ -107,6 +107,16 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def print_progress(message: str) -> None:
+    print(f"[report] {message}", flush=True)
+
+
+def format_elapsed(seconds: float | None) -> str:
+    if seconds is None:
+        return "not recorded"
+    return f"{seconds:.2f}s"
+
+
 def main() -> None:
     args = parse_args()
     settings = ReportSettings(
@@ -122,8 +132,16 @@ def main() -> None:
         include_weekends=args.include_weekends,
         gtfs_dir=args.gtfs_dir,
     )
-    cache_result = ensure_report_cache(settings, force=args.force)
+    cache_result = ensure_report_cache(
+        settings,
+        force=args.force,
+        progress=print_progress,
+    )
+    print_progress("Rendering Markdown report")
     output_path = write_markdown_report(settings, cache_result, args.output)
+    print_progress(
+        f"Finished in {format_elapsed(cache_result.timings.get('total_report_seconds'))}"
+    )
     print(f"Cache {cache_result.status}: {cache_result.cache_db}")
     print(f"Wrote report: {output_path}")
 
