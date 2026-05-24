@@ -146,6 +146,25 @@ class PolarsDashboardDataTests(unittest.TestCase):
         self.assertAlmostEqual(stop_10["p90_delay_min"], 0.0)
         self.assertAlmostEqual(stop_10["pct_over_3_min_late"], 0.0)
 
+    def test_stop_metrics_preserve_line_count_without_gtfs_coordinates(self) -> None:
+        buckets = pl.DataFrame(
+            {
+                "stop_id": ["10", "10"],
+                "stop_name": ["Fallback", "Fallback"],
+                "stop_lat": [None, None],
+                "stop_lon": [None, None],
+                "line_ref": ["3", "4"],
+                "delay_seconds": [60.0, 120.0],
+                "raw_poll_count": [1, 1],
+            },
+            schema_overrides={"stop_lat": pl.Float64, "stop_lon": pl.Float64},
+        )
+
+        metrics = build_stop_metrics(buckets, min_observations=1)
+        stop_10 = metrics.filter(pl.col("stop_id") == "10").row(0, named=True)
+
+        self.assertEqual(stop_10["line_count"], 2)
+
     def test_min_observations_filters_hourly_groups(self) -> None:
         prepared = prepare_observations(sample_observations(), sample_stops())
         metrics = build_hourly_line_metrics(prepared, min_observations=1)

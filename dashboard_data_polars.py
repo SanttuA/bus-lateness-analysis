@@ -256,6 +256,7 @@ def build_stop_metrics(
         line_counts,
         on=["stop_id", "stop_name", "stop_lat", "stop_lon"],
         how="left",
+        nulls_equal=True,
     ).select(
         "stop_id",
         "stop_name",
