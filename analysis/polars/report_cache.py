@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import tempfile
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -9,6 +10,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import polars as pl
+import polars.selectors as cs
 
 try:
     from ._shared import (
@@ -24,7 +26,7 @@ try:
         QUALITY_MODES,
         CONSERVATIVE_EXCLUSION_COLUMNS,
         add_quality_pass,
-        aggregate_delay_buckets,
+        aggregate_delay_buckets_lazy,
         assign_gtfs_feed_dates,
         base_quality_query,
         base_quality_query_without_collector,
@@ -59,7 +61,7 @@ except ImportError:  # pragma: no cover - used when called as analysis/polars/*.
         QUALITY_MODES,
         CONSERVATIVE_EXCLUSION_COLUMNS,
         add_quality_pass,
-        aggregate_delay_buckets,
+        aggregate_delay_buckets_lazy,
         assign_gtfs_feed_dates,
         base_quality_query,
         base_quality_query_without_collector,
@@ -89,6 +91,8 @@ MANIFEST_NAME = "manifest.json"
 QUALITY_ROWS_NAME = "quality_rows"
 DELAY_BUCKETS_NAME = "delay_buckets"
 DELAY_CACHE_SUMMARY_NAME = "delay_cache_summary"
+QUALITY_SOURCE_ID_BATCH_SIZE = 250_000
+DELAY_BUCKET_PARTITIONS = 16
 
 RESULT_TABLES = [
     "quality_summary",
@@ -205,15 +209,7 @@ def ensure_analysis_cache(
 
     _progress(progress, "Building base cache")
     db_metadata = collect_db_metadata(settings.db)
-    quality_rows = _build_quality_rows(settings)
-    delay_buckets = aggregate_delay_buckets(
-        quality_rows.filter(pl.col("quality_pass")),
-        bucket=settings.bucket,
-        timezone=settings.timezone,
-    )
-    _write_table(settings.cache_dir, QUALITY_ROWS_NAME, quality_rows)
-    _write_table(settings.cache_dir, DELAY_BUCKETS_NAME, delay_buckets)
-    _write_table(settings.cache_dir, DELAY_CACHE_SUMMARY_NAME, build_delay_cache_summary(delay_buckets))
+    _build_base_tables(settings, db_metadata, progress=progress)
 
     manifest = {
         **_expected_manifest(settings, db_metadata, base_only=True),
@@ -261,10 +257,8 @@ def ensure_report_cache(
     _progress(progress, "Rebuilding report cache")
     base = ensure_analysis_cache(settings, force=force, progress=progress)
     db_metadata = base.manifest.get("db_metadata") or collect_db_metadata(settings.db)
-    quality_rows = read_table(settings.cache_dir, QUALITY_ROWS_NAME)
-    delay_buckets = read_table(settings.cache_dir, DELAY_BUCKETS_NAME)
     _progress(progress, "Building result tables")
-    _build_result_tables(settings, quality_rows, delay_buckets)
+    _build_result_tables(settings)
 
     manifest = {
         **_expected_manifest(settings, db_metadata, base_only=False),
@@ -358,6 +352,136 @@ def collect_db_metadata(db_path: Path) -> dict[str, Any]:
     }
 
 
+def _build_base_tables(
+    settings: ReportSettings,
+    db_metadata: dict[str, Any],
+    *,
+    progress: Callable[[str], None] | None = None,
+) -> None:
+    with tempfile.TemporaryDirectory(
+        dir=settings.cache_dir,
+        prefix=".polars-report-build-",
+    ) as temp_name:
+        temp_dir = Path(temp_name)
+        quality_path = temp_dir / f"{QUALITY_ROWS_NAME}.parquet"
+        buckets_path = temp_dir / f"{DELAY_BUCKETS_NAME}.parquet"
+        summary_path = temp_dir / f"{DELAY_CACHE_SUMMARY_NAME}.parquet"
+
+        _progress(progress, "Building quality row fragments")
+        _build_quality_rows_table(settings, db_metadata, quality_path)
+        _progress(progress, "Building delay bucket fragments")
+        _build_delay_buckets_table(settings, quality_path, buckets_path)
+        _write_lazy_parquet(
+            build_delay_cache_summary_lazy(pl.scan_parquet(buckets_path)),
+            summary_path,
+        )
+
+        _replace_file(quality_path, settings.cache_dir / f"{QUALITY_ROWS_NAME}.parquet")
+        _replace_file(buckets_path, settings.cache_dir / f"{DELAY_BUCKETS_NAME}.parquet")
+        _replace_file(summary_path, settings.cache_dir / f"{DELAY_CACHE_SUMMARY_NAME}.parquet")
+
+
+def _build_quality_rows_table(
+    settings: ReportSettings,
+    db_metadata: dict[str, Any],
+    output_path: Path,
+    *,
+    batch_size: int = QUALITY_SOURCE_ID_BATCH_SIZE,
+) -> None:
+    fragments_dir = output_path.parent / f"{QUALITY_ROWS_NAME}-fragments"
+    fragments_dir.mkdir(parents=True, exist_ok=True)
+    fragments: list[Path] = []
+    max_id = int(db_metadata.get("vehicle_observation_max_id") or 0)
+    query_builder = (
+        base_quality_query
+        if _db_table_exists(settings.db, "collector_polls")
+        else base_quality_query_without_collector
+    )
+
+    part = 0
+    for start_id in range(1, max_id + 1, batch_size):
+        end_id = start_id + batch_size
+        where = f"""
+        v.id >= ?
+        AND v.id < ?
+        AND v.is_gtfs_matchable = 1
+        AND v.delay_seconds IS NOT NULL
+        AND v.line_ref IS NOT NULL
+        """
+        rows = read_sql(settings.db, query_builder(where=where), [start_id, end_id])
+        if rows.is_empty():
+            continue
+        quality_rows = add_quality_pass(
+            rows,
+            quality_mode=settings.quality_mode,
+            exclude_stop_call_disagreement=settings.exclude_stop_call_disagreement,
+        )
+        fragment_path = fragments_dir / f"part-{part:05d}.parquet"
+        quality_rows.write_parquet(fragment_path)
+        fragments.append(fragment_path)
+        part += 1
+
+    if fragments:
+        _write_lazy_parquet(pl.scan_parquet(fragments), output_path)
+        return
+
+    _build_empty_quality_rows(settings).write_parquet(output_path)
+
+
+def _build_empty_quality_rows(settings: ReportSettings) -> pl.DataFrame:
+    query_builder = (
+        base_quality_query
+        if _db_table_exists(settings.db, "collector_polls")
+        else base_quality_query_without_collector
+    )
+    rows = read_sql(settings.db, query_builder(where="1 = 0"))
+    return add_quality_pass(
+        rows,
+        quality_mode=settings.quality_mode,
+        exclude_stop_call_disagreement=settings.exclude_stop_call_disagreement,
+    )
+
+
+def _build_delay_buckets_table(
+    settings: ReportSettings,
+    quality_rows_path: Path,
+    output_path: Path,
+    *,
+    partition_count: int = DELAY_BUCKET_PARTITIONS,
+) -> None:
+    fragments_dir = output_path.parent / f"{DELAY_BUCKETS_NAME}-fragments"
+    fragments_dir.mkdir(parents=True, exist_ok=True)
+    quality_rows = pl.scan_parquet(quality_rows_path).filter(pl.col("quality_pass"))
+
+    if settings.bucket == "poll":
+        _write_lazy_parquet(
+            aggregate_delay_buckets_lazy(
+                quality_rows,
+                bucket=settings.bucket,
+                timezone=settings.timezone,
+            ),
+            output_path,
+        )
+        return
+
+    fragments: list[Path] = []
+    for partition_index in range(partition_count):
+        fragment_path = fragments_dir / f"part-{partition_index:03d}.parquet"
+        _write_lazy_parquet(
+            aggregate_delay_buckets_lazy(
+                quality_rows,
+                bucket=settings.bucket,
+                timezone=settings.timezone,
+                partition_count=partition_count,
+                partition_index=partition_index,
+            ),
+            fragment_path,
+        )
+        fragments.append(fragment_path)
+
+    _write_lazy_parquet(pl.scan_parquet(fragments), output_path)
+
+
 def build_delay_cache_summary(delay_buckets: pl.DataFrame) -> pl.DataFrame:
     if delay_buckets.is_empty():
         return pl.DataFrame(
@@ -369,6 +493,16 @@ def build_delay_cache_summary(delay_buckets: pl.DataFrame) -> pl.DataFrame:
                 "observation_end_utc": [None],
             }
         )
+    return delay_buckets.select(
+        pl.len().alias("bucket_count"),
+        pl.col("raw_poll_count").sum().alias("raw_poll_count"),
+        pl.col("line_ref").n_unique().alias("line_count"),
+        pl.col("representative_time_utc").min().alias("observation_start_utc"),
+        pl.col("representative_time_utc").max().alias("observation_end_utc"),
+    )
+
+
+def build_delay_cache_summary_lazy(delay_buckets: pl.LazyFrame) -> pl.LazyFrame:
     return delay_buckets.select(
         pl.len().alias("bucket_count"),
         pl.col("raw_poll_count").sum().alias("raw_poll_count"),
@@ -1347,62 +1481,836 @@ def json_list(value: object) -> list[str]:
     return [str(item) for item in decoded if item is not None and not isinstance(item, dict | list)]
 
 
-def _build_result_tables(
+def build_quality_summary_lazy(quality_rows: pl.LazyFrame) -> pl.LazyFrame:
+    conservative_default = pl.any_horizontal(
+        [pl.col(column) for column in CONSERVATIVE_EXCLUSION_COLUMNS]
+    )
+    conservative_with_stop_call = conservative_default | pl.col("has_stop_call_disagreement")
+    return (
+        quality_rows.select(
+            pl.len().alias("analysis_rows"),
+            *[pl.col(column).sum().alias(column) for column in QUALITY_FLAG_COLUMNS],
+            conservative_default.sum().alias("conservative_excluded_default"),
+            conservative_with_stop_call.sum().alias(
+                "conservative_excluded_with_stop_call_disagreement"
+            ),
+        )
+        .unpivot(index=[], variable_name="quality_check", value_name="row_count")
+        .with_columns(
+            pl.when(pl.col("quality_check") == "analysis_rows")
+            .then(pl.col("row_count").cast(pl.Float64))
+            .otherwise(
+                pl.col("row_count").cast(pl.Float64)
+                / pl.col("row_count").filter(pl.col("quality_check") == "analysis_rows").first()
+                * 100.0
+            )
+            .alias("pct_rows")
+        )
+        .with_columns(
+            pl.when(pl.col("quality_check") == "analysis_rows")
+            .then(pl.lit(100.0))
+            .otherwise(pl.col("pct_rows"))
+            .alias("pct_rows")
+        )
+        .with_columns(pl.col("row_count").cast(pl.Int64))
+    )
+
+
+def build_quality_by_line_lazy(
+    quality_rows: pl.LazyFrame,
+    *,
+    min_observations: int,
+    limit: int,
+) -> pl.LazyFrame:
+    conservative_default = pl.any_horizontal(
+        [pl.col(column) for column in CONSERVATIVE_EXCLUSION_COLUMNS]
+    )
+    grouped = (
+        quality_rows.with_columns(
+            conservative_default.alias("conservative_excluded_default")
+        )
+        .group_by("line_ref")
+        .agg(
+            pl.len().alias("row_count"),
+            pl.col("published_line_name").sort_by("recorded_at_utc").first().alias("line_name"),
+            pl.col("is_implausible_delay").sum().alias("implausible_delay_rows"),
+            pl.col("is_stale_observation").sum().alias("stale_rows"),
+            pl.col("is_pre_trip_observation").sum().alias("pre_trip_rows"),
+            pl.col("is_post_trip_observation").sum().alias("post_trip_rows"),
+            pl.col("has_stop_call_disagreement").sum().alias("stop_call_disagreement_rows"),
+            pl.col("conservative_excluded_default").sum().alias("conservative_excluded_rows"),
+        )
+        .filter(pl.col("row_count") >= min_observations)
+    )
+    return round_numeric_lazy(
+        grouped.with_columns(
+            (
+                pl.col("conservative_excluded_rows") / pl.col("row_count") * 100.0
+            ).alias("conservative_excluded_pct")
+        )
+        .sort(
+            ["conservative_excluded_pct", "conservative_excluded_rows", "line_ref"],
+            descending=[True, True, False],
+        )
+        .head(limit)
+    )
+
+
+def build_line_rankings_lazy(
+    delay_buckets: pl.LazyFrame,
+    ranking: str,
+    *,
+    min_observations: int,
+    limit: int,
+) -> pl.LazyFrame:
+    metrics = summarize_delay_metrics_lazy(
+        delay_buckets,
+        ["line_ref"],
+        min_observations=min_observations,
+        extra_aggs={"line_name": ("published_line_name", "first")},
+    )
+    if ranking == "early":
+        return round_numeric_lazy(
+            metrics.sort(
+                ["p90_early_min_abs", "pct_over_3_min_early", "bucket_count", "line_ref"],
+                descending=[True, True, True, False],
+            )
+            .head(limit)
+            .select(
+                [
+                    "line_ref",
+                    "line_name",
+                    "bucket_count",
+                    "raw_poll_count",
+                    "signed_mean_delay_min",
+                    "median_delay_min",
+                    "pct_early",
+                    "pct_over_1_min_early",
+                    "pct_over_3_min_early",
+                    "median_early_min_abs",
+                    "p90_early_min_abs",
+                ]
+            )
+        )
+    return round_numeric_lazy(
+        metrics.sort(
+            ["p90_delay_min", "pct_over_5_min_late", "bucket_count", "line_ref"],
+            descending=[True, True, True, False],
+        )
+        .head(limit)
+        .select(
+            [
+                "line_ref",
+                "line_name",
+                "bucket_count",
+                "raw_poll_count",
+                "signed_mean_delay_min",
+                "median_delay_min",
+                "p75_delay_min",
+                "p90_delay_min",
+                "p95_delay_min",
+                "pct_over_3_min_late",
+                "pct_over_5_min_late",
+            ]
+        )
+    )
+
+
+def build_context_delay_metrics_lazy(
+    delay_buckets: pl.LazyFrame,
+    *,
+    line_ref: str | None = None,
+    direction_ref: str | None = None,
+    day_type: str = "all",
+    min_observations: int,
+    limit: int,
+) -> pl.LazyFrame:
+    buckets = delay_buckets
+    if line_ref:
+        buckets = buckets.filter(pl.col("line_ref") == line_ref)
+    if direction_ref:
+        buckets = buckets.filter(pl.col("direction_ref") == direction_ref)
+    if day_type != "all":
+        buckets = buckets.filter(pl.col("day_type") == day_type)
+    metrics = summarize_delay_metrics_lazy(
+        buckets,
+        ["line_ref", "direction_ref", "local_hour", "day_type"],
+        min_observations=min_observations,
+        extra_aggs={"line_name": ("published_line_name", "first")},
+    )
+    return round_numeric_lazy(
+        sort_robust_delay_metrics_lazy(metrics, limit=limit)
+        .with_columns(
+            (pl.col("local_hour").cast(pl.Utf8).str.zfill(2) + pl.lit(":00")).alias(
+                "hour_local"
+            )
+        )
+        .select(
+            [
+                "line_ref",
+                "line_name",
+                "direction_ref",
+                "hour_local",
+                "day_type",
+                "bucket_count",
+                "raw_poll_count",
+                "signed_mean_delay_min",
+                "median_delay_min",
+                "p75_delay_min",
+                "p90_delay_min",
+                "p95_delay_min",
+                "pct_over_3_min_late",
+                "pct_over_5_min_late",
+                "pct_early",
+                "pct_over_1_min_early",
+                "pct_over_3_min_early",
+                "median_early_min_abs",
+                "p90_early_min_abs",
+            ]
+        )
+    )
+
+
+def build_hourly_delay_profile_lazy(
+    delay_buckets: pl.LazyFrame,
+    *,
+    line_ref: str | None = None,
+    min_observations: int,
+    limit: int,
+) -> pl.LazyFrame:
+    buckets = delay_buckets.filter(pl.col("line_ref") == line_ref) if line_ref else delay_buckets
+    metrics = summarize_delay_metrics_lazy(
+        buckets,
+        ["local_hour"],
+        min_observations=min_observations,
+    )
+    return round_numeric_lazy(
+        sort_robust_delay_metrics_lazy(metrics, limit=limit)
+        .with_columns(
+            (pl.col("local_hour").cast(pl.Utf8).str.zfill(2) + pl.lit(":00")).alias(
+                "hour_local"
+            )
+        )
+        .select(
+            [
+                "hour_local",
+                "bucket_count",
+                "raw_poll_count",
+                "signed_mean_delay_min",
+                "median_delay_min",
+                "p75_delay_min",
+                "p90_delay_min",
+                "p95_delay_min",
+                "pct_over_3_min_late",
+                "pct_over_5_min_late",
+                "pct_early",
+                "pct_over_1_min_early",
+                "pct_over_3_min_early",
+            ]
+        )
+    )
+
+
+def build_rush_impact_lazy(
+    delay_buckets: pl.LazyFrame,
+    *,
+    rush_windows: tuple[str, ...],
+    include_weekends: bool,
+    min_observations: int,
+    limit: int,
+) -> pl.LazyFrame:
+    marked = delay_buckets.with_columns(
+        rush_period_expr(parse_rush_windows(rush_windows), include_weekends=include_weekends)
+    )
+    grouped = summarize_delay_metrics_lazy(
+        marked,
+        ["line_ref", "is_rush"],
+        min_observations=min_observations,
+        extra_aggs={"line_name": ("published_line_name", "first")},
+    )
+    rush = grouped.filter(pl.col("is_rush")).drop("is_rush")
+    non_rush = grouped.filter(~pl.col("is_rush")).drop("is_rush")
+    result = non_rush.join(rush, on="line_ref", how="inner", suffix="_rush").rename(
+        {
+            "bucket_count": "bucket_count_non_rush",
+            "raw_poll_count": "raw_poll_count_non_rush",
+            "median_delay_min": "median_delay_min_non_rush",
+            "p90_delay_min": "p90_delay_min_non_rush",
+            "pct_over_5_min_late": "pct_over_5_min_late_non_rush",
+            "line_name": "line_name_non_rush",
+            "bucket_count_rush": "bucket_count_rush",
+            "raw_poll_count_rush": "raw_poll_count_rush",
+            "median_delay_min_rush": "median_delay_min_rush",
+            "p90_delay_min_rush": "p90_delay_min_rush",
+            "pct_over_5_min_late_rush": "pct_over_5_min_late_rush",
+            "line_name_rush": "line_name_rush",
+        }
+    )
+    return round_numeric_lazy(
+        result.with_columns(
+            pl.coalesce("line_name_rush", "line_name_non_rush").alias("line_name"),
+            (pl.col("median_delay_min_rush") - pl.col("median_delay_min_non_rush")).alias(
+                "rush_median_delay_lift_min"
+            ),
+            (pl.col("p90_delay_min_rush") - pl.col("p90_delay_min_non_rush")).alias(
+                "rush_p90_delay_lift_min"
+            ),
+            (
+                pl.col("pct_over_5_min_late_rush")
+                - pl.col("pct_over_5_min_late_non_rush")
+            ).alias("rush_over_5_min_late_pct_point_lift"),
+        )
+        .sort(
+            [
+                "rush_p90_delay_lift_min",
+                "rush_over_5_min_late_pct_point_lift",
+                "bucket_count_rush",
+            ],
+            descending=[True, True, True],
+        )
+        .head(limit)
+        .select(
+            [
+                "line_ref",
+                "line_name",
+                "bucket_count_non_rush",
+                "bucket_count_rush",
+                "raw_poll_count_non_rush",
+                "raw_poll_count_rush",
+                "median_delay_min_non_rush",
+                "median_delay_min_rush",
+                "rush_median_delay_lift_min",
+                "p90_delay_min_non_rush",
+                "p90_delay_min_rush",
+                "rush_p90_delay_lift_min",
+                "pct_over_5_min_late_non_rush",
+                "pct_over_5_min_late_rush",
+                "rush_over_5_min_late_pct_point_lift",
+            ]
+        )
+    )
+
+
+def summarize_delay_metrics_lazy(
+    df: pl.LazyFrame,
+    group_keys: list[str],
+    *,
+    min_observations: int = 1,
+    extra_aggs: dict[str, tuple[str, str]] | None = None,
+) -> pl.LazyFrame:
+    working = df.with_columns(pl.col("delay_seconds").cast(pl.Float64, strict=False))
+    if "raw_poll_count" not in working.collect_schema().names():
+        working = working.with_columns(pl.lit(1, dtype=pl.Int64).alias("raw_poll_count"))
+    keys = group_keys.copy()
+    if not keys:
+        working = working.with_columns(pl.lit("overall").alias("_scope"))
+        keys = ["_scope"]
+
+    aggs: list[pl.Expr] = metric_aggs()
+    for output, (column, how) in (extra_aggs or {}).items():
+        if how != "first":
+            raise ValueError("Polars extra_aggs currently supports only first aggregations.")
+        if "representative_time_utc" in working.collect_schema().names():
+            aggs.append(pl.col(column).sort_by("representative_time_utc").first().alias(output))
+        else:
+            aggs.append(pl.col(column).first().alias(output))
+
+    grouped = working.group_by(keys).agg(*aggs).filter(
+        pl.col("bucket_count") >= min_observations
+    )
+    if "_scope" in grouped.collect_schema().names():
+        grouped = grouped.drop("_scope")
+    return grouped
+
+
+def sort_robust_delay_metrics_lazy(
+    df: pl.LazyFrame,
+    *,
+    limit: int | None = None,
+    ascending: bool = False,
+) -> pl.LazyFrame:
+    result = df.sort(
+        ["p90_delay_min", "pct_over_5_min_late", "bucket_count"],
+        descending=[not ascending, not ascending, ascending],
+    )
+    return result.head(limit) if limit is not None else result
+
+
+def round_numeric_lazy(df: pl.LazyFrame, digits: int = 2) -> pl.LazyFrame:
+    return df.with_columns(cs.numeric().round(digits))
+
+
+def build_stop_midpoint_change_lazy(
     settings: ReportSettings,
-    quality_rows: pl.DataFrame,
-    delay_buckets: pl.DataFrame,
-) -> None:
-    result_tables = {
-        "quality_summary": build_quality_summary(quality_rows),
-        "quality_by_line": build_quality_by_line(
-            quality_rows,
-            min_observations=settings.min_observations,
-            limit=settings.limit,
+    delay_buckets: pl.LazyFrame,
+) -> tuple[pl.LazyFrame, pl.DataFrame]:
+    buckets = delay_buckets.filter(pl.col("next_stop_point_ref").is_not_null())
+    bounds = buckets.select(
+        pl.col("representative_time_utc").min().alias("start"),
+        pl.col("representative_time_utc").max().alias("end"),
+    ).collect()
+    start = bounds["start"][0] if bounds.height else None
+    end = bounds["end"][0] if bounds.height else None
+    if start is None or end is None or start >= end:
+        return pl.DataFrame().lazy(), pl.DataFrame()
+
+    midpoint = start + ((end - start) / 2)
+    summary = pl.DataFrame(
+        {
+            "baseline_start_utc": [start],
+            "baseline_end_utc": [midpoint],
+            "comparison_start_utc": [midpoint],
+            "comparison_end_utc": [end],
+        }
+    )
+    period_rows = (
+        buckets.with_columns(
+            pl.col("next_stop_point_ref").cast(pl.Utf8).alias("stop_id"),
+            pl.when(
+                (pl.col("representative_time_utc") >= start)
+                & (pl.col("representative_time_utc") < midpoint)
+            )
+            .then(pl.lit("baseline"))
+            .when(
+                (pl.col("representative_time_utc") >= midpoint)
+                & (pl.col("representative_time_utc") <= end)
+            )
+            .then(pl.lit("comparison"))
+            .otherwise(None)
+            .alias("period"),
+        )
+        .filter(pl.col("period").is_not_null())
+    )
+    rows = matched_context_rows_lazy(period_rows, ["stop_id"])
+    rows = enrich_stops_lazy(
+        rows,
+        load_gtfs_stop_metadata(gtfs_dir=settings.gtfs_dir, gtfs_root=settings.gtfs_root),
+    )
+    baseline = summarize_period_lazy(
+        rows.filter(pl.col("period") == "baseline"),
+        ["stop_id"],
+        "baseline",
+        min_observations=settings.min_observations,
+    )
+    comparison = summarize_period_lazy(
+        rows.filter(pl.col("period") == "comparison"),
+        ["stop_id"],
+        "comparison",
+        min_observations=settings.min_observations,
+    )
+    result = baseline.join(comparison, on="stop_id", how="inner", suffix="_comparison")
+    result_columns = set(result.collect_schema().names())
+    for column in ("stop_name", "city_part", "stop_lat", "stop_lon"):
+        comparison_column = f"{column}_comparison"
+        if comparison_column not in result_columns:
+            continue
+        if column in result_columns:
+            result = result.with_columns(
+                pl.coalesce(pl.col(column), pl.col(comparison_column)).alias(column)
+            ).drop(comparison_column)
+        else:
+            result = result.rename({comparison_column: column})
+        result_columns = set(result.collect_schema().names())
+
+    result = result.with_columns(
+        (pl.col("comparison_median_delay_min") - pl.col("baseline_median_delay_min")).alias(
+            "median_delay_change_min"
         ),
-        "line_late_rankings": build_line_rankings(
-            delay_buckets,
-            "late",
-            min_observations=settings.min_observations,
-            limit=settings.limit,
+        (pl.col("comparison_p90_delay_min") - pl.col("baseline_p90_delay_min")).alias(
+            "p90_delay_change_min"
         ),
-        "line_early_rankings": build_line_rankings(
-            delay_buckets,
-            "early",
-            min_observations=settings.min_observations,
-            limit=settings.limit,
-        ),
-        "context_delay_metrics": build_context_delay_metrics(
-            delay_buckets,
-            min_observations=settings.min_observations,
-            limit=settings.limit,
-        ),
-        "hourly_delay_profile": build_hourly_delay_profile(
-            delay_buckets,
-            min_observations=settings.min_observations,
-            limit=settings.limit,
-        ),
-        "rush_impact": build_rush_impact(
-            delay_buckets,
-            rush_windows=settings.rush_windows,
-            include_weekends=settings.include_weekends,
-            min_observations=settings.min_observations,
-            limit=settings.limit,
-        ),
+        (
+            pl.col("comparison_pct_over_5_min_late")
+            - pl.col("baseline_pct_over_5_min_late")
+        ).alias("over_5_min_late_pct_point_change"),
+    )
+    ordered = [
+        "stop_id",
+        "stop_name",
+        "stop_lat",
+        "stop_lon",
+        "baseline_bucket_count",
+        "comparison_bucket_count",
+        "baseline_raw_poll_count",
+        "comparison_raw_poll_count",
+        "baseline_median_delay_min",
+        "comparison_median_delay_min",
+        "median_delay_change_min",
+        "baseline_p90_delay_min",
+        "comparison_p90_delay_min",
+        "p90_delay_change_min",
+        "baseline_pct_over_5_min_late",
+        "comparison_pct_over_5_min_late",
+        "over_5_min_late_pct_point_change",
+        "baseline_pct_over_3_min_early",
+        "comparison_pct_over_3_min_early",
+    ]
+    present = [column for column in ordered if column in result.collect_schema().names()]
+    return round_numeric_lazy(
+        result.with_columns(pl.col("p90_delay_change_min").abs().alias("_abs_change"))
+        .sort(["_abs_change", "comparison_bucket_count"], descending=[True, True])
+        .drop("_abs_change")
+        .head(settings.limit)
+        .select(present)
+    ), summary
+
+
+def enrich_stops_lazy(df: pl.LazyFrame, stops: pl.DataFrame) -> pl.LazyFrame:
+    result = df.with_columns(pl.col("next_stop_point_ref").cast(pl.Utf8).alias("stop_id"))
+    if not stops.is_empty():
+        stops = stops.with_columns(pl.col("stop_id").cast(pl.Utf8))
+        if "gtfs_feed_date" in stops.columns:
+            feeds = stops.select("gtfs_feed_date").unique().sort("gtfs_feed_date")
+            result = (
+                result.sort("local_date")
+                .join_asof(
+                    feeds.lazy(),
+                    left_on="local_date",
+                    right_on="gtfs_feed_date",
+                    strategy="backward",
+                )
+                .join(stops.lazy(), on=["gtfs_feed_date", "stop_id"], how="left")
+            )
+        else:
+            result = result.with_columns(pl.lit(None).alias("gtfs_feed_date")).join(
+                stops.lazy(),
+                on="stop_id",
+                how="left",
+            )
+    else:
+        result = result.with_columns(
+            pl.lit(None).alias("gtfs_feed_date"),
+            pl.lit(None).alias("gtfs_stop_name"),
+            pl.lit(None).alias("stop_lat"),
+            pl.lit(None).alias("stop_lon"),
+        )
+    return result.with_columns(
+        pl.col("gtfs_stop_name").is_not_null().alias("has_gtfs_stop_metadata"),
+        pl.coalesce("gtfs_stop_name", "next_stop_point_name").alias("stop_name"),
+        pl.lit(None).alias("city_part"),
+    )
+
+
+def matched_context_rows_lazy(df: pl.LazyFrame, group_keys: list[str]) -> pl.LazyFrame:
+    context_keys = group_keys + ["line_ref", "direction_ref", "local_weekday", "local_hour"]
+    baseline = df.filter(pl.col("period") == "baseline").select(context_keys).unique()
+    comparison = df.filter(pl.col("period") == "comparison").select(context_keys).unique()
+    matched = baseline.join(comparison, on=context_keys, how="inner")
+    return df.join(matched, on=context_keys, how="inner")
+
+
+def summarize_period_lazy(
+    df: pl.LazyFrame,
+    keys: list[str],
+    prefix: str,
+    *,
+    min_observations: int,
+) -> pl.LazyFrame:
+    schema_names = set(df.collect_schema().names())
+    extra_aggs: dict[str, tuple[str, str]] = {}
+    for column in ("stop_name", "city_part", "stop_lat", "stop_lon"):
+        if column in schema_names and column not in keys:
+            extra_aggs[column] = (column, "first")
+    grouped = summarize_delay_metrics_lazy(
+        df,
+        keys,
+        min_observations=min_observations,
+        extra_aggs=extra_aggs,
+    )
+    rename = {
+        column: f"{prefix}_{column}"
+        for column in grouped.collect_schema().names()
+        if column not in keys and column not in extra_aggs
     }
-    stop_change, midpoint_summary = build_stop_midpoint_change(settings, delay_buckets)
-    result_tables["stop_midpoint_change"] = stop_change
-    _write_table(settings.cache_dir, "midpoint_summary", midpoint_summary)
-    polls = load_collector_polls(settings)
-    result_tables["collector_blackouts"] = build_collector_blackouts(polls, settings.limit)
-    spots = build_missing_spots(polls)
-    result_tables["collector_missing_summary"] = summarize_missing_spots(spots, polls)
-    result_tables["collector_missing_spots"] = spots.head(settings.limit) if not spots.is_empty() else spots
-    grouped_alerts, line_alerts = build_alert_results(settings, delay_buckets)
-    result_tables["service_alert_grouped"] = grouped_alerts
-    result_tables["service_alert_by_line"] = line_alerts
-    for name, table in result_tables.items():
-        _write_table(settings.cache_dir, name, table)
-        _write_csv(settings.cache_dir, name, table)
+    return grouped.rename(rename)
+
+
+def build_alert_results_lazy(
+    settings: ReportSettings,
+    observations: pl.LazyFrame,
+    *,
+    alert_kind: str = "any",
+) -> tuple[pl.LazyFrame, pl.LazyFrame]:
+    observations = observations.with_columns(
+        pl.col("line_ref").cast(pl.Utf8),
+        pl.col("direction_ref").cast(pl.Utf8),
+        pl.col("next_stop_point_ref").cast(pl.Utf8),
+    )
+    bounds = observations.select(
+        pl.col("representative_time_utc").min().alias("start"),
+        pl.col("representative_time_utc").max().alias("end"),
+    ).collect()
+    start = bounds["start"][0] if bounds.height else None
+    end = bounds["end"][0] if bounds.height else None
+    if start is None or end is None:
+        return pl.DataFrame().lazy(), pl.DataFrame().lazy()
+
+    alerts = load_alerts(settings, (start, end))
+    routes = load_gtfs_route_metadata(gtfs_dir=settings.gtfs_dir, gtfs_root=settings.gtfs_root)
+    targets = build_alert_targets(
+        alerts,
+        routes,
+        start,
+        end,
+        include_routes=alert_kind in ("route", "any"),
+        include_stops=alert_kind in ("stop", "any"),
+        timezone=settings.timezone,
+    )
+    if targets.is_empty():
+        return pl.DataFrame().lazy(), pl.DataFrame().lazy()
+
+    target_rows = targets.lazy().with_columns(
+        pl.col("target_ref").cast(pl.Utf8),
+        pl.col("start_utc").cast(pl.Datetime(time_zone="UTC")),
+        pl.col("end_utc").cast(pl.Datetime(time_zone="UTC")),
+    )
+    route_active = active_alert_buckets_lazy(
+        target_rows.filter(pl.col("alert_scope") == "route"),
+        observations,
+        observation_key="line_ref",
+    )
+    stop_active = active_alert_buckets_lazy(
+        target_rows.filter(pl.col("alert_scope") == "stop"),
+        observations,
+        observation_key="next_stop_point_ref",
+    )
+    active_buckets = pl.concat([route_active, stop_active], how="vertical_relaxed").unique()
+    active = active_buckets.join(observations, on="bucket_id", how="inner")
+    contexts = active.select([*ALERT_GROUP_COLUMNS, *MATCH_CONTEXT_COLUMNS]).unique()
+    controls = (
+        contexts.join(observations, on=MATCH_CONTEXT_COLUMNS, how="inner")
+        .join(active_buckets, on=[*ALERT_GROUP_COLUMNS, "bucket_id"], how="anti")
+    )
+    grouped = _format_alert_result_lazy(
+        summarize_alert_lift_lazy(
+            active,
+            controls,
+            min_observations=settings.min_observations,
+            group_keys=ALERT_GROUP_COLUMNS,
+        ),
+        settings.limit,
+    )
+    by_line = _format_alert_result_lazy(
+        summarize_alert_lift_lazy(
+            active,
+            controls,
+            min_observations=settings.min_observations,
+            group_keys=[*ALERT_GROUP_COLUMNS, "line_ref"],
+        ),
+        settings.limit,
+        include_line=True,
+    )
+    return grouped, by_line
+
+
+def active_alert_buckets_lazy(
+    targets: pl.LazyFrame,
+    observations: pl.LazyFrame,
+    *,
+    observation_key: str,
+) -> pl.LazyFrame:
+    return (
+        targets.join(observations, left_on="target_ref", right_on=observation_key, how="inner")
+        .filter(
+            (pl.col("representative_time_utc") >= pl.col("start_utc"))
+            & (pl.col("representative_time_utc") <= pl.col("end_utc"))
+        )
+        .select([*ALERT_GROUP_COLUMNS, "bucket_id"])
+    )
+
+
+def summarize_alert_lift_lazy(
+    active: pl.LazyFrame,
+    controls: pl.LazyFrame,
+    *,
+    min_observations: int,
+    group_keys: list[str],
+) -> pl.LazyFrame:
+    extra = {"line_name": ("published_line_name", "first")} if "line_ref" in group_keys else None
+    active_metrics = summarize_delay_metrics_lazy(
+        active,
+        group_keys,
+        min_observations=min_observations,
+        extra_aggs=extra,
+    )
+    control_metrics = summarize_delay_metrics_lazy(
+        controls,
+        group_keys,
+        min_observations=min_observations,
+        extra_aggs=extra,
+    )
+    result = control_metrics.join(active_metrics, on=group_keys, how="inner", suffix="_alert")
+    rename = {
+        column: f"{column}_control"
+        for column in control_metrics.collect_schema().names()
+        if column not in group_keys
+    }
+    result = result.rename(rename)
+    if "line_name_control" in result.collect_schema().names():
+        result = result.with_columns(
+            pl.coalesce("line_name_alert", "line_name_control").alias("line_name")
+        ).drop(["line_name_control", "line_name_alert"])
+    return result.with_columns(
+        (pl.col("median_delay_min_alert") - pl.col("median_delay_min_control")).alias(
+            "median_delay_lift_min"
+        ),
+        (pl.col("p90_delay_min_alert") - pl.col("p90_delay_min_control")).alias(
+            "p90_delay_lift_min"
+        ),
+        (
+            pl.col("pct_over_5_min_late_alert")
+            - pl.col("pct_over_5_min_late_control")
+        ).alias("over_5_min_late_pct_point_lift"),
+    )
+
+
+def _format_alert_result_lazy(
+    df: pl.LazyFrame,
+    limit: int,
+    *,
+    include_line: bool = False,
+) -> pl.LazyFrame:
+    ordered = ALERT_GROUP_COLUMNS.copy()
+    if include_line:
+        ordered.extend(["line_ref", "line_name"])
+    ordered.extend(
+        [
+            "bucket_count_control",
+            "bucket_count_alert",
+            "raw_poll_count_control",
+            "raw_poll_count_alert",
+            "median_delay_min_control",
+            "median_delay_min_alert",
+            "median_delay_lift_min",
+            "p90_delay_min_control",
+            "p90_delay_min_alert",
+            "p90_delay_lift_min",
+            "pct_over_5_min_late_control",
+            "pct_over_5_min_late_alert",
+            "over_5_min_late_pct_point_lift",
+            "pct_over_3_min_early_control",
+            "pct_over_3_min_early_alert",
+        ]
+    )
+    present = [column for column in ordered if column in df.collect_schema().names()]
+    return round_numeric_lazy(
+        df.sort(
+            ["p90_delay_lift_min", "over_5_min_late_pct_point_lift", "bucket_count_alert"],
+            descending=[True, True, True],
+        )
+        .head(limit)
+        .select(present)
+    )
+
+
+def _build_result_tables(settings: ReportSettings) -> None:
+    quality_rows = _scan_table(settings.cache_dir, QUALITY_ROWS_NAME)
+    delay_buckets = _scan_table(settings.cache_dir, DELAY_BUCKETS_NAME)
+
+    with tempfile.TemporaryDirectory(
+        dir=settings.cache_dir,
+        prefix=".polars-report-results-",
+    ) as temp_name:
+        temp_dir = Path(temp_name)
+        _write_result_table(
+            settings.cache_dir,
+            "quality_summary",
+            build_quality_summary_lazy(quality_rows),
+            temp_dir,
+        )
+        _write_result_table(
+            settings.cache_dir,
+            "quality_by_line",
+            build_quality_by_line_lazy(
+                quality_rows,
+                min_observations=settings.min_observations,
+                limit=settings.limit,
+            ),
+            temp_dir,
+        )
+        _write_result_table(
+            settings.cache_dir,
+            "line_late_rankings",
+            build_line_rankings_lazy(
+                delay_buckets,
+                "late",
+                min_observations=settings.min_observations,
+                limit=settings.limit,
+            ),
+            temp_dir,
+        )
+        _write_result_table(
+            settings.cache_dir,
+            "line_early_rankings",
+            build_line_rankings_lazy(
+                delay_buckets,
+                "early",
+                min_observations=settings.min_observations,
+                limit=settings.limit,
+            ),
+            temp_dir,
+        )
+        _write_result_table(
+            settings.cache_dir,
+            "context_delay_metrics",
+            build_context_delay_metrics_lazy(
+                delay_buckets,
+                min_observations=settings.min_observations,
+                limit=settings.limit,
+            ),
+            temp_dir,
+        )
+        _write_result_table(
+            settings.cache_dir,
+            "hourly_delay_profile",
+            build_hourly_delay_profile_lazy(
+                delay_buckets,
+                min_observations=settings.min_observations,
+                limit=settings.limit,
+            ),
+            temp_dir,
+        )
+        _write_result_table(
+            settings.cache_dir,
+            "rush_impact",
+            build_rush_impact_lazy(
+                delay_buckets,
+                rush_windows=settings.rush_windows,
+                include_weekends=settings.include_weekends,
+                min_observations=settings.min_observations,
+                limit=settings.limit,
+            ),
+            temp_dir,
+        )
+
+        stop_change, midpoint_summary = build_stop_midpoint_change_lazy(settings, delay_buckets)
+        _write_table_atomic(settings.cache_dir, "midpoint_summary", midpoint_summary, temp_dir)
+        _write_result_table(settings.cache_dir, "stop_midpoint_change", stop_change, temp_dir)
+
+        polls = load_collector_polls(settings)
+        _write_result_table(
+            settings.cache_dir,
+            "collector_blackouts",
+            build_collector_blackouts(polls, settings.limit),
+            temp_dir,
+        )
+        spots = build_missing_spots(polls)
+        _write_result_table(
+            settings.cache_dir,
+            "collector_missing_summary",
+            summarize_missing_spots(spots, polls),
+            temp_dir,
+        )
+        _write_result_table(
+            settings.cache_dir,
+            "collector_missing_spots",
+            spots.head(settings.limit) if not spots.is_empty() else spots,
+            temp_dir,
+        )
+
+        grouped_alerts, line_alerts = build_alert_results_lazy(settings, delay_buckets)
+        _write_result_table(settings.cache_dir, "service_alert_grouped", grouped_alerts, temp_dir)
+        _write_result_table(settings.cache_dir, "service_alert_by_line", line_alerts, temp_dir)
 
 
 def _build_quality_rows(settings: ReportSettings) -> pl.DataFrame:
@@ -1427,6 +2335,45 @@ def _write_table(cache_dir: Path, table_name: str, df: pl.DataFrame) -> None:
 def _write_csv(cache_dir: Path, table_name: str, df: pl.DataFrame) -> None:
     cache_dir.mkdir(parents=True, exist_ok=True)
     df.write_csv(cache_dir / f"{table_name}.csv")
+
+
+def _scan_table(cache_dir: Path, table_name: str) -> pl.LazyFrame:
+    return pl.scan_parquet(resolve_project_path(cache_dir) / f"{table_name}.parquet")
+
+
+def _write_result_table(
+    cache_dir: Path,
+    table_name: str,
+    table: pl.DataFrame | pl.LazyFrame,
+    temp_dir: Path,
+) -> None:
+    df = table.collect() if isinstance(table, pl.LazyFrame) else table
+    _write_table_atomic(cache_dir, table_name, df, temp_dir)
+    csv_path = temp_dir / f"{table_name}.csv"
+    df.write_csv(csv_path)
+    _replace_file(csv_path, cache_dir / f"{table_name}.csv")
+
+
+def _write_table_atomic(
+    cache_dir: Path,
+    table_name: str,
+    df: pl.DataFrame,
+    temp_dir: Path,
+) -> None:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    table_path = temp_dir / f"{table_name}.parquet"
+    df.write_parquet(table_path)
+    _replace_file(table_path, cache_dir / f"{table_name}.parquet")
+
+
+def _write_lazy_parquet(lf: pl.LazyFrame, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lf.sink_parquet(path)
+
+
+def _replace_file(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    source.replace(destination)
 
 
 def _render_report_lines(settings: ReportSettings, cache_result: CacheResult) -> list[str]:
