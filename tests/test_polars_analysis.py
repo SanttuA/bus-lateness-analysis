@@ -51,13 +51,30 @@ POLARS_NOTEBOOK_NAMES = [
 
 def load_polars_script_module(name: str, relative_path: str):
     analysis_path = str(PROJECT_ROOT / "analysis" / "polars")
-    if analysis_path not in sys.path:
+    previous_path = sys.path.copy()
+    top_level_modules = ("_shared", "report_cache", "cli_common")
+    missing = object()
+    previous_modules = {
+        module_name: sys.modules.get(module_name, missing)
+        for module_name in top_level_modules
+    }
+    try:
+        sys.path = [path for path in sys.path if path != analysis_path]
         sys.path.insert(0, analysis_path)
-    spec = importlib.util.spec_from_file_location(name, PROJECT_ROOT / relative_path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
+        for module_name in top_level_modules:
+            sys.modules.pop(module_name, None)
+        spec = importlib.util.spec_from_file_location(name, PROJECT_ROOT / relative_path)
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        for module_name in top_level_modules:
+            sys.modules.pop(module_name, None)
+            previous = previous_modules[module_name]
+            if previous is not missing:
+                sys.modules[module_name] = previous
+        sys.path = previous_path
 
 
 def quality_sample() -> pl.DataFrame:
