@@ -80,6 +80,12 @@ Run the local interactive dashboard with:
 uv run streamlit run streamlit_app.py
 ```
 
+A separate Polars-backed version is also available:
+
+```sh
+uv run streamlit run streamlit_app_polars.py
+```
+
 The dashboard reads `data/foli.db`, joins observations to the date-matched GTFS
 snapshot under `data/gtfs/`, applies conservative quality filtering, collapses
 repeated polls into trip-stop buckets, and visualizes robust delay by line,
