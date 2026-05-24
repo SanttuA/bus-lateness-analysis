@@ -1497,22 +1497,21 @@ def build_quality_summary_lazy(quality_rows: pl.LazyFrame) -> pl.LazyFrame:
         )
         .unpivot(index=[], variable_name="quality_check", value_name="row_count")
         .with_columns(
-            pl.when(pl.col("quality_check") == "analysis_rows")
-            .then(pl.col("row_count").cast(pl.Float64))
-            .otherwise(
-                pl.col("row_count").cast(pl.Float64)
-                / pl.col("row_count").filter(pl.col("quality_check") == "analysis_rows").first()
-                * 100.0
-            )
-            .alias("pct_rows")
+            pl.col("row_count")
+            .filter(pl.col("quality_check") == "analysis_rows")
+            .first()
+            .alias("_analysis_row_count")
         )
+        .filter(pl.col("_analysis_row_count") > 0)
         .with_columns(
-            pl.when(pl.col("quality_check") == "analysis_rows")
-            .then(pl.lit(100.0))
-            .otherwise(pl.col("pct_rows"))
-            .alias("pct_rows")
+            pl.col("row_count").cast(pl.Int64),
+            (
+                pl.col("row_count").cast(pl.Float64)
+                / pl.col("_analysis_row_count").cast(pl.Float64)
+                * 100.0
+            ).alias("pct_rows"),
         )
-        .with_columns(pl.col("row_count").cast(pl.Int64))
+        .drop("_analysis_row_count")
     )
 
 
