@@ -62,6 +62,8 @@ CSVs are written separately under `outputs/polars-report-cache/`, so the
 existing DuckDB/pandas outputs remain comparable.
 The Polars command prints the same progress updates and timing section for
 side-by-side runtime comparisons.
+Polars notebook counterparts for the main exploratory notebooks are available
+under `notebooks/polars/`.
 
 Example Polars CLI commands:
 
