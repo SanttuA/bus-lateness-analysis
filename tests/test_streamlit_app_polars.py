@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import unittest
 
 import polars as pl
@@ -7,18 +8,25 @@ import polars as pl
 from streamlit_app_polars import (
     DELAY_SCALE_AUTO,
     DELAY_SCALE_MANUAL,
+    HEATMAP_RESPONSE_LOG1P,
+    HEATMAP_RESPONSE_SQUARE_ROOT,
     HEATMAP_SCALE_AUTO,
     HEATMAP_SCALE_MANUAL,
+    STOP_HEATMAP_OPACITY,
+    STOP_HEATMAP_RADIUS,
     STOP_MARKER_MAX_SIZE,
     STOP_MARKER_MIN_SIZE,
     delay_color_range_extent,
+    heatmap_intensity_cutoff,
     heatmap_intensity_max,
+    heatmap_scale_caption,
     make_hourly_heatmap,
     make_stop_heatmap,
     make_stop_map,
     scale_stop_marker_sizes,
     stop_marker_caption,
     table_columns,
+    transform_heatmap_weights,
 )
 from tests.test_dashboard_data_polars import sample_stop_metrics
 
@@ -136,14 +144,25 @@ class PolarsStopHeatmapScaleTests(unittest.TestCase):
     def test_heatmap_intensity_max_empty_input_returns_none(self) -> None:
         self.assertIsNone(heatmap_intensity_max([], HEATMAP_SCALE_AUTO))
 
-    def test_heatmap_intensity_max_auto_uses_95th_percentile(self) -> None:
+    def test_heatmap_intensity_max_auto_uses_selected_percentile(self) -> None:
         weights = pl.Series("weight", [10.0] * 95 + [10_000.0] * 5)
 
-        intensity_max = heatmap_intensity_max(weights, HEATMAP_SCALE_AUTO)
+        intensity_max = heatmap_intensity_max(
+            weights,
+            HEATMAP_SCALE_AUTO,
+            auto_quantile=0.95,
+        )
 
         self.assertIsNotNone(intensity_max)
         self.assertGreater(intensity_max, 10.0)
         self.assertLess(intensity_max, weights.max())
+
+        max_intensity = heatmap_intensity_max(
+            weights,
+            HEATMAP_SCALE_AUTO,
+            auto_quantile=None,
+        )
+        self.assertEqual(max_intensity, weights.max())
 
     def test_heatmap_intensity_max_auto_handles_constant_data(self) -> None:
         intensity_max = heatmap_intensity_max(
@@ -162,6 +181,46 @@ class PolarsStopHeatmapScaleTests(unittest.TestCase):
 
         self.assertEqual(intensity_max, 25.0)
 
+    def test_heatmap_intensity_cutoff_uses_selected_percentile(self) -> None:
+        cutoff = heatmap_intensity_cutoff(
+            pl.Series("weight", [1.0, 2.0, 100.0]),
+            0.50,
+        )
+
+        self.assertEqual(cutoff, 2.0)
+
+    def test_heatmap_response_transforms_are_monotonic_and_compress_outliers(
+        self,
+    ) -> None:
+        weights = pl.Series("weight", [0.0, 1.0, 4.0, 100.0])
+
+        sqrt_weights = transform_heatmap_weights(
+            weights,
+            HEATMAP_RESPONSE_SQUARE_ROOT,
+        )
+        log_weights = transform_heatmap_weights(weights, HEATMAP_RESPONSE_LOG1P)
+
+        self.assertEqual(sqrt_weights.to_list(), sorted(sqrt_weights.to_list()))
+        self.assertEqual(log_weights.to_list(), sorted(log_weights.to_list()))
+        self.assertAlmostEqual(sqrt_weights[2], 2.0)
+        self.assertAlmostEqual(log_weights[3], math.log1p(100.0))
+        self.assertLess(sqrt_weights[3] / sqrt_weights[2], weights[3] / weights[2])
+        self.assertLess(log_weights[3] / log_weights[2], weights[3] / weights[2])
+
+    def test_heatmap_caption_mentions_display_controls(self) -> None:
+        caption = heatmap_scale_caption(
+            pl.Series("weight", [1.0, 2.0, 100.0]),
+            HEATMAP_SCALE_AUTO,
+            80.0,
+            auto_quantile=0.99,
+            cutoff_quantile=0.25,
+            response_mode=HEATMAP_RESPONSE_SQUARE_ROOT,
+        )
+
+        self.assertIn("99th percentile", caption)
+        self.assertIn("25th percentile", caption)
+        self.assertIn("Square root", caption)
+
     def test_make_stop_heatmap_applies_color_axis_max(self) -> None:
         fig = make_stop_heatmap(
             sample_stop_metrics(),
@@ -176,6 +235,32 @@ class PolarsStopHeatmapScaleTests(unittest.TestCase):
             fig.layout.coloraxis.colorbar.title.text,
             "Late delay intensity",
         )
+
+    def test_make_stop_heatmap_applies_default_radius_and_opacity(self) -> None:
+        fig = make_stop_heatmap(
+            sample_stop_metrics(),
+            "p90_delay_min",
+            delay_direction="late",
+            max_intensity=20.0,
+        )
+
+        heatmap = fig.data[0]
+        self.assertEqual(heatmap.radius, STOP_HEATMAP_RADIUS)
+        self.assertEqual(heatmap.opacity, STOP_HEATMAP_OPACITY)
+
+    def test_make_stop_heatmap_applies_custom_radius_and_opacity(self) -> None:
+        fig = make_stop_heatmap(
+            sample_stop_metrics(),
+            "p90_delay_min",
+            delay_direction="late",
+            max_intensity=20.0,
+            radius=8,
+            opacity=0.40,
+        )
+
+        heatmap = fig.data[0]
+        self.assertEqual(heatmap.radius, 8)
+        self.assertEqual(heatmap.opacity, 0.40)
 
 
 if __name__ == "__main__":
