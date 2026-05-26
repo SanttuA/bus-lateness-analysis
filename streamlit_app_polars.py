@@ -46,9 +46,22 @@ LATE_EARLY_SCALE = [
     [1.0, "#b2182b"],
 ]
 
-SEQUENTIAL_SCALE = "YlOrRd"
-EARLY_HEAT_SCALE = "Blues"
-STOP_HEATMAP_RADIUS = 25
+LATE_HEAT_SCALE = [
+    [0.0, "rgba(255, 255, 255, 0.00)"],
+    [0.25, "rgba(255, 237, 160, 0.18)"],
+    [0.55, "rgba(254, 178, 76, 0.45)"],
+    [0.8, "rgba(240, 59, 32, 0.70)"],
+    [1.0, "rgba(128, 0, 38, 0.90)"],
+]
+EARLY_HEAT_SCALE = [
+    [0.0, "rgba(255, 255, 255, 0.00)"],
+    [0.25, "rgba(198, 219, 239, 0.18)"],
+    [0.55, "rgba(107, 174, 214, 0.45)"],
+    [0.8, "rgba(33, 113, 181, 0.70)"],
+    [1.0, "rgba(8, 48, 107, 0.90)"],
+]
+STOP_HEATMAP_RADIUS = 12
+STOP_HEATMAP_OPACITY = 0.65
 STOP_MARKER_MIN_SIZE = 9.0
 STOP_MARKER_MAX_SIZE = 30.0
 STOP_MARKER_HALO_PADDING = 5.0
@@ -68,7 +81,26 @@ STOP_MARKER_COLORBAR_TITLES = {
 }
 HEATMAP_SCALE_AUTO = "Auto"
 HEATMAP_SCALE_MANUAL = "Manual maximum"
-HEATMAP_AUTO_QUANTILE = 0.95
+HEATMAP_AUTO_QUANTILE = 0.99
+HEATMAP_AUTO_QUANTILE_OPTIONS = {
+    "95th": 0.95,
+    "98th": 0.98,
+    "99th": 0.99,
+    "Maximum": None,
+}
+HEATMAP_RESPONSE_LINEAR = "Linear"
+HEATMAP_RESPONSE_SQUARE_ROOT = "Square root"
+HEATMAP_RESPONSE_LOG1P = "Log1p"
+HEATMAP_RESPONSE_OPTIONS = [
+    HEATMAP_RESPONSE_LINEAR,
+    HEATMAP_RESPONSE_SQUARE_ROOT,
+    HEATMAP_RESPONSE_LOG1P,
+]
+HEATMAP_CUTOFF_OPTIONS = {
+    "None": None,
+    "25th percentile": 0.25,
+    "50th percentile": 0.50,
+}
 DELAY_SCALE_AUTO = "Auto"
 DELAY_SCALE_MANUAL = "Manual range"
 DELAY_AUTO_QUANTILE = 0.95
@@ -476,6 +508,8 @@ def heatmap_intensity_max(
     heat_weights: object,
     scale_mode: str,
     manual_max: float | None = None,
+    *,
+    auto_quantile: float | None = HEATMAP_AUTO_QUANTILE,
 ) -> float | None:
     weights = _numeric_series(heat_weights).drop_nulls()
     weights = weights.filter(weights > 0)
@@ -487,7 +521,12 @@ def heatmap_intensity_max(
             return None
         return float(manual_max)
 
-    auto_max = weights.quantile(HEATMAP_AUTO_QUANTILE, interpolation="linear")
+    if auto_quantile is None:
+        auto_max = weights.max()
+    else:
+        if not 0 < auto_quantile <= 1:
+            raise ValueError("auto_quantile must be in the range (0, 1]")
+        auto_max = weights.quantile(auto_quantile, interpolation="linear")
     if auto_max is None or auto_max <= 0:
         auto_max = weights.max()
     if auto_max is None or auto_max <= 0:
@@ -495,10 +534,82 @@ def heatmap_intensity_max(
     return float(auto_max)
 
 
+def heatmap_intensity_cutoff(
+    heat_weights: object,
+    cutoff_quantile: float | None,
+) -> float | None:
+    if cutoff_quantile is None:
+        return None
+    if not 0 < cutoff_quantile < 1:
+        raise ValueError("cutoff_quantile must be in the range (0, 1)")
+
+    weights = _numeric_series(heat_weights).drop_nulls()
+    weights = weights.filter(weights > 0)
+    if weights.is_empty():
+        return None
+
+    cutoff = weights.quantile(cutoff_quantile, interpolation="linear")
+    if cutoff is None or cutoff <= 0:
+        return None
+    return float(cutoff)
+
+
+def transform_heatmap_weights(
+    heat_weights: object,
+    response_mode: str = HEATMAP_RESPONSE_LINEAR,
+) -> pl.Series:
+    weights = _numeric_series(heat_weights).clip(lower_bound=0)
+    if response_mode == HEATMAP_RESPONSE_LINEAR:
+        return weights
+    if response_mode == HEATMAP_RESPONSE_SQUARE_ROOT:
+        return weights.sqrt()
+    if response_mode == HEATMAP_RESPONSE_LOG1P:
+        return (weights + 1).log()
+    raise ValueError(f"Unsupported heatmap response mode: {response_mode}")
+
+
+def _display_intensity_max(
+    max_intensity: float | None,
+    response_mode: str,
+) -> float | None:
+    if max_intensity is None:
+        return None
+    display_value = transform_heatmap_weights([max_intensity], response_mode)[0]
+    if display_value is None or display_value <= 0:
+        return None
+    return float(display_value)
+
+
+def _heatmap_percentile_label(quantile: float) -> str:
+    percentile = int(round(quantile * 100))
+    suffix = "th"
+    if percentile % 100 not in {11, 12, 13}:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(percentile % 10, "th")
+    return f"{percentile}{suffix} percentile"
+
+
+def _heatmap_display_caption_parts(
+    cutoff_quantile: float | None,
+    response_mode: str,
+) -> list[str]:
+    parts = []
+    if cutoff_quantile is not None:
+        parts.append(
+            f"Low-intensity cutoff: {_heatmap_percentile_label(cutoff_quantile)}."
+        )
+    if response_mode != HEATMAP_RESPONSE_LINEAR:
+        parts.append(f"Intensity response: {response_mode}.")
+    return parts
+
+
 def heatmap_scale_caption(
     heat_weights: object,
     scale_mode: str,
     intensity_max: float | None,
+    *,
+    auto_quantile: float | None = HEATMAP_AUTO_QUANTILE,
+    cutoff_quantile: float | None = None,
+    response_mode: str = HEATMAP_RESPONSE_LINEAR,
 ) -> str:
     weights = _numeric_series(heat_weights).drop_nulls()
     weights = weights.filter(weights > 0)
@@ -506,15 +617,21 @@ def heatmap_scale_caption(
         return "Heatmap scale: no positive heat values in the current filters."
 
     actual_max = float(weights.max())
+    suffix_parts = _heatmap_display_caption_parts(cutoff_quantile, response_mode)
     if scale_mode == HEATMAP_SCALE_MANUAL:
-        return (
+        caption = (
             f"Manual scale: capped at {intensity_max:,.2f}. "
             f"Current maximum is {actual_max:,.2f}."
         )
-    return (
-        f"Auto scale: capped at 95th percentile ({intensity_max:,.2f}). "
-        f"Current maximum is {actual_max:,.2f}."
-    )
+        return " ".join([caption, *suffix_parts])
+    if auto_quantile is None:
+        caption = f"Auto scale: capped at current maximum ({intensity_max:,.2f})."
+    else:
+        caption = (
+            f"Auto scale: capped at {_heatmap_percentile_label(auto_quantile)} "
+            f"({intensity_max:,.2f}). Current maximum is {actual_max:,.2f}."
+        )
+    return " ".join([caption, *suffix_parts])
 
 
 def make_stop_heatmap(
@@ -523,23 +640,36 @@ def make_stop_heatmap(
     *,
     delay_direction: str = "late",
     max_intensity: float | None = None,
+    radius: int = STOP_HEATMAP_RADIUS,
+    opacity: float = STOP_HEATMAP_OPACITY,
+    response_mode: str = HEATMAP_RESPONSE_LINEAR,
+    min_intensity: float | None = None,
 ) -> go.Figure:
     heat_df = build_stop_heatmap_weights(
         stop_metrics,
         metric_key,
         delay_direction=delay_direction,
     )
+    if min_intensity is not None and min_intensity > 0:
+        heat_df = heat_df.filter(pl.col("heat_weight") >= min_intensity)
+    heat_df = heat_df.with_columns(
+        transform_heatmap_weights(heat_df["heat_weight"], response_mode).alias(
+            "display_heat_weight"
+        )
+    )
     center = {
         "lat": float(heat_df["stop_lat"].mean()),
         "lon": float(heat_df["stop_lon"].mean()),
     }
     weight_label = heatmap_weight_label(metric_key, delay_direction)
+    display_max_intensity = _display_intensity_max(max_intensity, response_mode)
     fig = px.density_mapbox(
         heat_df,
         lat="stop_lat",
         lon="stop_lon",
-        z="heat_weight",
-        radius=STOP_HEATMAP_RADIUS,
+        z="display_heat_weight",
+        radius=radius,
+        opacity=opacity,
         hover_name="stop_name",
         hover_data={
             "stop_id": True,
@@ -552,6 +682,7 @@ def make_stop_heatmap(
             "raw_poll_count": True,
             "line_count": True,
             "heat_weight": ":.2f",
+            "display_heat_weight": False,
             "stop_lat": False,
             "stop_lon": False,
         },
@@ -561,11 +692,14 @@ def make_stop_heatmap(
         labels={
             **{key: label for key, label in METRIC_LABELS.items()},
             "heat_weight": weight_label,
+            "display_heat_weight": weight_label,
         },
         color_continuous_scale=EARLY_HEAT_SCALE
         if delay_direction == "early"
-        else SEQUENTIAL_SCALE,
-        range_color=[0, max_intensity] if max_intensity is not None else None,
+        else LATE_HEAT_SCALE,
+        range_color=[0, display_max_intensity]
+        if display_max_intensity is not None
+        else None,
     )
     fig.update_layout(
         mapbox_style="carto-positron",
@@ -728,6 +862,38 @@ def main() -> None:
                 step=100.0,
                 format="%.2f",
             )
+        with st.expander("Advanced heatmap display"):
+            heatmap_radius = st.slider(
+                "Heatmap radius",
+                min_value=4,
+                max_value=35,
+                value=STOP_HEATMAP_RADIUS,
+            )
+            heatmap_opacity = st.slider(
+                "Heatmap opacity",
+                min_value=0.20,
+                max_value=1.00,
+                value=STOP_HEATMAP_OPACITY,
+                step=0.05,
+                format="%.2f",
+            )
+            heatmap_auto_quantile_label = st.selectbox(
+                "Auto cap percentile",
+                list(HEATMAP_AUTO_QUANTILE_OPTIONS),
+                index=list(HEATMAP_AUTO_QUANTILE_OPTIONS).index("99th"),
+            )
+            heatmap_auto_quantile = HEATMAP_AUTO_QUANTILE_OPTIONS[
+                heatmap_auto_quantile_label
+            ]
+            heatmap_response_mode = st.selectbox(
+                "Intensity response",
+                HEATMAP_RESPONSE_OPTIONS,
+            )
+            heatmap_cutoff_label = st.selectbox(
+                "Low-intensity cutoff",
+                list(HEATMAP_CUTOFF_OPTIONS),
+            )
+            heatmap_cutoff_quantile = HEATMAP_CUTOFF_OPTIONS[heatmap_cutoff_label]
 
     selected_lines_tuple = tuple(str(line_ref) for line_ref in selected_lines)
     selected_directions_tuple = tuple(
@@ -907,12 +1073,20 @@ def main() -> None:
                                 late_heat["heat_weight"],
                                 heatmap_scale_mode,
                                 manual_heatmap_max,
+                                auto_quantile=heatmap_auto_quantile,
+                            )
+                            min_intensity = heatmap_intensity_cutoff(
+                                late_heat["heat_weight"],
+                                heatmap_cutoff_quantile,
                             )
                             st.caption(
                                 heatmap_scale_caption(
                                     late_heat["heat_weight"],
                                     heatmap_scale_mode,
                                     max_intensity,
+                                    auto_quantile=heatmap_auto_quantile,
+                                    cutoff_quantile=heatmap_cutoff_quantile,
+                                    response_mode=heatmap_response_mode,
                                 )
                             )
                             st.plotly_chart(
@@ -921,6 +1095,10 @@ def main() -> None:
                                     metric_key,
                                     delay_direction="late",
                                     max_intensity=max_intensity,
+                                    radius=heatmap_radius,
+                                    opacity=heatmap_opacity,
+                                    response_mode=heatmap_response_mode,
+                                    min_intensity=min_intensity,
                                 ),
                                 use_container_width=True,
                             )
@@ -940,12 +1118,20 @@ def main() -> None:
                                 early_heat["heat_weight"],
                                 heatmap_scale_mode,
                                 manual_heatmap_max,
+                                auto_quantile=heatmap_auto_quantile,
+                            )
+                            min_intensity = heatmap_intensity_cutoff(
+                                early_heat["heat_weight"],
+                                heatmap_cutoff_quantile,
                             )
                             st.caption(
                                 heatmap_scale_caption(
                                     early_heat["heat_weight"],
                                     heatmap_scale_mode,
                                     max_intensity,
+                                    auto_quantile=heatmap_auto_quantile,
+                                    cutoff_quantile=heatmap_cutoff_quantile,
+                                    response_mode=heatmap_response_mode,
                                 )
                             )
                             st.plotly_chart(
@@ -954,6 +1140,10 @@ def main() -> None:
                                     metric_key,
                                     delay_direction="early",
                                     max_intensity=max_intensity,
+                                    radius=heatmap_radius,
+                                    opacity=heatmap_opacity,
+                                    response_mode=heatmap_response_mode,
+                                    min_intensity=min_intensity,
                                 ),
                                 use_container_width=True,
                             )
@@ -966,12 +1156,20 @@ def main() -> None:
                             heat["heat_weight"],
                             heatmap_scale_mode,
                             manual_heatmap_max,
+                            auto_quantile=heatmap_auto_quantile,
+                        )
+                        min_intensity = heatmap_intensity_cutoff(
+                            heat["heat_weight"],
+                            heatmap_cutoff_quantile,
                         )
                         st.caption(
                             heatmap_scale_caption(
                                 heat["heat_weight"],
                                 heatmap_scale_mode,
                                 max_intensity,
+                                auto_quantile=heatmap_auto_quantile,
+                                cutoff_quantile=heatmap_cutoff_quantile,
+                                response_mode=heatmap_response_mode,
                             )
                         )
                         st.plotly_chart(
@@ -979,6 +1177,10 @@ def main() -> None:
                                 heat,
                                 metric_key,
                                 max_intensity=max_intensity,
+                                radius=heatmap_radius,
+                                opacity=heatmap_opacity,
+                                response_mode=heatmap_response_mode,
+                                min_intensity=min_intensity,
                             ),
                             use_container_width=True,
                         )
