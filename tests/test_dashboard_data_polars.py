@@ -10,12 +10,18 @@ import polars as pl
 from dashboard_data_polars import (
     DEFAULT_DB_PATH,
     build_hourly_line_metrics,
+    build_hourly_line_metrics_lazy,
     build_stop_heatmap_weights,
     build_stop_metrics,
+    build_stop_metrics_lazy,
+    collect_filter_options,
     filter_observations,
+    filter_observations_lazy,
     load_observations,
     load_stop_metadata,
     prepare_observations,
+    summarize_observations,
+    summarize_observations_lazy,
 )
 
 
@@ -134,6 +140,109 @@ class PolarsDashboardDataTests(unittest.TestCase):
         )
 
         self.assertEqual(filtered["delay_seconds"].to_list(), [0.0])
+
+    def test_lazy_filter_options_match_prepared_observations(self) -> None:
+        prepared = prepare_observations(sample_observations(), sample_stops())
+
+        options = collect_filter_options(prepared.lazy())
+
+        self.assertEqual(str(options["min_date"]), "2026-04-23")
+        self.assertEqual(str(options["max_date"]), "2026-04-23")
+        self.assertEqual(set(options["line_options"]), {"3", "4"})
+        self.assertEqual(set(options["direction_options"]), {"1", "2"})
+
+    def test_lazy_filter_observations_matches_eager_filter(self) -> None:
+        prepared = prepare_observations(sample_observations(), sample_stops())
+        kwargs = {
+            "line_refs": ("3",),
+            "direction_refs": ("1",),
+            "day_filter": "Weekdays",
+            "start_time": time(11, 0),
+            "end_time": time(11, 12),
+        }
+
+        eager = filter_observations(prepared, **kwargs)
+        lazy = filter_observations_lazy(prepared.lazy(), **kwargs).collect()
+
+        self.assertEqual(lazy["delay_seconds"].to_list(), eager["delay_seconds"].to_list())
+
+    def test_lazy_summary_matches_eager_summary(self) -> None:
+        prepared = prepare_observations(sample_observations(), sample_stops())
+
+        self.assertEqual(
+            summarize_observations_lazy(prepared.lazy()),
+            summarize_observations(prepared),
+        )
+
+    def test_lazy_hourly_metrics_match_eager_metrics(self) -> None:
+        prepared = prepare_observations(sample_observations(), sample_stops())
+
+        eager = build_hourly_line_metrics(prepared, min_observations=1).sort(
+            ["line_ref", "local_hour"]
+        )
+        lazy = build_hourly_line_metrics_lazy(
+            prepared.lazy(),
+            min_observations=1,
+        ).sort(["line_ref", "local_hour"])
+
+        self.assertEqual(lazy.select(eager.columns).to_dicts(), eager.to_dicts())
+
+    def test_lazy_stop_metrics_match_eager_metrics(self) -> None:
+        prepared = prepare_observations(sample_observations(), sample_stops())
+
+        eager = build_stop_metrics(prepared, min_observations=1).sort("stop_id")
+        lazy = build_stop_metrics_lazy(
+            prepared.lazy(),
+            sample_stops(),
+            min_observations=1,
+        ).sort("stop_id")
+
+        self.assertEqual(lazy.select(eager.columns).to_dicts(), eager.to_dicts())
+
+    def test_lazy_stop_metrics_use_stop_metadata_by_feed_date(self) -> None:
+        observations = pl.DataFrame(
+            {
+                "recorded_at_utc": [
+                    "2026-04-22T08:00:00Z",
+                    "2026-04-23T08:00:00Z",
+                    "2026-04-30T08:00:00Z",
+                ],
+                "vehicle_id": ["v-before", "v-first", "v-second"],
+                "trip_match_key": ["before", "first", "second"],
+                "line_ref": ["3", "3", "3"],
+                "direction_ref": ["1", "1", "1"],
+                "published_line_name": ["3", "3", "3"],
+                "delay_seconds": [60, 120, 180],
+                "next_stop_point_ref": ["10", "10", "10"],
+                "next_stop_point_name": [
+                    "Fallback before",
+                    "Fallback first",
+                    "Fallback second",
+                ],
+            }
+        )
+        stops = pl.DataFrame(
+            {
+                "gtfs_feed_date": [date(2026, 4, 23), date(2026, 4, 30)],
+                "stop_id": ["10", "10"],
+                "gtfs_stop_name": ["First feed", "Second feed"],
+                "stop_lat": [60.45, 60.46],
+                "stop_lon": [22.27, 22.28],
+            },
+            schema_overrides={"stop_id": pl.Utf8},
+        )
+        prepared = prepare_observations(observations, stops)
+
+        eager = build_stop_metrics(prepared, min_observations=1).sort(
+            ["stop_name", "stop_lat"]
+        )
+        lazy = build_stop_metrics_lazy(
+            prepared.lazy(),
+            stops,
+            min_observations=1,
+        ).sort(["stop_name", "stop_lat"])
+
+        self.assertEqual(lazy.select(eager.columns).to_dicts(), eager.to_dicts())
 
     def test_stop_metrics_preserve_signed_delay_and_late_rates(self) -> None:
         prepared = prepare_observations(sample_observations(), sample_stops())

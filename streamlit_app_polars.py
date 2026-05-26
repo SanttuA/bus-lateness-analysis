@@ -15,19 +15,22 @@ from dashboard_data_polars import (
     DEFAULT_TIMEZONE,
     DIVERGING_METRICS,
     METRIC_LABELS,
-    build_hourly_line_metrics,
+    build_hourly_line_metrics_lazy,
     build_stop_heatmap_weights,
-    build_stop_metrics,
-    filter_observations,
+    build_stop_metrics_lazy,
+    collect_filter_options,
+    dashboard_cache_fingerprint,
+    ensure_dashboard_cache,
+    filter_observations_lazy,
     gtfs_stop_metadata_fingerprint,
     latest_gtfs_dir,
-    load_observations,
     load_stop_metadata,
     metric_label,
-    prepare_observations,
     rank_early_stops,
     rank_late_stops,
-    summarize_observations,
+    scan_cached_observations,
+    summarize_observations_lazy,
+    summarize_stop_metadata_coverage_lazy,
 )
 
 
@@ -71,11 +74,110 @@ DELAY_SCALE_MANUAL = "Manual range"
 DELAY_AUTO_QUANTILE = 0.95
 
 
-@st.cache_data(show_spinner="Loading Föli observations with Polars")
-def cached_dataset(db_path: str, gtfs_root: str, gtfs_fingerprint: str, timezone: str):
-    observations = load_observations(Path(db_path))
+@st.cache_data(show_spinner="Loading filter options")
+def cached_filter_options(cache_dir: str, cache_token: str) -> dict[str, object]:
+    return collect_filter_options(scan_cached_observations(Path(cache_dir)))
+
+
+@st.cache_data(show_spinner="Checking GTFS stop coverage")
+def cached_gtfs_coverage(
+    cache_dir: str,
+    cache_token: str,
+    gtfs_root: str,
+    gtfs_fingerprint: str,
+) -> dict[str, int]:
     stops = load_stop_metadata(gtfs_root=Path(gtfs_root))
-    return prepare_observations(observations, stops, timezone=timezone)
+    return summarize_stop_metadata_coverage_lazy(
+        scan_cached_observations(Path(cache_dir)),
+        stops,
+    )
+
+
+@st.cache_data(show_spinner="Summarizing selected observations")
+def cached_summary(
+    cache_dir: str,
+    cache_token: str,
+    start_date: date,
+    end_date: date,
+    line_refs: tuple[str, ...],
+    direction_refs: tuple[str, ...],
+    day_filter: str,
+    start_time: time | None = None,
+    end_time: time | None = None,
+) -> dict[str, float | int]:
+    filtered = filter_observations_lazy(
+        scan_cached_observations(Path(cache_dir)),
+        start_date=start_date,
+        end_date=end_date,
+        line_refs=line_refs,
+        direction_refs=direction_refs,
+        day_filter=day_filter,
+        start_time=start_time,
+        end_time=end_time,
+    )
+    return summarize_observations_lazy(filtered)
+
+
+@st.cache_data(show_spinner="Building line-hour metrics")
+def cached_hourly_metrics(
+    cache_dir: str,
+    cache_token: str,
+    start_date: date,
+    end_date: date,
+    line_refs: tuple[str, ...],
+    direction_refs: tuple[str, ...],
+    day_filter: str,
+    start_time: time,
+    end_time: time,
+    min_observations: int,
+) -> pl.DataFrame:
+    filtered = filter_observations_lazy(
+        scan_cached_observations(Path(cache_dir)),
+        start_date=start_date,
+        end_date=end_date,
+        line_refs=line_refs,
+        direction_refs=direction_refs,
+        day_filter=day_filter,
+        start_time=start_time,
+        end_time=end_time,
+    )
+    return build_hourly_line_metrics_lazy(
+        filtered,
+        min_observations=min_observations,
+    )
+
+
+@st.cache_data(show_spinner="Building stop metrics")
+def cached_stop_metrics(
+    cache_dir: str,
+    cache_token: str,
+    gtfs_root: str,
+    gtfs_fingerprint: str,
+    start_date: date,
+    end_date: date,
+    line_refs: tuple[str, ...],
+    direction_refs: tuple[str, ...],
+    day_filter: str,
+    min_observations: int,
+    start_time: time | None = None,
+    end_time: time | None = None,
+) -> pl.DataFrame:
+    stops = load_stop_metadata(gtfs_root=Path(gtfs_root))
+    filtered = filter_observations_lazy(
+        scan_cached_observations(Path(cache_dir)),
+        start_date=start_date,
+        end_date=end_date,
+        line_refs=line_refs,
+        direction_refs=direction_refs,
+        day_filter=day_filter,
+        start_time=start_time,
+        end_time=end_time,
+    )
+    return build_stop_metrics_lazy(
+        filtered,
+        stops,
+        min_observations=min_observations,
+    )
 
 
 def route_sort_key(value: object) -> list[object]:
@@ -522,38 +624,45 @@ def main() -> None:
 
     try:
         gtfs_fingerprint = gtfs_stop_metadata_fingerprint(DEFAULT_GTFS_ROOT)
-        df = cached_dataset(
-            str(DEFAULT_DB_PATH),
+        progress_box = st.empty()
+        cache_result = ensure_dashboard_cache(
+            DEFAULT_DB_PATH,
+            timezone=DEFAULT_TIMEZONE,
+            progress=lambda message: progress_box.info(message),
+        )
+        progress_box.empty()
+        cache_dir = str(cache_result.cache_db)
+        cache_token = dashboard_cache_fingerprint(cache_result)
+        options = cached_filter_options(cache_dir, cache_token)
+        coverage = cached_gtfs_coverage(
+            cache_dir,
+            cache_token,
             str(DEFAULT_GTFS_ROOT),
             gtfs_fingerprint,
-            DEFAULT_TIMEZONE,
         )
     except FileNotFoundError as exc:
         st.error(str(exc))
         st.stop()
-    if df.is_empty():
+    min_date = options["min_date"]
+    max_date = options["max_date"]
+    if min_date is None or max_date is None:
         st.warning("No analysis-ready observations found.")
         st.stop()
-    unmatched_gtfs_count = int(
-        df.select((~pl.col("has_gtfs_stop_metadata")).sum().alias("count")).item()
-    )
+
+    unmatched_gtfs_count = coverage["unmatched_gtfs_count"]
     if unmatched_gtfs_count:
         st.warning(
-            f"{unmatched_gtfs_count:,} of {df.height:,} buckets do not have "
+            f"{unmatched_gtfs_count:,} of {coverage['bucket_count']:,} buckets do not have "
             "date-matched GTFS stop metadata. Those rows keep SIRI stop names and "
             "are omitted from coordinate-based maps."
         )
 
-    min_date = df["local_date"].min()
-    max_date = df["local_date"].max()
     line_options = sorted(
-        df.select(pl.col("line_ref").drop_nulls().cast(pl.Utf8).unique())["line_ref"].to_list(),
+        options["line_options"],
         key=route_sort_key,
     )
     direction_options = sorted(
-        df.select(pl.col("direction_ref").drop_nulls().cast(pl.Utf8).unique())[
-            "direction_ref"
-        ].to_list(),
+        options["direction_options"],
         key=route_sort_key,
     )
     metric_options = list(METRIC_LABELS.keys())
@@ -620,25 +729,35 @@ def main() -> None:
                 format="%.2f",
             )
 
-    filtered = filter_observations(
-        df,
+    selected_lines_tuple = tuple(str(line_ref) for line_ref in selected_lines)
+    selected_directions_tuple = tuple(
+        str(direction_ref) for direction_ref in selected_directions
+    )
+    summary = cached_summary(
+        cache_dir,
+        cache_token,
         start_date=start_date,
         end_date=end_date,
-        line_refs=selected_lines,
-        direction_refs=selected_directions,
+        line_refs=selected_lines_tuple,
+        direction_refs=selected_directions_tuple,
         day_filter=day_filter,
     )
-    if filtered.is_empty():
+    if summary["bucket_count"] == 0:
         st.warning("No observations match the selected filters.")
         st.stop()
 
-    heatmap_filtered = filter_observations(
-        filtered,
+    heatmap_summary = cached_summary(
+        cache_dir,
+        cache_token,
+        start_date=start_date,
+        end_date=end_date,
+        line_refs=selected_lines_tuple,
+        direction_refs=selected_directions_tuple,
+        day_filter=day_filter,
         start_time=selected_start_time,
         end_time=selected_end_time,
     )
 
-    summary = summarize_observations(filtered)
     col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("Buckets", f"{summary['bucket_count']:,}")
     col2.metric("Lines", f"{summary['line_count']:,}")
@@ -646,21 +765,47 @@ def main() -> None:
     col4.metric("Median delay", f"{summary['median_delay_min']:.2f} min")
     col5.metric(">5 min late", f"{summary['pct_over_5_min_late']:.1f}%")
 
-    hourly = build_hourly_line_metrics(
-        heatmap_filtered,
+    hourly = cached_hourly_metrics(
+        cache_dir,
+        cache_token,
+        start_date=start_date,
+        end_date=end_date,
+        line_refs=selected_lines_tuple,
+        direction_refs=selected_directions_tuple,
+        day_filter=day_filter,
+        start_time=selected_start_time,
+        end_time=selected_end_time,
         min_observations=int(min_observations),
     )
-    stop_metrics = build_stop_metrics(
-        filtered,
+    stop_metrics = cached_stop_metrics(
+        cache_dir,
+        cache_token,
+        str(DEFAULT_GTFS_ROOT),
+        gtfs_fingerprint,
+        start_date=start_date,
+        end_date=end_date,
+        line_refs=selected_lines_tuple,
+        direction_refs=selected_directions_tuple,
+        day_filter=day_filter,
         min_observations=int(min_observations),
     )
-    heatmap_stop_metrics = build_stop_metrics(
-        heatmap_filtered,
+    heatmap_stop_metrics = cached_stop_metrics(
+        cache_dir,
+        cache_token,
+        str(DEFAULT_GTFS_ROOT),
+        gtfs_fingerprint,
+        start_date=start_date,
+        end_date=end_date,
+        line_refs=selected_lines_tuple,
+        direction_refs=selected_directions_tuple,
+        day_filter=day_filter,
         min_observations=int(min_observations),
+        start_time=selected_start_time,
+        end_time=selected_end_time,
     )
 
     st.subheader("Line By Hour")
-    if heatmap_filtered.is_empty():
+    if heatmap_summary["bucket_count"] == 0:
         st.info("No observations match the selected map and heatmap time range.")
     elif hourly.is_empty():
         st.info("No line-hour groups meet the minimum observation threshold.")
@@ -688,7 +833,7 @@ def main() -> None:
     else:
         marker_tab, heatmap_tab = st.tabs(["Stop markers", "Delay heatmap"])
         with marker_tab:
-            if heatmap_filtered.is_empty():
+            if heatmap_summary["bucket_count"] == 0:
                 st.info("No observations match the selected map and heatmap time range.")
             elif heatmap_stop_metrics.is_empty():
                 st.info(
@@ -726,7 +871,7 @@ def main() -> None:
                         use_container_width=True,
                     )
         with heatmap_tab:
-            if heatmap_filtered.is_empty():
+            if heatmap_summary["bucket_count"] == 0:
                 st.info("No observations match the selected map and heatmap time range.")
             elif heatmap_stop_metrics.is_empty():
                 st.info(

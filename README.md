@@ -86,11 +86,14 @@ A separate Polars-backed version is also available:
 uv run streamlit run streamlit_app_polars.py
 ```
 
-The dashboard reads `data/foli.db`, joins observations to the date-matched GTFS
-snapshot under `data/gtfs/`, applies conservative quality filtering, collapses
-repeated polls into trip-stop buckets, and visualizes robust delay by line,
-local hour, and next-stop location. Observations before the first local GTFS
-snapshot keep SIRI stop names but have no GTFS coordinates.
+The dashboard uses the Polars base cache under `outputs/polars-report-cache/`.
+If that cache is missing or stale, Streamlit builds it with the same
+batch/partitioned cache path used by the Polars report command instead of
+loading the full SQLite dataset into dashboard memory. It then joins filtered
+trip-stop buckets to the date-matched GTFS snapshot under `data/gtfs/` and
+visualizes robust delay by line, local hour, and next-stop location.
+Observations before the first local GTFS snapshot keep SIRI stop names but have
+no GTFS coordinates.
 
 ## Data Caveats
 
