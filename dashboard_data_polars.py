@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import time
 from pathlib import Path
+from typing import Callable
 
 import polars as pl
 
@@ -18,11 +19,20 @@ from analysis.polars._shared import (
     read_sql,
     summarize_delay_metrics,
 )
+from analysis.polars.report_cache import (
+    CacheResult,
+    DEFAULT_CACHE_DIR,
+    DELAY_BUCKETS_NAME,
+    ReportSettings,
+    ensure_analysis_cache,
+    summarize_delay_metrics_lazy,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "foli.db"
 DEFAULT_GTFS_ROOT = PROJECT_ROOT / "data" / "gtfs"
+DEFAULT_CACHE_PATH = DEFAULT_CACHE_DIR
 
 DELAY_METRIC_COLUMNS = [
     "signed_mean_delay_min",
@@ -93,6 +103,261 @@ def load_stop_metadata(
     if "gtfs_feed_date" in stops.columns:
         return stops.sort("gtfs_feed_date", "stop_id")
     return stops.sort("stop_id")
+
+
+def ensure_dashboard_cache(
+    db_path: Path | str = DEFAULT_DB_PATH,
+    *,
+    cache_dir: Path | str = DEFAULT_CACHE_PATH,
+    timezone: str = DEFAULT_TIMEZONE,
+    progress: Callable[[str], None] | None = None,
+) -> CacheResult:
+    settings = ReportSettings(
+        db=resolve_project_path(db_path),
+        cache_dir=resolve_project_path(cache_dir),
+        timezone=timezone,
+    )
+    return ensure_analysis_cache(settings, progress=progress)
+
+
+def dashboard_cache_fingerprint(cache_result: CacheResult) -> str:
+    manifest = cache_result.manifest
+    db_metadata = manifest.get("db_metadata", {})
+    settings = manifest.get("settings", {})
+    return "|".join(
+        str(part)
+        for part in [
+            manifest.get("cache_version", ""),
+            manifest.get("built_at_utc", ""),
+            db_metadata.get("db_path", ""),
+            db_metadata.get("db_size_bytes", ""),
+            db_metadata.get("db_mtime_ns", ""),
+            settings.get("quality_mode", ""),
+            settings.get("bucket", ""),
+            settings.get("timezone", ""),
+        ]
+    )
+
+
+def scan_cached_observations(
+    cache_dir: Path | str = DEFAULT_CACHE_PATH,
+) -> pl.LazyFrame:
+    cache_path = resolve_project_path(cache_dir) / f"{DELAY_BUCKETS_NAME}.parquet"
+    if not cache_path.exists():
+        raise FileNotFoundError(f"Dashboard cache not found: {cache_path}")
+    return _normalise_dashboard_lazy_frame(pl.scan_parquet(cache_path))
+
+
+def collect_filter_options(df: pl.LazyFrame) -> dict[str, object]:
+    result = _normalise_dashboard_lazy_frame(df)
+    bounds = result.select(
+        pl.col("local_date").min().alias("min_date"),
+        pl.col("local_date").max().alias("max_date"),
+    ).collect().row(0, named=True)
+    line_options = (
+        result.select(pl.col("line_ref").drop_nulls().cast(pl.Utf8).unique())
+        .collect()["line_ref"]
+        .to_list()
+    )
+    direction_options = (
+        result.select(pl.col("direction_ref").drop_nulls().cast(pl.Utf8).unique())
+        .collect()["direction_ref"]
+        .to_list()
+    )
+    return {
+        "min_date": bounds["min_date"],
+        "max_date": bounds["max_date"],
+        "line_options": [str(value) for value in line_options],
+        "direction_options": [str(value) for value in direction_options],
+    }
+
+
+def filter_observations_lazy(
+    df: pl.LazyFrame,
+    *,
+    start_date: object | None = None,
+    end_date: object | None = None,
+    line_refs: list[str] | tuple[str, ...] | None = None,
+    direction_refs: list[str] | tuple[str, ...] | None = None,
+    day_filter: str = "All days",
+    start_time: time | None = None,
+    end_time: time | None = None,
+) -> pl.LazyFrame:
+    result = _normalise_dashboard_lazy_frame(df)
+    if start_date is not None:
+        result = result.filter(pl.col("local_date") >= start_date)
+    if end_date is not None:
+        result = result.filter(pl.col("local_date") <= end_date)
+    if line_refs:
+        selected_lines = [str(line_ref) for line_ref in line_refs]
+        result = result.filter(pl.col("line_ref").cast(pl.Utf8).is_in(selected_lines))
+    if direction_refs:
+        selected_directions = [str(direction_ref) for direction_ref in direction_refs]
+        result = result.filter(pl.col("direction_ref").cast(pl.Utf8).is_in(selected_directions))
+    if day_filter == "Weekdays":
+        result = result.filter(pl.col("is_weekday"))
+    elif day_filter == "Weekends":
+        result = result.filter(~pl.col("is_weekday"))
+    if start_time is not None or end_time is not None:
+        start_minute = 0 if start_time is None else _minute_of_day(start_time)
+        end_minute = (24 * 60) - 1 if end_time is None else _minute_of_day(end_time)
+        if start_minute > end_minute:
+            raise ValueError("start_time must be before or equal to end_time")
+        result = result.filter(
+            (pl.col("local_minute_of_day") >= start_minute)
+            & (pl.col("local_minute_of_day") <= end_minute)
+        )
+    return result
+
+
+def summarize_observations_lazy(df: pl.LazyFrame) -> dict[str, float | int]:
+    result = _normalise_dashboard_lazy_frame(df)
+    summary = result.select(
+        pl.len().alias("bucket_count"),
+        pl.col("raw_poll_count").sum().alias("raw_poll_count"),
+        pl.col("line_ref").n_unique().alias("line_count"),
+        pl.col("stop_id").n_unique().alias("stop_count"),
+        pl.col("delay_min").median().alias("median_delay_min"),
+        pl.col("delay_min").quantile(0.90, interpolation="linear").alias("p90_delay_min"),
+        (pl.col("delay_seconds") > 300).mean().mul(100.0).alias("pct_over_5_min_late"),
+    ).collect().row(0, named=True)
+    return {
+        "bucket_count": int(summary["bucket_count"] or 0),
+        "raw_poll_count": int(summary["raw_poll_count"] or 0),
+        "line_count": int(summary["line_count"] or 0),
+        "stop_count": int(summary["stop_count"] or 0),
+        "median_delay_min": float(summary["median_delay_min"] or 0.0),
+        "p90_delay_min": float(summary["p90_delay_min"] or 0.0),
+        "pct_over_5_min_late": float(summary["pct_over_5_min_late"] or 0.0),
+    }
+
+
+def build_hourly_line_metrics_lazy(
+    df: pl.LazyFrame,
+    *,
+    min_observations: int = 1,
+) -> pl.DataFrame:
+    result = summarize_delay_metrics_lazy(
+        _normalise_dashboard_lazy_frame(df),
+        ["line_ref", "local_hour"],
+        min_observations=min_observations,
+        extra_aggs={"line_name": ("published_line_name", "first")},
+    )
+    return result.collect()
+
+
+def build_stop_metrics_lazy(
+    df: pl.LazyFrame,
+    stops: pl.DataFrame,
+    *,
+    min_observations: int = 1,
+) -> pl.DataFrame:
+    group_keys = ["stop_id", "stop_name", "stop_lat", "stop_lon"]
+    enriched = enrich_stop_metadata_lazy(df, stops)
+    metrics = summarize_delay_metrics_lazy(
+        enriched,
+        group_keys,
+        min_observations=min_observations,
+    )
+    line_counts = enriched.group_by(group_keys).agg(
+        pl.col("line_ref").n_unique().alias("line_count")
+    )
+    result = metrics.join(
+        line_counts,
+        on=group_keys,
+        how="left",
+        nulls_equal=True,
+    )
+    return result.select(
+        "stop_id",
+        "stop_name",
+        "stop_lat",
+        "stop_lon",
+        "line_count",
+        *[
+            column
+            for column in metrics.collect_schema().names()
+            if column not in {"stop_id", "stop_name", "stop_lat", "stop_lon"}
+        ],
+    ).collect()
+
+
+def summarize_stop_metadata_coverage_lazy(
+    df: pl.LazyFrame,
+    stops: pl.DataFrame,
+) -> dict[str, int]:
+    summary = enrich_stop_metadata_lazy(df, stops).select(
+        pl.len().alias("bucket_count"),
+        (~pl.col("has_gtfs_stop_metadata")).sum().alias("unmatched_gtfs_count"),
+    ).collect().row(0, named=True)
+    return {
+        "bucket_count": int(summary["bucket_count"] or 0),
+        "unmatched_gtfs_count": int(summary["unmatched_gtfs_count"] or 0),
+    }
+
+
+def enrich_stop_metadata_lazy(
+    df: pl.LazyFrame,
+    stops: pl.DataFrame,
+) -> pl.LazyFrame:
+    result = _normalise_dashboard_lazy_frame(df)
+    existing = set(result.collect_schema().names())
+    drop_columns = [
+        column
+        for column in [
+            "gtfs_feed_date",
+            "gtfs_stop_name",
+            "stop_lat",
+            "stop_lon",
+            "has_gtfs_stop_metadata",
+            "stop_name",
+        ]
+        if column in existing
+    ]
+    if drop_columns:
+        result = result.drop(drop_columns)
+
+    stop_columns = ["stop_id", "gtfs_stop_name", "stop_lat", "stop_lon"]
+    if stops.is_empty():
+        result = result.with_columns(
+            pl.lit(None, dtype=pl.Date).alias("gtfs_feed_date"),
+            pl.lit(None, dtype=pl.Utf8).alias("gtfs_stop_name"),
+            pl.lit(None, dtype=pl.Float64).alias("stop_lat"),
+            pl.lit(None, dtype=pl.Float64).alias("stop_lon"),
+        )
+    elif "gtfs_feed_date" in stops.columns:
+        metadata = (
+            stops.select("gtfs_feed_date", *stop_columns)
+            .with_columns(pl.col("stop_id").cast(pl.Utf8))
+            .unique(["gtfs_feed_date", "stop_id"], keep="first")
+            .sort("gtfs_feed_date", "stop_id")
+        )
+        feeds = metadata.select("gtfs_feed_date").unique().sort("gtfs_feed_date")
+        result = (
+            result.sort("local_date")
+            .join_asof(
+                feeds.lazy(),
+                left_on="local_date",
+                right_on="gtfs_feed_date",
+                strategy="backward",
+            )
+            .join(metadata.lazy(), on=["gtfs_feed_date", "stop_id"], how="left")
+        )
+    else:
+        metadata = (
+            stops.select(stop_columns)
+            .with_columns(pl.col("stop_id").cast(pl.Utf8))
+            .unique(["stop_id"], keep="first")
+        )
+        result = result.with_columns(pl.lit(None, dtype=pl.Date).alias("gtfs_feed_date"))
+        result = result.join(metadata.lazy(), on="stop_id", how="left")
+
+    return result.with_columns(
+        pl.col("gtfs_stop_name").is_not_null().alias("has_gtfs_stop_metadata"),
+        pl.coalesce(pl.col("gtfs_stop_name"), pl.col("next_stop_point_name")).alias("stop_name"),
+        pl.col("stop_lat").cast(pl.Float64, strict=False),
+        pl.col("stop_lon").cast(pl.Float64, strict=False),
+    )
 
 
 def prepare_observations(
@@ -383,6 +648,22 @@ def _empty_prepared_frame() -> pl.DataFrame:
 
 def _minute_of_day(value: time) -> int:
     return value.hour * 60 + value.minute
+
+
+def _normalise_dashboard_lazy_frame(df: pl.LazyFrame) -> pl.LazyFrame:
+    columns = set(df.collect_schema().names())
+    expressions: list[pl.Expr] = []
+    if "next_stop_point_ref" in columns:
+        expressions.append(pl.col("next_stop_point_ref").cast(pl.Utf8).alias("stop_id"))
+    elif "stop_id" in columns:
+        expressions.append(pl.col("stop_id").cast(pl.Utf8).alias("stop_id"))
+    if "local_minutes" in columns:
+        expressions.append(pl.col("local_minutes").alias("local_minute_of_day"))
+    elif "local_minute_of_day" in columns:
+        expressions.append(pl.col("local_minute_of_day").alias("local_minute_of_day"))
+    if "delay_min" not in columns and "delay_seconds" in columns:
+        expressions.append((pl.col("delay_seconds").cast(pl.Float64) / 60.0).alias("delay_min"))
+    return df.with_columns(expressions) if expressions else df
 
 
 def _empty_metric_frame(group_columns: list[str]) -> pl.DataFrame:
