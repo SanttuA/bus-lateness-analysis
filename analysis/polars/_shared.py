@@ -512,8 +512,26 @@ def aggregate_delay_buckets(
     if df.is_empty():
         return empty_bucket_frame()
 
-    working = add_representative_time_columns(df, timezone=timezone)
-    working = _ensure_columns(
+    return aggregate_delay_buckets_lazy(df.lazy(), bucket=bucket, timezone=timezone).collect()
+
+
+def aggregate_delay_buckets_lazy(
+    df: pl.LazyFrame,
+    *,
+    bucket: str = DEFAULT_BUCKET_MODE,
+    timezone: str = DEFAULT_TIMEZONE,
+    partition_count: int | None = None,
+    partition_index: int | None = None,
+) -> pl.LazyFrame:
+    if bucket not in BUCKET_MODES:
+        raise ValueError(f"bucket must be one of: {', '.join(BUCKET_MODES)}")
+    if (partition_count is None) != (partition_index is None):
+        raise ValueError("partition_count and partition_index must be provided together")
+    if partition_count is not None and not (0 <= partition_index < partition_count):
+        raise ValueError("partition_index must be between 0 and partition_count - 1")
+
+    working = add_representative_time_columns_lazy(df, timezone=timezone)
+    working = _ensure_lazy_columns(
         working,
         [
             "id",
@@ -538,8 +556,6 @@ def aggregate_delay_buckets(
         & pl.col("representative_time_utc").is_not_null()
         & pl.col("line_ref").is_not_null()
     )
-    if working.is_empty():
-        return empty_bucket_frame()
 
     if bucket == "poll":
         result = working.with_row_index("_row_nr").with_columns(
@@ -562,12 +578,18 @@ def aggregate_delay_buckets(
         else:
             group_keys = ["line_ref", "direction_ref", "local_date", "local_hour", "day_type"]
 
-        working = working.sort("representative_time_utc")
-        result = working.group_by(group_keys, maintain_order=True).agg(
+        if partition_count is not None:
+            partition_key = pl.concat_str(
+                [pl.col(column).cast(pl.Utf8).fill_null("<NA>") for column in group_keys],
+                separator="|",
+            ).hash(seed=0)
+            working = working.filter((partition_key % partition_count) == partition_index)
+
+        result = working.group_by(group_keys).agg(
             pl.col("delay_seconds").median().alias("delay_seconds"),
             pl.len().alias("raw_poll_count"),
-            pl.col("published_line_name").first(),
-            pl.col("next_stop_point_name").first(),
+            pl.col("published_line_name").sort_by("representative_time_utc").first(),
+            pl.col("next_stop_point_name").sort_by("representative_time_utc").first(),
             pl.col("representative_time_utc").min(),
             pl.col("recorded_at_utc").min(),
             pl.col("recorded_at_utc").min().alias("first_recorded_at_utc"),
@@ -579,7 +601,7 @@ def aggregate_delay_buckets(
                 separator="|",
             ).alias("bucket_id")
         )
-        if "next_stop_point_ref" not in result.columns:
+        if "next_stop_point_ref" not in result.collect_schema().names():
             result = result.with_columns(pl.lit(None, dtype=pl.Utf8).alias("next_stop_point_ref"))
 
     result = add_local_time_columns(result, "representative_time_utc", timezone)
@@ -590,8 +612,34 @@ def aggregate_delay_buckets(
         (pl.col("delay_seconds") / 60.0).alias("delay_min"),
         pl.lit(bucket).alias("bucket_mode"),
     )
-    columns = [column for column in empty_bucket_frame().columns if column in result.columns]
+    if bucket != "poll":
+        result = result.sort("representative_time_utc")
+    result_columns = set(result.collect_schema().names())
+    columns = [column for column in empty_bucket_frame().columns if column in result_columns]
     return result.select(columns)
+
+
+def add_representative_time_columns_lazy(
+    df: pl.LazyFrame,
+    *,
+    timezone: str = DEFAULT_TIMEZONE,
+) -> pl.LazyFrame:
+    result = _ensure_lazy_columns(df, ["recorded_at_utc", "next_aimed_arrival_time_utc"])
+    result = result.with_columns(
+        _parse_datetime_expr("recorded_at_utc").alias("recorded_at_utc"),
+        _parse_datetime_expr("next_aimed_arrival_time_utc").alias("next_aimed_arrival_time_utc"),
+    )
+    result = result.with_columns(
+        pl.coalesce("next_aimed_arrival_time_utc", "recorded_at_utc").alias(
+            "representative_time_utc"
+        )
+    )
+    result = add_local_time_columns(result, "representative_time_utc", timezone)
+    return result.with_columns(
+        pl.when(pl.col("is_weekday")).then(pl.lit("weekday")).otherwise(pl.lit("weekend")).alias(
+            "day_type"
+        )
+    )
 
 
 def summarize_delay_metrics(
@@ -966,6 +1014,14 @@ def _parse_datetime_expr(column: str) -> pl.Expr:
 
 def _ensure_columns(df: pl.DataFrame, columns: list[str]) -> pl.DataFrame:
     missing = [column for column in columns if column not in df.columns]
+    if not missing:
+        return df
+    return df.with_columns([pl.lit(None).alias(column) for column in missing])
+
+
+def _ensure_lazy_columns(df: pl.LazyFrame, columns: list[str]) -> pl.LazyFrame:
+    existing = set(df.collect_schema().names())
+    missing = [column for column in columns if column not in existing]
     if not missing:
         return df
     return df.with_columns([pl.lit(None).alias(column) for column in missing])

@@ -23,6 +23,7 @@ from analysis.polars.report_cache import (
     ReportSettings as PolarsReportSettings,
     build_hourly_delay_profile,
     build_line_rankings,
+    build_quality_summary_lazy,
     ensure_report_cache as ensure_polars_report_cache,
     enrich_stops,
     matched_control_rows,
@@ -229,6 +230,24 @@ class PolarsSharedAnalyticsTests(unittest.TestCase):
 
         self.assertEqual(active["delay_seconds"].to_list(), [60])
         self.assertEqual(controls["delay_seconds"].to_list(), [120])
+
+    def test_lazy_quality_summary_is_empty_for_no_analysis_rows(self) -> None:
+        summary = build_quality_summary_lazy(
+            pl.DataFrame(
+                schema={
+                    "line_ref": pl.Utf8,
+                    "published_line_name": pl.Utf8,
+                    "is_implausible_delay": pl.Boolean,
+                    "is_stale_observation": pl.Boolean,
+                    "is_pre_trip_observation": pl.Boolean,
+                    "is_post_trip_observation": pl.Boolean,
+                    "has_stop_call_disagreement": pl.Boolean,
+                }
+            ).lazy()
+        ).collect()
+
+        self.assertTrue(summary.is_empty())
+        self.assertEqual(summary.columns, ["quality_check", "row_count", "pct_rows"])
 
 
 class PolarsReportParityTests(unittest.TestCase):
