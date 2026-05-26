@@ -1,57 +1,57 @@
 # Complete Bus Lateness Findings
 
-This report summarizes all cached analysis outputs currently available in the
-repository. It is a narrative companion to the generated table report at
-[`reports/generated/overall-results.md`](reports/generated/overall-results.md)
-and the detailed CSV artifacts in [`outputs/report-cache/`](outputs/report-cache/).
+This report summarizes the latest generated bus lateness analysis artifacts in
+this repository. The primary source is the pandas/DuckDB report at
+[`reports/generated/overall-results.md`](reports/generated/overall-results.md),
+generated at `2026-05-26T10:11:03+00:00` from a rebuilt cache.
 
-The cache was not refreshed for this report.
+The cache was not rebuilt again for this narrative report.
 
 ## Executive Summary
 
-- The cached analysis covers `2026-04-23T08:05:22Z` to
-  `2026-05-08T09:36:13Z`, with `5,585,585` analysis rows collapsed into
-  `2,012,287` trip-stop buckets across `138` lines.
-- Conservative default quality filtering excludes `310,081` rows, or `5.55%`
-  of analysis rows. If stop-call disagreement rows are also excluded, the
-  excluded share rises to `7.74%`.
-- The strongest late-running line findings are led by `612`, `615`, `L8`,
-  `614`, and `720` when ranked by p90 delay. Line `L8` has only `50` buckets,
-  so its ranking is less stable than high-volume lines such as `612`, `615`,
-  `614`, `25`, `24`, and `25A`.
-- Early running is a separate operational issue. `P6` is the clearest outlier:
-  `93.81%` of its buckets are early and `60.85%` are more than three minutes
-  early. Other notable early-running lines include `N10`, `711`, `L4`, `L6`,
-  `L1`, `L5`, and `L2`.
-- Systemwide delay pressure is highest in the afternoon, especially
-  `15:00-16:00` local time. Those hours have the largest p90 delay and the
-  highest share of buckets more than five minutes late.
-- Rush-window impact is concentrated on a smaller set of lines. `612` and
-  `615` show the largest p90 rush delay lifts, with much higher late-running
-  rates during rush periods.
-- Stop-level midpoint changes identify locations whose observed p90 delay
-  changed between the first and second half of the cached range. These are
-  before/after indicators, not causal evidence.
-- Service-alert matched-control analysis shows generally modest group-level
-  delay lifts, but some line-level alert matches show larger p90 lifts. Small
-  alert sample sizes should be interpreted cautiously.
-- Collector blackout and missing-data report tables currently contain no
-  matching rows under the configured definitions.
+- The latest generated report covers `2026-04-23T08:05:22Z` to
+  `2026-05-23T13:24:20Z`, with `10,430,580` analysis rows from `10,532,270`
+  raw vehicle observations.
+- The default trip-stop bucketed dataset contains `3,746,770` buckets,
+  representing `9,837,244` raw polls across `140` lines.
+- Conservative quality filtering excludes `593,336` rows, or `5.69%` of
+  analysis rows. If stop-call disagreement rows are also excluded, the excluded
+  share rises to `7.90%`.
+- Late-running pressure is led by lines `612`, `615`, and `614`, each with high
+  p90 delay and thousands of buckets. Lines `25`, `25A`, `24`, and `21` have
+  lower p90 delay than the top routes but much larger service volumes.
+- Early running remains a separate reliability issue. `P6` is the clearest
+  outlier, with `92.76%` of buckets early and `59.62%` more than three minutes
+  early. Other notable early-running lines include `N10`, `75`, `L4`, `N7`,
+  `L6`, `L1`, `711`, `L5`, and `L2`.
+- The networkwide late-running peak is concentrated around `15:00-16:00` local
+  time. Both hours have p90 delay of `4.40` minutes and the highest shares of
+  buckets more than five minutes late.
+- Rush-period impact is strongest for `612` and `615`. Line `612` has a
+  `10.75` minute p90 rush lift and a `55.71` percentage-point increase in the
+  share of buckets more than five minutes late.
+- Collector coverage is no longer empty in the latest generated report. The
+  collector tables identify major `siri_vm` and `siri_alerts` collection gaps,
+  including multi-day gaps that can affect interpretation of affected periods.
+- The Polars report is useful corroboration for the main operational findings,
+  but pandas/DuckDB remains the better source for this narrative report because
+  it is the established primary report and currently has fuller generated
+  output.
 
 ## Scope And Methodology
-
-The source of truth for this report is the existing cache built at
-`2026-05-11T05:32:44+00:00`. The manifest is
-[`outputs/report-cache/manifest.json`](outputs/report-cache/manifest.json).
 
 | Item | Value |
 | --- | --- |
 | Database | `data/foli.db` |
-| Raw vehicle observations | `5,647,149` |
-| Analysis rows | `5,585,585` |
-| Cached trip-stop buckets | `2,012,287` |
-| Lines represented | `138` |
-| Representative bucket range | `2026-04-23T09:45:00Z` to `2026-05-08T09:50:00Z` |
+| Generated report | `reports/generated/overall-results.md` |
+| Cache manifest | `outputs/report-cache/manifest.json` |
+| Cache built at | `2026-05-26T10:11:03+00:00` |
+| Raw vehicle observations | `10,532,270` |
+| Analysis rows | `10,430,580` |
+| Cached trip-stop buckets | `3,746,770` |
+| Raw polls represented by buckets | `9,837,244` |
+| Lines represented | `140` |
+| Representative bucket range | `2026-04-23T09:45:00Z` to `2026-05-23T13:39:00Z` |
 | Quality mode | `conservative` |
 | Bucket mode | `trip-stop` |
 | Timezone | `Europe/Helsinki` |
@@ -60,8 +60,8 @@ The source of truth for this report is the existing cache built at
 
 The analysis uses SIRI vehicle-monitoring delay values. These are estimated
 vehicle state values, not measured stop arrival truth. Raw vehicle-monitoring
-rows are repeated polls, so the default analysis collapses rows into trip-stop
-buckets to avoid overweighting vehicles that remain visible for longer.
+rows are repeated polls, so the default report collapses them into trip-stop
+buckets before ranking lines, stops, hours, and alert contexts.
 
 Primary delay findings use robust metrics:
 
@@ -73,103 +73,97 @@ Primary delay findings use robust metrics:
 
 ## Data Quality Findings
 
-The default conservative filter removes rows that are implausible, stale,
-pre-trip, or post-trip. Stop-call disagreement is flagged by default but not
+The default conservative filter removes implausible, stale, pre-trip, and
+post-trip observations. Stop-call disagreement is flagged by default but not
 removed unless explicitly requested.
 
 | Quality check | Rows | Share |
 | --- | ---: | ---: |
-| Analysis rows | 5,585,585 | 100.00% |
-| Implausible delay | 4,001 | 0.07% |
-| Stale observation | 73,822 | 1.32% |
-| Pre-trip observation | 186,131 | 3.33% |
-| Post-trip observation | 101,019 | 1.81% |
-| Stop-call disagreement | 173,682 | 3.11% |
-| Conservative default excluded | 310,081 | 5.55% |
-| Conservative with stop-call disagreement excluded | 432,344 | 7.74% |
+| Analysis rows | 10,430,580 | 100.00% |
+| Implausible delay | 6,637 | 0.06% |
+| Stale observation | 149,992 | 1.44% |
+| Pre-trip observation | 343,245 | 3.29% |
+| Post-trip observation | 201,581 | 1.93% |
+| Stop-call disagreement | 320,371 | 3.07% |
+| Conservative default excluded | 593,336 | 5.69% |
+| Conservative with stop-call disagreement excluded | 823,567 | 7.90% |
 
-Pre-trip and post-trip observations are the largest default quality exclusions.
-Stop-call disagreement is also material at `3.11%`, but it is handled as a flag
-in the default report so the core findings are not narrowed more aggressively.
+Pre-trip observations are the largest individual default exclusion. Stop-call
+disagreement is also material at `3.07%`, but leaving it as a flag keeps the
+main findings from being narrowed more aggressively than the report default.
 
 ### Worst Quality Lines
 
-The worst data-quality rates are concentrated on a small set of lines. These
-lines should be treated carefully in operational interpretation, especially
-where delay rankings and data-quality flags overlap.
-
 | Line | Rows | Default excluded | Excluded share |
 | --- | ---: | ---: | ---: |
-| `79A` | 3,512 | 2,244 | 63.90% |
-| `N6` | 8,135 | 4,809 | 59.11% |
-| `711` | 6,875 | 3,842 | 55.88% |
-| `P3` | 9,659 | 5,292 | 54.79% |
-| `V2` | 2,818 | 1,499 | 53.19% |
-| `L13` | 3,525 | 1,841 | 52.23% |
-| `P6` | 10,932 | 5,450 | 49.85% |
-| `N10` | 8,461 | 3,190 | 37.70% |
-| `71` | 7,264 | 2,715 | 37.38% |
-| `L4` | 8,164 | 2,872 | 35.18% |
+| `P3` | 19,454 | 11,394 | 58.57% |
+| `N6` | 13,832 | 7,905 | 57.15% |
+| `79A` | 6,103 | 3,423 | 56.09% |
+| `711` | 12,774 | 7,150 | 55.97% |
+| `L13` | 6,377 | 3,426 | 53.72% |
+| `N14` | 5,035 | 2,500 | 49.65% |
+| `V2` | 3,970 | 1,726 | 43.48% |
+| `P6` | 16,611 | 6,683 | 40.23% |
+| `N10` | 16,349 | 6,291 | 38.48% |
+| `67` | 12,071 | 4,556 | 37.74% |
 
-`P6`, `N10`, `711`, and `L4` also appear in early-running findings, so their
-early-running results should be read together with these data-quality rates.
+Several lines with high exclusion rates also appear in operational findings.
+`P6`, `N10`, and `711` should be read with particular caution because they also
+rank as early-running outliers.
 
-Full data-quality tables:
+Full tables:
 [`quality_summary.csv`](outputs/report-cache/quality_summary.csv),
 [`quality_by_line.csv`](outputs/report-cache/quality_by_line.csv).
 
 ## Late-Running Line Findings
 
-Late-running line rankings use `p90_delay_min` as the primary sort key. This
-captures high-end delay more reliably than the signed mean.
+Late-running rankings use p90 delay as the main sort key. This highlights routes
+where high-end delays are operationally meaningful even when the median remains
+moderate.
 
 | Rank | Line | Buckets | Median delay | p90 delay | >5 min late |
 | ---: | --- | ---: | ---: | ---: | ---: |
-| 1 | `612` | 1,397 | 4.12 min | 15.38 min | 46.96% |
-| 2 | `615` | 3,199 | 2.80 min | 14.79 min | 37.95% |
-| 3 | `L8` | 50 | 3.66 min | 11.38 min | 36.00% |
-| 4 | `614` | 3,393 | 4.00 min | 10.23 min | 39.91% |
-| 5 | `720` | 1,601 | 3.12 min | 8.45 min | 29.42% |
-| 6 | `25` | 13,306 | 2.06 min | 8.37 min | 26.01% |
-| 7 | `V1` | 2,345 | 1.45 min | 8.31 min | 22.26% |
-| 8 | `42A` | 1,899 | 0.87 min | 8.17 min | 18.96% |
-| 9 | `24` | 24,585 | 1.03 min | 8.07 min | 20.39% |
-| 10 | `25A` | 15,796 | 2.72 min | 7.95 min | 24.19% |
+| 1 | `612` | 2,599 | 4.17 min | 14.12 min | 46.25% |
+| 2 | `615` | 5,993 | 3.03 min | 13.40 min | 39.03% |
+| 3 | `614` | 6,291 | 4.02 min | 10.18 min | 39.71% |
+| 4 | `42A` | 3,527 | 1.33 min | 9.72 min | 22.51% |
+| 5 | `V1` | 4,235 | 3.27 min | 9.59 min | 37.21% |
+| 6 | `25` | 25,175 | 2.08 min | 8.10 min | 26.72% |
+| 7 | `25A` | 29,265 | 2.78 min | 7.75 min | 24.31% |
+| 8 | `24` | 45,581 | 1.02 min | 7.53 min | 18.74% |
+| 9 | `720` | 3,030 | 2.50 min | 7.43 min | 24.36% |
+| 10 | `42` | 3,196 | 0.83 min | 7.26 min | 18.09% |
 
-The strongest late-running evidence is on `612`, `615`, and `614`: they have
-both high p90 delay and thousands of buckets. `L8` has severe p90 delay but only
-`50` buckets, so it is a useful signal for follow-up rather than a stable
-networkwide conclusion.
-
-Lines `24`, `25`, and `25A` have lower p90 delay than the top few routes but
-far more observations. Their findings matter because they represent repeated
-delay across a much larger volume of service.
+The strongest late-running evidence is on `612`, `615`, and `614`: all three
+combine high p90 delay with enough bucket volume to be stable screening
+signals. `25`, `25A`, `24`, and `21` are also important because they have much
+larger volumes; smaller p90 delay on those lines still affects many trips.
 
 Full table: [`line_late_rankings.csv`](outputs/report-cache/line_late_rankings.csv).
 
 ## Early-Running Line Findings
 
-Early running matters because it can cause missed boardings even when average
-delay appears acceptable. The early-running ranking uses early magnitude and
-early shares rather than p90 late delay.
+Early running matters because it can create missed boardings even when average
+delay appears acceptable. The ranking below emphasizes early frequency and
+early magnitude rather than late delay.
 
 | Rank | Line | Buckets | Median delay | Early | >3 min early | p90 early magnitude |
 | ---: | --- | ---: | ---: | ---: | ---: | ---: |
-| 1 | `P6` | 1,663 | -4.23 min | 93.81% | 60.85% | 16.12 min |
-| 2 | `903` | 995 | 0.00 min | 30.75% | 12.66% | 12.85 min |
-| 3 | `901` | 8,076 | 0.00 min | 49.24% | 24.26% | 12.02 min |
-| 4 | `615` | 3,199 | 2.80 min | 24.66% | 10.03% | 9.47 min |
-| 5 | `N10` | 1,189 | -2.57 min | 70.14% | 46.43% | 8.88 min |
-| 6 | `801` | 45,201 | 0.00 min | 48.25% | 19.39% | 8.57 min |
-| 7 | `75` | 283 | -2.55 min | 93.29% | 46.64% | 8.45 min |
-| 8 | `L4` | 1,445 | -1.57 min | 62.84% | 34.46% | 8.05 min |
-| 9 | `N7` | 1,593 | -0.32 min | 53.86% | 31.64% | 7.96 min |
-| 10 | `42` | 1,722 | 0.82 min | 34.67% | 8.94% | 7.91 min |
+| 1 | `P6` | 3,081 | -4.20 min | 92.76% | 59.62% | 15.87 min |
+| 2 | `901` | 14,098 | 0.00 min | 49.38% | 25.51% | 13.32 min |
+| 3 | `903` | 1,760 | 0.00 min | 35.74% | 18.12% | 12.38 min |
+| 4 | `N10` | 2,215 | -2.60 min | 71.92% | 46.68% | 9.23 min |
+| 5 | `75` | 528 | -2.67 min | 94.51% | 46.59% | 8.48 min |
+| 6 | `801` | 85,169 | 0.00 min | 48.61% | 19.68% | 8.47 min |
+| 7 | `L4` | 2,669 | -1.50 min | 62.27% | 34.02% | 8.28 min |
+| 8 | `N7` | 2,926 | -0.68 min | 55.23% | 33.77% | 8.27 min |
+| 9 | `615` | 5,993 | 3.03 min | 21.54% | 7.83% | 8.26 min |
+| 10 | `L6` | 2,120 | -2.20 min | 78.96% | 41.42% | 8.03 min |
 
-`P6` is the dominant early-running finding by both frequency and magnitude.
-`N10`, `711`, `L4`, `L6`, `L1`, `L5`, and `L2` also show high rates of buckets
-more than three minutes early. `615` appears in both late and early rankings,
-which suggests high variability rather than a simple consistently late profile.
+`P6` is the dominant early-running signal by both frequency and magnitude.
+`N10`, `75`, `L4`, `N7`, `L6`, `L1`, `711`, `L5`, and `L2` also have high early
+shares. `615` appears in both late and early rankings, which suggests high
+variability rather than a simple consistently-late profile.
 
 Full table: [`line_early_rankings.csv`](outputs/report-cache/line_early_rankings.csv).
 
@@ -180,115 +174,104 @@ are useful for finding specific operating conditions where delay is concentrated
 
 | Line | Direction | Hour | Day type | Buckets | Median delay | p90 delay | >5 min late |
 | --- | ---: | --- | --- | ---: | ---: | ---: | ---: |
-| `705` | 1 | 16:00 | weekend | 30 | 0.06 min | 39.25 min | 23.33% |
-| `24` | 1 | 07:00 | weekend | 167 | -1.68 min | 28.39 min | 12.57% |
-| `402` | 2 | 22:00 | weekday | 216 | -1.10 min | 27.83 min | 20.37% |
-| `24` | 1 | 17:00 | weekend | 181 | 6.15 min | 24.40 min | 58.01% |
-| `24` | 2 | 17:00 | weekend | 178 | 1.03 min | 21.40 min | 24.72% |
-| `25A` | 1 | 10:00 | weekday | 433 | 0.55 min | 21.20 min | 14.09% |
-| `N12` | 2 | 07:00 | weekday | 50 | 0.00 min | 20.27 min | 16.00% |
-| `615` | 2 | 17:00 | weekday | 695 | 12.55 min | 19.69 min | 89.06% |
-| `901` | 2 | 12:00 | weekday | 34 | 4.42 min | 19.50 min | 44.12% |
-| `612` | 2 | 15:00 | weekday | 689 | 10.22 min | 17.60 min | 91.44% |
+| `901` | 2 | 07:00 | weekend | 115 | 0.78 min | 43.34 min | 20.00% |
+| `24` | 1 | 15:00 | weekend | 335 | 7.37 min | 28.72 min | 69.25% |
+| `901` | 2 | 06:00 | weekend | 38 | 2.97 min | 28.23 min | 39.47% |
+| `402` | 2 | 22:00 | weekday | 394 | -1.10 min | 27.83 min | 11.42% |
+| `901` | 2 | 09:00 | weekend | 278 | 1.25 min | 24.65 min | 16.91% |
+| `24` | 1 | 17:00 | weekend | 323 | 4.88 min | 23.23 min | 48.92% |
+| `24` | 2 | 17:00 | weekend | 308 | 0.57 min | 20.14 min | 23.70% |
+| `615` | 2 | 17:00 | weekday | 1,317 | 11.73 min | 18.90 min | 88.46% |
+| `612` | 2 | 15:00 | weekday | 1,311 | 9.45 min | 16.45 min | 87.57% |
+| `42A` | 2 | 13:00 | weekday | 668 | 5.23 min | 16.16 min | 51.80% |
 
-The context table shows two different kinds of hotspots:
-
-- Sparse but severe contexts, such as `705` direction `1` at weekend `16:00`,
-  where the bucket count is exactly the minimum threshold.
-- High-confidence recurring contexts, such as `615` direction `2` weekday
-  `17:00` and `612` direction `2` weekday `15:00`, where hundreds of buckets
-  show both high median delay and very high late-running shares.
+The context table shows two types of signals. Some contexts are severe but
+lower-volume, such as weekend `901` contexts. Others are operationally stronger
+because both volume and severity are high, especially `615` direction `2`
+weekday `17:00` and `612` direction `2` weekday `15:00`.
 
 Full table: [`context_delay_metrics.csv`](outputs/report-cache/context_delay_metrics.csv).
 
 ## Hourly Delay Profile
 
-The hourly profile aggregates all lines by local hour. Networkwide medians stay
-near zero, but p90 delay and late-running shares rise during the afternoon.
+Networkwide medians stay near zero for most hours, but p90 delay and
+late-running shares rise sharply in the afternoon.
 
 | Hour | Buckets | Median delay | p90 delay | >5 min late | Early |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| 07:00 | 133,523 | 0.00 min | 2.57 min | 2.50% | 47.49% |
-| 08:00 | 132,500 | 0.00 min | 2.90 min | 3.72% | 46.64% |
-| 12:00 | 103,334 | 0.18 min | 3.23 min | 4.59% | 41.18% |
-| 14:00 | 132,401 | 0.26 min | 3.77 min | 6.01% | 40.35% |
-| 15:00 | 141,140 | 0.50 min | 4.58 min | 8.60% | 36.22% |
-| 16:00 | 133,864 | 0.42 min | 4.48 min | 8.10% | 37.61% |
-| 17:00 | 122,101 | -0.02 min | 2.98 min | 4.48% | 50.11% |
-| 18:00 | 104,358 | 0.00 min | 2.73 min | 4.06% | 47.73% |
-| 23:00 | 65,661 | -0.17 min | 1.92 min | 2.24% | 54.63% |
+| 07:00 | 240,355 | 0.00 min | 2.50 min | 2.31% | 48.31% |
+| 08:00 | 239,810 | 0.00 min | 2.90 min | 3.77% | 46.41% |
+| 12:00 | 199,020 | 0.20 min | 3.23 min | 4.59% | 41.16% |
+| 13:00 | 219,043 | 0.27 min | 3.64 min | 5.55% | 39.90% |
+| 14:00 | 245,934 | 0.22 min | 3.67 min | 5.65% | 41.07% |
+| 15:00 | 264,877 | 0.44 min | 4.40 min | 7.99% | 37.26% |
+| 16:00 | 252,061 | 0.37 min | 4.40 min | 7.93% | 38.38% |
+| 17:00 | 229,091 | -0.05 min | 2.83 min | 4.18% | 50.94% |
+| 23:00 | 122,898 | -0.15 min | 1.98 min | 1.94% | 54.23% |
 
 The clearest systemwide late-running peak is `15:00-16:00`. The morning peak is
-visible but smaller in aggregate: `08:00` has a higher p90 than `07:00`, but
-both remain below the afternoon p90 values. Late evening and overnight hours
-have lower late-running rates but higher early-running shares.
+visible but smaller: `08:00` has higher p90 delay than `07:00`, but both remain
+well below the afternoon p90 values. Late evening and overnight periods show
+more early running than late running.
 
 Full table: [`hourly_delay_profile.csv`](outputs/report-cache/hourly_delay_profile.csv).
 
 ## Rush-Time Impact
 
-Rush impact compares weekday rush windows (`07:00-09:00` and `15:00-18:00`) to
-non-rush periods for the same line. The table is sorted by p90 delay lift.
+Rush impact compares weekday rush windows with non-rush periods for the same
+line. The table is sorted by p90 delay lift in the generated report.
 
 | Line | Non-rush buckets | Rush buckets | Median lift | p90 lift | >5 min late lift |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| `612` | 422 | 975 | 7.26 min | 12.27 min | 58.45 pp |
-| `615` | 1,014 | 2,185 | 3.31 min | 9.44 min | 31.59 pp |
-| `72` | 2,146 | 1,138 | 2.76 min | 5.21 min | 27.42 pp |
-| `721` | 1,428 | 774 | 2.41 min | 3.73 min | 30.59 pp |
-| `701` | 1,011 | 2,149 | 1.37 min | 3.59 min | 12.00 pp |
-| `220` | 33,634 | 8,841 | 2.48 min | 3.47 min | 20.89 pp |
-| `77` | 886 | 1,306 | 4.47 min | 3.39 min | -0.29 pp |
-| `903` | 315 | 680 | 0.70 min | 3.31 min | 13.74 pp |
-| `25A` | 12,112 | 3,684 | 2.10 min | 2.28 min | 22.58 pp |
-| `24` | 19,337 | 5,248 | 1.70 min | 2.13 min | 11.56 pp |
+| `612` | 769 | 1,830 | 6.60 min | 10.75 min | 55.71 pp |
+| `75` | 36 | 492 | 7.32 min | 6.97 min | 0.20 pp |
+| `615` | 1,944 | 4,049 | 2.58 min | 6.57 min | 27.62 pp |
+| `802` | 36 | 621 | 3.33 min | 4.14 min | 4.51 pp |
+| `P1` | 1,077 | 525 | 0.35 min | 4.10 min | 11.94 pp |
+| `903` | 628 | 1,132 | 1.20 min | 3.91 min | 12.36 pp |
+| `220` | 63,801 | 17,469 | 2.43 min | 3.75 min | 21.15 pp |
+| `721` | 2,650 | 1,491 | 2.42 min | 3.63 min | 32.15 pp |
+| `72` | 4,073 | 2,207 | 1.67 min | 3.32 min | 16.54 pp |
+| `25` | 20,496 | 4,679 | 1.88 min | 2.57 min | 15.32 pp |
 
-`612` and `615` are the strongest rush-window findings. Their rush-period p90
-delay is much higher than their non-rush p90 delay, and their late-running
-shares increase sharply. `220`, `25A`, and `24` are also important because they
-combine meaningful rush effects with large sample sizes.
+`612` is the strongest rush-window finding. It has both a large p90 lift and a
+large late-share lift. `615` is also substantial and has a larger rush sample.
+`220`, `25`, `25A`, `24`, `28`, `722`, and `722S` matter because they combine
+meaningful rush effects with high bucket volumes.
 
 Full table: [`rush_impact.csv`](outputs/report-cache/rush_impact.csv).
 
 ## Stop-Level Midpoint Changes
 
-The midpoint comparison splits the representative bucket range into:
+The midpoint comparison splits the representative bucket range into two halves
+and compares matched stop contexts. These findings show where observed delay
+changed between the first and second halves of the cached range. They do not
+prove that any particular intervention or incident caused the change.
 
-- Baseline: `2026-04-23T09:45:00Z` to `2026-04-30T21:47:30Z`
-- Comparison: `2026-04-30T21:47:30Z` to `2026-05-08T09:50:00Z`
-
-The comparison uses matched stop contexts. These findings show where observed
-delay changed between the two halves of the available data. They do not prove
-that any particular intervention or incident caused the change.
-
-### Largest Deteriorations
+The generated table is sorted by absolute p90-delay change, so it mixes
+improvements and deteriorations.
 
 | Stop | Baseline buckets | Comparison buckets | Median change | p90 change | >5 min late change |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Betonimiehenkatu | 38 | 34 | -0.12 min | 9.74 min | 11.76 pp |
-| Kallio | 39 | 35 | 5.07 min | 6.83 min | 32.31 pp |
-| Vähätalontie | 36 | 32 | 4.47 min | 6.72 min | 41.32 pp |
-| Laukolan koulu | 43 | 40 | 0.00 min | 6.68 min | 20.00 pp |
-| Vajosuontie | 48 | 44 | 3.60 min | 5.89 min | 32.39 pp |
-| Lavamäen kylätalo | 51 | 45 | 3.38 min | 4.99 min | 30.46 pp |
+| Kaamanen | 50 | 42 | 0.18 min | -7.91 min | -8.86 pp |
+| Koverinlahdentie | 59 | 48 | -0.01 min | -4.33 min | -9.78 pp |
+| Salonkylä | 49 | 35 | -0.26 min | -4.27 min | -9.39 pp |
+| Tapaninkalliontie | 51 | 41 | 6.17 min | 3.68 min | 36.01 pp |
+| Virola | 81 | 65 | 0.65 min | -3.49 min | 3.27 pp |
+| Elinantie | 39 | 32 | 1.15 min | -3.45 min | -8.57 pp |
+| Ruusukortteli | 109 | 87 | -0.92 min | -3.43 min | -15.34 pp |
+| Nummenpakan koulu | 79 | 57 | 0.00 min | -3.43 min | -6.13 pp |
+| Jalkapallostadion | 39 | 31 | -1.05 min | -3.36 min | -16.63 pp |
+| Vajosuontie | 97 | 74 | 5.32 min | 3.30 min | 37.81 pp |
 
-### Largest Improvements In The Reported Table
+The clearest deterioration signals in the displayed table are
+`Tapaninkalliontie` and `Vajosuontie`, where both median delay and the share of
+buckets more than five minutes late increased sharply. Several other stops show
+improvement in p90 delay. Treat this section as a drill-down list rather than a
+causal conclusion.
 
-| Stop | Baseline buckets | Comparison buckets | Median change | p90 change | >5 min late change |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Uusikartano | 34 | 32 | -0.34 min | -4.72 min | -14.34 pp |
-| Tammilehto | 40 | 36 | -1.23 min | -4.18 min | -26.94 pp |
-| Montolantie | 50 | 45 | -0.04 min | -3.97 min | -21.33 pp |
-| Salonkyläntie | 45 | 41 | -0.60 min | -3.87 min | -23.79 pp |
-| Monnoistentie | 68 | 63 | -0.02 min | -3.86 min | -8.36 pp |
-| Järvenpääntie | 68 | 64 | -0.29 min | -3.78 min | -9.83 pp |
-
-The strongest deterioration signals are mostly low-to-moderate volume stop
-contexts. They are good candidates for drill-down, but should be validated
-against route, timetable, construction, and event context before drawing an
-operational conclusion.
-
-Full table: [`stop_midpoint_change.csv`](outputs/report-cache/stop_midpoint_change.csv).
+Full table:
+[`stop_midpoint_change.csv`](outputs/report-cache/stop_midpoint_change.csv).
 
 ## Service Alert Matched-Control Findings
 
@@ -300,37 +283,38 @@ associations, not causal effects.
 
 | Cause | Effect | Scope | Priority | Alert buckets | Median lift | p90 lift | >5 min late lift |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| `OTHER_CAUSE` | `DETOUR` | route | 900 | 601,681 | 0.18 min | 0.78 min | 2.65 pp |
-| `OTHER_CAUSE` | `UNKNOWN_EFFECT` | route | 900 | 891 | 0.25 min | 0.48 min | 2.10 pp |
-| `OTHER_CAUSE` | `DETOUR` | route | 1000 | 415,259 | 0.08 min | 0.46 min | 1.64 pp |
-| `OTHER_CAUSE` | `OTHER_EFFECT` | route | 1000 | 145,510 | 0.07 min | 0.37 min | 1.52 pp |
-| `OTHER_CAUSE` | `Unknown` | route | 1200 | 454,964 | 0.04 min | 0.24 min | 0.89 pp |
-| `OTHER_CAUSE` | `DETOUR` | stop | 1000 | 428,653 | 0.03 min | 0.20 min | 0.48 pp |
-| `ACCIDENT` | `Unknown` | stop | 1200 | 91,613 | 0.12 min | 0.09 min | -0.07 pp |
-| `TECHNICAL_PROBLEM` | `Unknown` | route | 1200 | 521,441 | -0.01 min | 0.00 min | 0.22 pp |
+| `OTHER_CAUSE` | `DETOUR` | route | 900 | 846,743 | 0.17 min | 0.90 min | 2.80 pp |
+| `OTHER_CAUSE` | `UNKNOWN_EFFECT` | route | 900 | 891 | 0.34 min | 0.85 min | 3.92 pp |
+| `OTHER_CAUSE` | `DETOUR` | route | 1000 | 415,259 | 0.09 min | 0.48 min | 1.63 pp |
+| `OTHER_CAUSE` | `OTHER_EFFECT` | route | 1000 | 145,510 | 0.10 min | 0.40 min | 1.60 pp |
+| `OTHER_CAUSE` | `DETOUR` | stop | 1000 | 428,653 | 0.07 min | 0.27 min | 0.71 pp |
+| `ACCIDENT` | `Unknown` | stop | 1200 | 196,969 | 0.08 min | 0.08 min | -0.26 pp |
+| `OTHER_CAUSE` | `Unknown` | route | 1200 | 1,265,592 | 0.03 min | 0.08 min | 0.13 pp |
+| `TECHNICAL_PROBLEM` | `Unknown` | stop | 1200 | 1,047,788 | 0.00 min | -0.10 min | -0.31 pp |
 
 At the grouped level, route detours have the clearest positive lift, but the
-lift is still modest compared with the worst line-level and context-specific
-delay findings. Some alert groups have near-zero or negative p90 lift, which
-suggests that alert presence alone is not enough to explain delay severity.
+lift remains modest compared with the worst line-level and context-specific
+delay findings. Alert presence alone does not explain most severe delay
+patterns in the dataset.
 
 ### Largest Line-Level Alert Lifts
 
 | Cause | Effect | Scope | Line | Alert buckets | Median lift | p90 lift | >5 min late lift |
 | --- | --- | --- | --- | ---: | ---: | ---: | ---: |
-| `ACCIDENT` | `Unknown` | stop | `28A` | 50 | 0.18 min | 11.07 min | 20.00 pp |
-| `TECHNICAL_PROBLEM` | `Unknown` | stop | `722` | 39 | -4.67 min | 6.05 min | 15.69 pp |
-| `OTHER_CAUSE` | `DETOUR` | stop | `42A` | 600 | 1.13 min | 5.32 min | 21.02 pp |
-| `OTHER_CAUSE` | `DETOUR` | stop | `N11` | 268 | -0.37 min | 5.30 min | 15.09 pp |
-| `TECHNICAL_PROBLEM` | `Unknown` | stop | `21` | 11,675 | 3.63 min | 4.57 min | 28.37 pp |
-| `ACCIDENT` | `Unknown` | stop | `220` | 312 | 1.74 min | 4.09 min | 18.35 pp |
-| `OTHER_CAUSE` | `DETOUR` | stop | `25A` | 2,934 | 0.70 min | 3.78 min | 10.53 pp |
-| `TECHNICAL_PROBLEM` | `Unknown` | stop | `82` | 467 | 1.52 min | 3.55 min | 18.08 pp |
+| `ACCIDENT` | `Unknown` | stop | `28A` | 217 | -0.57 min | 10.68 min | 17.96 pp |
+| `OTHER_CAUSE` | `DETOUR` | route | `704` | 108 | 7.00 min | 7.96 min | 78.13 pp |
+| `OTHER_CAUSE` | `SIGNIFICANT_DELAYS` | stop | `K1` | 320 | 1.10 min | 7.79 min | 17.50 pp |
+| `OTHER_CAUSE` | `DETOUR` | route | `706` | 125 | 7.22 min | 7.48 min | 62.27 pp |
+| `OTHER_CAUSE` | `DETOUR` | stop | `N11` | 268 | -0.37 min | 6.36 min | 16.83 pp |
+| `TECHNICAL_PROBLEM` | `Unknown` | stop | `21` | 25,186 | 3.45 min | 5.23 min | 28.57 pp |
+| `OTHER_CAUSE` | `DETOUR` | route | `703` | 108 | 10.26 min | 4.80 min | 77.32 pp |
+| `TECHNICAL_PROBLEM` | `Unknown` | stop | `701` | 85 | 0.87 min | 4.69 min | 12.90 pp |
 
-The largest line-level p90 lifts often have small alert bucket counts. The most
-operationally credible high-volume signal in this table is line `21` during
-stop-scoped technical-problem alerts: `11,675` alert buckets, `3.63` minutes of
-median lift, and `4.57` minutes of p90 lift.
+The largest line-level alert lifts often have small alert bucket counts. The
+most operationally credible high-volume signal in the displayed table is line
+`21` during stop-scoped technical-problem alerts: `25,186` alert buckets,
+`3.45` minutes of median lift, `5.23` minutes of p90 lift, and a `28.57`
+percentage-point late-share lift.
 
 Full tables:
 [`service_alert_grouped.csv`](outputs/report-cache/service_alert_grouped.csv),
@@ -338,36 +322,75 @@ Full tables:
 
 ## Collector Coverage Findings
 
-The cache manifest contains `46,869` collector poll records, but the generated
-collector result tables currently report no matching rows:
+The latest cache manifest contains `86,116` collector poll records. The current
+collector outputs identify meaningful missing-data periods, so collection
+coverage is a real caveat for affected date ranges.
 
-- Collector blackouts: no matching rows.
-- Collector missing-data summary: no matching rows.
-- Collector missing-data spots: no matching rows.
+| Source | Polls | Failures | Missing spots | Total missing | Largest missing | Estimated missed rows |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `siri_vm` | 78,203 | 191 | 71 | 4,156.67 min | 2,186.83 min | 1,122,360.85 |
+| `siri_alerts` | 7,908 | 15 | 5 | 3,873.67 min | 2,178.08 min | 9,711.16 |
+| `gtfs` | 5 | 0 | 0 | 0.00 min | 0.00 min | 0.00 |
 
-This means no blackouts or missing-data spots matched the current report
-definitions. It should not be read as proof that collection was perfect; it
-only describes the configured report outputs.
+The two largest visible gaps are:
+
+| Source | Gap start | Gap end | Missing time | Estimated missed rows |
+| --- | --- | --- | ---: | ---: |
+| `siri_vm` | `2026-05-13T00:00:17Z` | `2026-05-14T12:27:37Z` | 2,186.83 min | 590,477.01 |
+| `siri_alerts` | `2026-05-13T00:05:03Z` | `2026-05-14T12:28:08Z` | 2,178.08 min | 5,460.39 |
+| `siri_vm` | `2026-05-09T10:02:27Z` | `2026-05-10T13:26:44Z` | 1,643.78 min | 443,845.56 |
+| `siri_alerts` | `2026-05-09T10:01:41Z` | `2026-05-10T13:26:50Z` | 1,640.15 min | 4,111.81 |
+
+These gaps mean the report should not be interpreted as complete continuous
+coverage. They do not invalidate the full analysis, but they matter for
+date-specific or incident-specific interpretation during gap periods.
 
 Full tables:
 [`collector_blackouts.csv`](outputs/report-cache/collector_blackouts.csv),
 [`collector_missing_summary.csv`](outputs/report-cache/collector_missing_summary.csv),
 [`collector_missing_spots.csv`](outputs/report-cache/collector_missing_spots.csv).
 
+## Pandas/DuckDB vs Polars Source Comparison
+
+The separate comparison report at
+[`reports/generated/pandas-polars-comparison.md`](reports/generated/pandas-polars-comparison.md)
+shows that both report paths use the same SQLite database, observation range,
+analysis row count, raw observation count, bucket count, quality mode, bucket
+mode, timezone, and minimum observation settings.
+
+For real-world interpretation, the important point is that the primary
+operational findings mostly agree: data quality totals, line late rankings,
+line early rankings, rush impact, and many context metrics point to the same
+routes and time windows. That makes the Polars output useful as a corroborating
+source for broad conclusions.
+
+Polars was faster in the existing generated runs, but only by `2.22` seconds
+overall, about `1.0%`. Most runtime is cache/build work, so speed is not a
+decisive difference for this current report workflow.
+
+For this narrative report, pandas/DuckDB is the better source data path. It is
+the established primary generated report, has fuller current report output for
+the narrative sections, and is the safer source when alert, hourly, and
+collector interpretation matters. Polars should be treated as useful
+corroboration until the remaining output differences are resolved.
+
 ## Overall Interpretation
 
-The most actionable reliability findings are concentrated in three areas:
+The most actionable reliability findings are concentrated in four areas:
 
-1. Late-running priority lines: `612`, `615`, `614`, `720`, `25`, `24`, and
-   `25A`.
-2. Early-running priority lines: `P6`, `N10`, `711`, `L4`, `L6`, `L1`, `L5`,
-   and `L2`.
+1. Late-running priority lines: `612`, `615`, `614`, `42A`, `V1`, `25`, `25A`,
+   `24`, `720`, and high-volume line `21`.
+2. Early-running priority lines: `P6`, `N10`, `75`, `L4`, `N7`, `L6`, `L1`,
+   `711`, `L5`, and `L2`.
 3. Time-and-context hotspots: afternoon rush contexts, especially `612`
-   direction `2` at weekday `15:00` and `615` direction `2` at weekday `17:00`.
+   direction `2` weekday `15:00` and `615` direction `2` weekday `17:00`.
+4. Collector gaps: multi-hour to multi-day gaps in `siri_vm` and `siri_alerts`
+   collection that can affect date-specific conclusions.
 
 The top-level network median is usually close to zero, so averages alone would
 hide the most important patterns. The operational issues appear in high-end
-delay, early-running shares, and specific line-direction-hour contexts.
+delay, early-running shares, line-direction-hour contexts, and collection
+coverage.
 
 Data quality is good enough for broad screening, but not perfect. Lines with
 high conservative exclusion rates should be validated before making line-level
@@ -379,6 +402,10 @@ be sensitive to sample size.
 
 - Generated markdown table report:
   [`reports/generated/overall-results.md`](reports/generated/overall-results.md)
+- Polars generated report:
+  [`reports/generated/overall-results-polars.md`](reports/generated/overall-results-polars.md)
+- Pandas/DuckDB vs Polars comparison:
+  [`reports/generated/pandas-polars-comparison.md`](reports/generated/pandas-polars-comparison.md)
 - Cache manifest:
   [`outputs/report-cache/manifest.json`](outputs/report-cache/manifest.json)
 - Cached result tables:
@@ -398,15 +425,18 @@ be sensitive to sample size.
 
 ## Caveats
 
-- SIRI VM delay is estimated vehicle-monitoring state, not measured arrival
+- SIRI VM delay is estimated vehicle-monitoring state, not measured stop arrival
   truth.
-- The report uses trip-stop buckets by default. Results would differ if raw
-  polls were treated as independent observations.
-- Conservative quality filtering excludes implausible, stale, pre-trip, and
-  post-trip rows. Stop-call disagreement is flagged but not excluded in the
-  default cache.
-- The cached data ends at `2026-05-08T09:36:13Z`; later data is not included.
+- Raw vehicle-monitoring rows are repeated polls; default results use trip-stop
+  buckets so a visible vehicle is not overweighted just because it was polled
+  repeatedly.
+- Conservative filtering excludes implausible, stale, pre-trip, and post-trip
+  rows. Stop-call disagreement is flagged but not excluded in the default cache.
+- The latest generated source data ends at `2026-05-23T13:24:20Z`; later data is
+  not included in this report.
 - Service-alert and stop-midpoint findings are matched observational
   comparisons. They should not be interpreted as causal proof.
 - Some high-ranked findings have low sample sizes near the `30` bucket minimum.
   These should be validated before prioritizing operational action.
+- Collector blackout and missing-data outputs show meaningful gaps. Use caution
+  when interpreting date-specific patterns during those periods.
