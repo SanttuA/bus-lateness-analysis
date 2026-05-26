@@ -95,6 +95,12 @@ visualizes robust delay by line, local hour, and next-stop location.
 Observations before the first local GTFS snapshot keep SIRI stop names but have
 no GTFS coordinates.
 
+### Dashboard Preview
+
+![Dashboard overview with filters, summary metrics, and line-by-hour delay heatmap.](docs/images/dashboard-overview.png)
+
+![Stop-level delay marker map in the dashboard.](docs/images/dashboard-stop-map.png)
+
 ## Data Caveats
 
 - SIRI VM delay is estimated vehicle-monitoring state, not measured arrival
