@@ -1,0 +1,24 @@
+{
+  "name": "bus-lateness-analysis-workspace",
+  "private": true,
+  "packageManager": "pnpm@11.15.1",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "dev": "corepack pnpm --dir site dev",
+    "build": "corepack pnpm --dir site build",
+    "preview": "corepack pnpm --dir site preview",
+    "format": "corepack pnpm --dir site format",
+    "format:check": "corepack pnpm --dir site format:check",
+    "lint": "corepack pnpm --dir site lint",
+    "typecheck": "corepack pnpm --dir site typecheck",
+    "test": "corepack pnpm --dir site test",
+    "test:coverage": "corepack pnpm --dir site test:coverage",
+    "e2e": "corepack pnpm --dir site e2e",
+    "test:a11y": "corepack pnpm --dir site test:a11y",
+    "test:python": "uv run python -m unittest discover -v",
+    "data:public": "uv run python analysis/build-public-site-data.py",
+    "check": "corepack pnpm format:check && corepack pnpm lint && corepack pnpm typecheck && corepack pnpm test && corepack pnpm build"
+  }
+}

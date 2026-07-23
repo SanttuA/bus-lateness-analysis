@@ -45,3 +45,10 @@ Thumbs.db
 .idea/
 .codex
 .codex/
+
+# React site
+node_modules/
+site/dist/
+site/coverage/
+site/playwright-report/
+site/test-results/
