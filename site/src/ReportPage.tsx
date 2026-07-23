@@ -1,7 +1,13 @@
 import { lazy, Suspense, useEffect, useState } from 'react';
 
 import { loadContext, loadLines, loadOverview } from './data';
-import { formatDate, formatDuration, formatNumber, formatPercent } from './format';
+import {
+  formatAlertPriority,
+  formatDate,
+  formatDuration,
+  formatNumber,
+  formatPercent,
+} from './format';
 import { dataLabel, t } from './i18n';
 import type { ContextPayload, Language, LinesPayload, OverviewPayload, SearchState } from './types';
 import { HourlyChart } from './components/HourlyChart';
@@ -191,7 +197,7 @@ export function ReportPage({ language, search, onSearchChange }: ReportPageProps
                           {dataLabel(language, 'alertCause', row.cause)}
                         </span>
                         <span className="alert-detail">
-                          {`${dataLabel(language, 'alertEffect', row.effect)} · ${copy.alertPriority} ${row.priority}`}
+                          {`${dataLabel(language, 'alertEffect', row.effect)} · ${copy.alertPriority}: ${formatAlertPriority(row.priority, copy.alertPriorityUnknown)}`}
                         </span>
                       </th>
                       <td>{dataLabel(language, 'alertScope', row.alert_scope)}</td>

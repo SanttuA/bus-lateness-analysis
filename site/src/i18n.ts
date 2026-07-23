@@ -62,8 +62,9 @@ const copy = {
       'Häiriövertailu käyttää saman linjan, suunnan, tunnin ja päivätyypin kontrollihavaintoja. Jokainen rivi on häiriön syyn, vaikutuksen, tiedoteprioriteetin ja kohteen erillinen yhdistelmä. Ryhmätason vaikutukset jäävät pienemmiksi kuin pahimmat linja- ja ruuhkahavainnot.',
     alert: 'Häiriö',
     alertPriority: 'Tiedoteprioriteetti',
+    alertPriorityUnknown: 'tuntematon',
     alertPriorityDescription:
-      'Fölin tiedoterajapinnassa pienempi prioriteettiluku tarkoittaa tärkeämpää viestiä. Föli suosittelee käsittelemään arvon 100 tai alle tärkeänä etusivun nostona. Luku järjestää tiedotteita, eikä mittaa viiveen suuruutta.',
+      'Fölin antamissa prioriteettiluvuissa pienempi luku tarkoittaa tärkeämpää viestiä. Föli suosittelee käsittelemään arvon 100 tai alle tärkeänä etusivun nostona. Luku järjestää tiedotteita, eikä mittaa viiveen suuruutta. Jos prioriteetti puuttuu lähdedatasta, se näytetään tuntemattomana.',
     scope: 'Kohde',
     alertBuckets: 'Häiriöluokkia',
     p90Lift: 'p90-lisä',
@@ -175,8 +176,9 @@ const copy = {
       'The disruption comparison uses controls from the same line, direction, hour, and day type. Each row is a distinct combination of disruption cause, effect, message priority, and scope. Group-level effects remain smaller than the worst line and rush-period signals.',
     alert: 'Disruption',
     alertPriority: 'Message priority',
+    alertPriorityUnknown: 'unknown',
     alertPriorityDescription:
-      'In Föli’s alerts feed, a smaller priority number means a more important message. Föli recommends treating a value of 100 or below as an important front-page item. The number orders messages; it does not measure delay severity.',
+      'For priority values supplied by Föli, a smaller number means a more important message. Föli recommends treating a value of 100 or below as an important front-page item. The number orders messages; it does not measure delay severity. A priority missing from the source data is shown as unknown.',
     scope: 'Scope',
     alertBuckets: 'Alert buckets',
     p90Lift: 'p90 lift',

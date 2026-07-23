@@ -7,7 +7,9 @@ describe('reader-facing labels', () => {
     expect(t('fi').stopSearch).toBe('Pysäkin nimi tai tunnus');
     expect(t('en').stopSearch).toBe('Stop name or ID');
     expect(t('fi').alertPriority).toBe('Tiedoteprioriteetti');
-    expect(t('en').alertPriorityDescription).toContain('smaller priority number');
+    expect(t('fi').alertPriorityUnknown).toBe('tuntematon');
+    expect(t('en').alertPriorityDescription).toContain('supplied by Föli');
+    expect(t('en').alertPriorityDescription).toContain('shown as unknown');
   });
 
   it('translates public data codes instead of exposing raw identifiers', () => {
