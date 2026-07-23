@@ -29,6 +29,22 @@ test('Finnish report presents the answer before the evidence', async ({ page }) 
   await expect(page.getByRole('heading', { name: /Kolme linjaa erottuu/ })).toBeVisible();
 });
 
+test('first p90 mention links to a focused plain-language explanation', async ({ page }) => {
+  await page.goto('./#/en?view=table');
+  const originalUrl = page.url();
+  const link = page.getByRole('link', {
+    name: 'p90 delay — jump to a plain-language explanation',
+  });
+
+  await expect(link).toHaveText('p90 delay');
+  await link.click();
+
+  const explanation = page.getByRole('heading', { name: 'What does p90 mean?' });
+  await expect(explanation).toBeFocused();
+  await expect(page.getByText(/about 90 of every 100 trip–stop buckets/)).toBeVisible();
+  await expect(page).toHaveURL(originalUrl);
+});
+
 test('English hash route survives reload and updates document language', async ({ page }) => {
   await page.goto('./#/en?view=table');
   await expect(

@@ -34,6 +34,13 @@ const copy = {
     buckets: 'Luokkia',
     median: 'Mediaani',
     p90: 'p90-viive',
+    p90ExplanationLink: 'p90-viive – siirry selkokieliseen selitykseen',
+    p90ExplanationTitle: 'Mitä p90 tarkoittaa?',
+    p90Explanation:
+      'p90 eli 90. prosenttipiste kuvaa tulosten suuren viiveen päätä. Se on raja-arvo, ei jokaisen bussin viive eikä keskiarvo.',
+    p90Example:
+      'Jos p90-viive on 8 minuuttia, noin 90 sadasta matka–pysäkki-luokasta on enintään 8 minuuttia myöhässä ja noin 10 on tätä enemmän myöhässä. Yksinkertainen mielikuva: järjestä 10 havaintoa pienimmästä suurimpaan viiveeseen — p90 on lähellä toiseksi suurinta arvoa.',
+    example: 'Esimerkki:',
     earlyP90: 'Varhaisuuden p90',
     overFive: '>5 min myöhässä',
     overThreeEarly: '>3 min etuajassa',
@@ -148,6 +155,13 @@ const copy = {
     buckets: 'Buckets',
     median: 'Median',
     p90: 'p90 delay',
+    p90ExplanationLink: 'p90 delay — jump to a plain-language explanation',
+    p90ExplanationTitle: 'What does p90 mean?',
+    p90Explanation:
+      'P90, or the 90th percentile, describes the high-delay end of the results. It is a threshold, not every bus’s delay or an average.',
+    p90Example:
+      'If p90 delay is 8 minutes, about 90 of every 100 trip–stop buckets are no more than 8 minutes late, while about 10 are later. For a simple mental picture, sort 10 observations from shortest to longest delay — p90 is around the second-worst result.',
+    example: 'Example:',
     earlyP90: 'Early p90',
     overFive: '>5 min late',
     overThreeEarly: '>3 min early',
