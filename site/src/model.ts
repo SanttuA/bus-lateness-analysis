@@ -7,6 +7,14 @@ import type {
   StopsPayload,
 } from './types';
 
+export function selectExplorableLines(data: LinesPayload): string[] {
+  const linesWithProfiles = new Set(data.contexts.map((row) => row.line_ref));
+  return data.lines
+    .filter((row) => linesWithProfiles.has(row.line_ref))
+    .sort((a, b) => a.line_name.localeCompare(b.line_name, undefined, { numeric: true }))
+    .map((row) => row.line_ref);
+}
+
 export function selectLineContexts(
   data: LinesPayload,
   line: string,

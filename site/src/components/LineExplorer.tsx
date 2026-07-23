@@ -3,7 +3,7 @@ import { useCallback, useMemo } from 'react';
 
 import { formatMinutes, formatNumber, formatPercent } from '../format';
 import { t } from '../i18n';
-import { selectDefaultLine, selectLineContexts } from '../model';
+import { selectDefaultLine, selectExplorableLines, selectLineContexts } from '../model';
 import { normalizeHourRange } from '../search';
 import type { Language, LinesPayload, SearchState } from '../types';
 import { PlotFigure } from './PlotFigure';
@@ -17,13 +17,7 @@ interface LineExplorerProps {
 
 export function LineExplorer({ language, data, search, onSearchChange }: LineExplorerProps) {
   const copy = t(language);
-  const lineRefs = useMemo(
-    () =>
-      [...data.lines]
-        .sort((a, b) => a.line_name.localeCompare(b.line_name, undefined, { numeric: true }))
-        .map((row) => row.line_ref),
-    [data.lines],
-  );
+  const lineRefs = useMemo(() => selectExplorableLines(data), [data]);
   const direction = search.direction ?? '1';
   const day = search.day ?? 'weekday';
   const defaultLine = useMemo(

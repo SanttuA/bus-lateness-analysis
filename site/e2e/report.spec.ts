@@ -194,3 +194,22 @@ test('explorers use readable labels and a useful default profile', async ({ page
     await expect(page.getByText('Taulukkoa voi vierittää sivusuunnassa.')).toBeVisible();
   }
 });
+
+test('line explorer only advertises lines with hourly profiles', async ({ page }) => {
+  await page.goto('./#/?view=table');
+
+  const lineSelector = page.locator('#lines select').first();
+  await expect(lineSelector).toBeVisible();
+  const advertisedLines = await lineSelector
+    .locator('option')
+    .evaluateAll((options) => options.map((option) => (option as HTMLOptionElement).value));
+  const contextLines = await page.evaluate(async () => {
+    const response = await fetch(new URL('data/lines.json', document.baseURI));
+    if (!response.ok) throw new Error(`Unable to load lines.json (${response.status})`);
+    const payload = (await response.json()) as { contexts: Array<{ line_ref: string }> };
+    return [...new Set(payload.contexts.map((row) => row.line_ref))];
+  });
+
+  expect(advertisedLines.length).toBeGreaterThan(0);
+  expect(advertisedLines.filter((line) => !contextLines.includes(line))).toEqual([]);
+});

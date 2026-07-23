@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest';
 
-import { selectDefaultLine, selectLineContexts, selectStopPoints } from '../model';
+import {
+  selectDefaultLine,
+  selectExplorableLines,
+  selectLineContexts,
+  selectStopPoints,
+} from '../model';
 import type { LinesPayload, StopsPayload } from '../types';
 
 const metric = {
@@ -20,6 +25,23 @@ const metric = {
 };
 
 describe('explorer filtering', () => {
+  it('excludes line options without an hourly profile', () => {
+    const line = (line_ref: string) => ({ ...metric, line_ref, line_name: line_ref });
+    const context = (line_ref: string) => ({
+      ...line(line_ref),
+      direction_ref: '1' as const,
+      day_type: 'weekday' as const,
+      local_hour: 8,
+    });
+    const data = {
+      schema_version: 1,
+      lines: [line('N14'), line('10'), line('2')],
+      contexts: [context('10'), context('2')],
+    } as LinesPayload;
+
+    expect(selectExplorableLines(data)).toEqual(['2', '10']);
+  });
+
   it('selects line contexts and orders hours', () => {
     const data = {
       schema_version: 1,
