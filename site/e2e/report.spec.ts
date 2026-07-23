@@ -126,6 +126,9 @@ test('stop explorer exposes an exact table alternative', async ({ page }) => {
   await stops.getByLabel('Stop name or ID').fill('Kauppatori');
   await expect(stops.getByRole('table')).toBeVisible();
   await expect(stops.getByText('Kauppatori', { exact: false }).first()).toBeVisible();
+  const tableRegion = stops.getByRole('region', { name: /Exact values.*top 50 values/ });
+  await tableRegion.focus();
+  await expect(tableRegion).toBeFocused();
 });
 
 test('stop explorer switches between the table and keyboard-safe map', async ({ page }) => {

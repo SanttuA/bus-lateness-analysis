@@ -10,6 +10,7 @@ for (const route of [
   test(`@a11y has no serious accessibility violations on ${route}`, async ({ page }) => {
     await page.goto(`./${route}`);
     await expect(page.locator('h1')).toBeVisible();
+    await expect(page.locator('#stops .result-count')).toBeVisible();
     const results = await new AxeBuilder({ page })
       .withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa'])
       .analyze();

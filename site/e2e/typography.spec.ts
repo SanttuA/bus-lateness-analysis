@@ -84,7 +84,6 @@ test('mobile chapter heading forms a compact lockup', async ({ page }, testInfo)
     const titleBounds = title.getBoundingClientRect();
     const introBounds = intro.getBoundingClientRect();
     const titleStyle = getComputedStyle(title);
-    const lineHeight = Number.parseFloat(titleStyle.lineHeight);
 
     return {
       sectionPaddingTop: Number.parseFloat(getComputedStyle(section).paddingTop),
@@ -93,7 +92,7 @@ test('mobile chapter heading forms a compact lockup', async ({ page }, testInfo)
       textIndent: Number.parseFloat(titleStyle.textIndent),
       markerWidth: markerBounds.width,
       titleFontSize: Number.parseFloat(titleStyle.fontSize),
-      titleLines: Math.round(titleBounds.height / lineHeight),
+      titleHeight: titleBounds.height,
       titleIntroGap: introBounds.top - titleBounds.bottom,
     };
   });
@@ -104,7 +103,7 @@ test('mobile chapter heading forms a compact lockup', async ({ page }, testInfo)
   expect(composition.textIndent).toBeGreaterThanOrEqual(composition.markerWidth + 12);
   expect(composition.titleFontSize).toBeGreaterThanOrEqual(33);
   expect(composition.titleFontSize).toBeLessThanOrEqual(41);
-  expect(composition.titleLines).toBeLessThanOrEqual(5);
+  expect(composition.titleHeight).toBeLessThanOrEqual(230);
   expect(composition.titleIntroGap).toBeGreaterThanOrEqual(12);
   expect(composition.titleIntroGap).toBeLessThanOrEqual(20);
 });

@@ -6,6 +6,8 @@ import { t } from '../i18n';
 import { selectStopPoints } from '../model';
 import type { DayFilter, DelayDirection, Language, SearchState, StopsPayload } from '../types';
 
+/* oxlint-disable jsx-a11y/no-noninteractive-tabindex -- The stop table's scrollable region must be keyboard-focusable for WCAG 2.1.1. */
+
 const StopMap = lazy(() => import('./StopMap'));
 
 interface StopExplorerProps {
@@ -138,7 +140,11 @@ export default function StopExplorer({ language, search, onSearchChange }: StopE
         </Suspense>
       ) : null}
       {view === 'table' && points.length ? (
-        <div className="table-scroll stop-table">
+        <section
+          className="table-scroll stop-table"
+          aria-label={`${copy.tableCaption} · ${language === 'fi' ? '50 korkeinta arvoa' : 'top 50 values'}`}
+          tabIndex={0}
+        >
           <table>
             <caption>
               {copy.tableCaption} · {language === 'fi' ? '50 korkeinta arvoa' : 'top 50 values'}
@@ -164,7 +170,7 @@ export default function StopExplorer({ language, search, onSearchChange }: StopE
               ))}
             </tbody>
           </table>
-        </div>
+        </section>
       ) : null}
     </div>
   );
