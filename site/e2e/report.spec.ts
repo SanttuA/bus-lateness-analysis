@@ -190,12 +190,44 @@ test('explorers use readable labels and a useful default profile', async ({ page
   );
   expect(styles.every(({ transform, weight }) => transform === 'none' && weight <= 700)).toBe(true);
 
-  await expect(page.getByRole('rowheader', { name: 'Muu syy', exact: true }).first()).toBeVisible();
+  const detourPriority1000 = page.getByRole('rowheader', {
+    name: 'Muu syy Poikkeusreitti · Tiedoteprioriteetti: 1000',
+    exact: true,
+  });
+  await expect(detourPriority1000).toHaveCount(2);
+  await expect(detourPriority1000.first()).toBeVisible();
+  await expect(
+    page.getByRole('rowheader', {
+      name: 'Muu syy Poikkeusreitti · Tiedoteprioriteetti: 900',
+      exact: true,
+    }),
+  ).toBeVisible();
+  await expect(page.getByText('Tuntematon vaikutus', { exact: false }).first()).toBeVisible();
+  await expect(
+    page.getByText(/Fölin antamissa prioriteettiluvuissa pienempi luku tarkoittaa tärkeämpää/),
+  ).toBeVisible();
+  await expect(page.getByText(/Jos prioriteetti puuttuu lähdedatasta/)).toBeVisible();
   await expect(page.getByText('other cause', { exact: true })).toHaveCount(0);
   if (testInfo.project.name.startsWith('mobile')) {
     await expect(page.getByRole('navigation', { name: 'Päävalikko' })).toBeVisible();
     await expect(page.getByText('Taulukkoa voi vierittää sivusuunnassa.')).toBeVisible();
   }
+});
+
+test('missing alert priorities are presented as unknown', async ({ page }) => {
+  await page.route(/\/data\/context\.json$/, async (route) => {
+    const response = await route.fetch();
+    const payload = (await response.json()) as { alerts: Array<{ priority: number }> };
+    payload.alerts[0].priority = -1;
+    await route.fulfill({ response, json: payload });
+  });
+  await page.goto('./#/en?view=table');
+
+  const alerts = page.locator('#alerts');
+  await expect(
+    alerts.getByText('Detour · Message priority: unknown', { exact: true }),
+  ).toBeVisible();
+  await expect(alerts.getByText('Message priority: -1', { exact: false })).toHaveCount(0);
 });
 
 test('line explorer only advertises lines with hourly profiles', async ({ page }) => {

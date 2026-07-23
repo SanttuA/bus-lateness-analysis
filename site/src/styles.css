@@ -698,6 +698,29 @@ input[type='range'] {
   box-shadow: var(--shadow);
 }
 
+.alert-label {
+  min-width: 260px;
+  white-space: normal;
+}
+
+.alert-priority-note {
+  max-width: 850px;
+  margin: -18px 0 32px 116px;
+}
+
+.alert-cause,
+.alert-detail {
+  display: block;
+}
+
+.alert-detail {
+  margin-top: 2px;
+  color: var(--ink-soft);
+  font-size: 1rem;
+  font-weight: 550;
+  line-height: 1.4;
+}
+
 .stop-filters {
   grid-template-columns:
     minmax(132px, 0.75fr) minmax(150px, 0.9fr) minmax(190px, 1.1fr) minmax(220px, 1.45fr)
@@ -1102,6 +1125,12 @@ input[type='range'] {
   }
   .evidence-table {
     padding: 22px 14px;
+  }
+  .alert-label {
+    min-width: 220px;
+  }
+  .alert-priority-note {
+    margin: 0 0 24px;
   }
   .stop-map {
     min-height: 430px;

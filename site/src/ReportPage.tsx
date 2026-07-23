@@ -1,7 +1,13 @@
 import { lazy, Suspense, useEffect, useState } from 'react';
 
 import { loadContext, loadLines, loadOverview } from './data';
-import { formatDate, formatDuration, formatNumber, formatPercent } from './format';
+import {
+  formatAlertPriority,
+  formatDate,
+  formatDuration,
+  formatNumber,
+  formatPercent,
+} from './format';
 import { dataLabel, t } from './i18n';
 import type { ContextPayload, Language, LinesPayload, OverviewPayload, SearchState } from './types';
 import { HourlyChart } from './components/HourlyChart';
@@ -160,13 +166,17 @@ export function ReportPage({ language, search, onSearchChange }: ReportPageProps
           <RushChart language={language} rows={context.rush_impact} />
         </Section>
 
-        <Section number="05" title={copy.alertsTitle} intro={copy.alertsIntro}>
+        <Section id="alerts" number="05" title={copy.alertsTitle} intro={copy.alertsIntro}>
+          <p id="alert-priority-note" className="definition-note alert-priority-note">
+            <span aria-hidden="true">i</span>
+            {copy.alertPriorityDescription}
+          </p>
           <div className="table-scroll evidence-table">
             <InPageLink className="skip-link" targetId="alert-table-end" focusTarget>
               {language === 'fi' ? 'Ohita häiriötaulukko' : 'Skip disruption table'}
             </InPageLink>
             <p className="table-scroll-hint">{copy.tableScrollHint}</p>
-            <table>
+            <table aria-describedby="alert-priority-note">
               <caption>{copy.tableCaption}</caption>
               <thead>
                 <tr>
@@ -182,7 +192,14 @@ export function ReportPage({ language, search, onSearchChange }: ReportPageProps
                   .slice(0, 8)
                   .map((row) => (
                     <tr key={`${row.cause}-${row.effect}-${row.alert_scope}-${row.priority}`}>
-                      <th scope="row">{dataLabel(language, 'alertCause', row.cause)}</th>
+                      <th scope="row" className="alert-label">
+                        <span className="alert-cause">
+                          {dataLabel(language, 'alertCause', row.cause)}
+                        </span>
+                        <span className="alert-detail">
+                          {`${dataLabel(language, 'alertEffect', row.effect)} · ${copy.alertPriority}: ${formatAlertPriority(row.priority, copy.alertPriorityUnknown)}`}
+                        </span>
+                      </th>
                       <td>{dataLabel(language, 'alertScope', row.alert_scope)}</td>
                       <td>{formatNumber(row.bucket_count_alert, language)}</td>
                       <td>

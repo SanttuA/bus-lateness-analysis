@@ -26,3 +26,7 @@ export function formatDuration(minutes: number, language: Language) {
   if (minutes < 120) return `${formatNumber(minutes, language, 0)} min`;
   return `${formatNumber(minutes / 60, language, 1)} h`;
 }
+
+export function formatAlertPriority(value: number, unknownLabel: string) {
+  return value < 0 ? unknownLabel : String(value);
+}
