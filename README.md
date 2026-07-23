@@ -3,6 +3,18 @@
 Small Python project for exploring bus lateness in Turku region public
 transport using data from the Föli API.
 
+## Public Report
+
+The reader-facing bilingual report is a static React application:
+
+- Finnish: <https://santtua.github.io/bus-lateness-analysis/#/>
+- English: <https://santtua.github.io/bus-lateness-analysis/#/en>
+
+It combines an answer-first narrative with line, hour, and stop explorers. The
+published data is a manually refreshed aggregate snapshot; the local database,
+vehicle identifiers, trip identifiers, and fine-grained timestamps are never
+included in the site build.
+
 ## Data
 
 Input data is expected in a local database at:
@@ -25,6 +37,57 @@ This project uses `uv`.
 ```sh
 uv sync
 ```
+
+The public report additionally requires Node.js 24 and the pinned pnpm version
+from the root `package.json`:
+
+```sh
+corepack install
+corepack pnpm install --frozen-lockfile
+```
+
+The workspace enforces a 24-hour minimum package release age for direct and
+transitive dependencies. Dependencies are exact-pinned and the lockfile remains
+subject to pnpm's supply-chain verification.
+
+Update exact pins only after the same release-age gate and validation suite:
+
+```sh
+corepack pnpm update --latest
+corepack pnpm check
+```
+
+## Public Report Development
+
+Refresh the tracked aggregate JSON from the local database and GTFS snapshots:
+
+```sh
+corepack pnpm data:public
+```
+
+Run the development server and production checks:
+
+```sh
+corepack pnpm dev
+corepack pnpm check
+corepack pnpm test:coverage
+corepack pnpm e2e
+```
+
+The Vite build is written to `site/dist`. TanStack Router uses hash history so
+direct links and reloads work on GitHub Pages without server-side rewrites.
+
+## GitHub Pages Deployment
+
+The workflow in `.github/workflows/pages.yml` validates Python and frontend
+tests, runs cross-browser Playwright and axe checks, and deploys pushes to
+`master`. One repository setting must be enabled before the first deployment:
+
+1. Open **Settings → Pages**.
+2. Under **Build and deployment**, set **Source** to **GitHub Actions**.
+
+The workflow builds only the aggregate JSON committed under `site/public/data`;
+it does not require or upload `data/foli.db`.
 
 ## Analysis
 

@@ -1,0 +1,12 @@
+.venv/
+data/
+outputs/
+reports/generated/
+site/dist/
+site/coverage/
+site/playwright-report/
+site/test-results/
+site/public/data/
+site/src/routeTree.gen.ts
+pnpm-lock.yaml
+*.ipynb

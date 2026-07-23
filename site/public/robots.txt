@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://santtua.github.io/bus-lateness-analysis/sitemap.xml
