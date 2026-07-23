@@ -59,8 +59,11 @@ const copy = {
     rushChartSub: 'Arkipäivien ruuhka 07–09 ja 15–18 verrattuna muihin aikoihin',
     alertsTitle: 'Häiriöt liittyvät viiveeseen, mutta eivät selitä koko vaihtelua',
     alertsIntro:
-      'Häiriövertailu käyttää saman linjan, suunnan, tunnin ja päivätyypin kontrollihavaintoja. Ryhmätason vaikutukset jäävät pienemmiksi kuin pahimmat linja- ja ruuhkahavainnot.',
+      'Häiriövertailu käyttää saman linjan, suunnan, tunnin ja päivätyypin kontrollihavaintoja. Jokainen rivi on häiriön syyn, vaikutuksen, tiedoteprioriteetin ja kohteen erillinen yhdistelmä. Ryhmätason vaikutukset jäävät pienemmiksi kuin pahimmat linja- ja ruuhkahavainnot.',
     alert: 'Häiriö',
+    alertPriority: 'Tiedoteprioriteetti',
+    alertPriorityDescription:
+      'Fölin tiedoterajapinnassa pienempi prioriteettiluku tarkoittaa tärkeämpää viestiä. Föli suosittelee käsittelemään arvon 100 tai alle tärkeänä etusivun nostona. Luku järjestää tiedotteita, eikä mittaa viiveen suuruutta.',
     scope: 'Kohde',
     alertBuckets: 'Häiriöluokkia',
     p90Lift: 'p90-lisä',
@@ -169,8 +172,11 @@ const copy = {
     rushChartSub: 'Weekday rush 07–09 and 15–18 compared with other times',
     alertsTitle: 'Disruptions are associated with delay, but do not explain all variation',
     alertsIntro:
-      'The disruption comparison uses controls from the same line, direction, hour, and day type. Group-level effects remain smaller than the worst line and rush-period signals.',
+      'The disruption comparison uses controls from the same line, direction, hour, and day type. Each row is a distinct combination of disruption cause, effect, message priority, and scope. Group-level effects remain smaller than the worst line and rush-period signals.',
     alert: 'Disruption',
+    alertPriority: 'Message priority',
+    alertPriorityDescription:
+      'In Föli’s alerts feed, a smaller priority number means a more important message. Föli recommends treating a value of 100 or below as an important front-page item. The number orders messages; it does not measure delay severity.',
     scope: 'Scope',
     alertBuckets: 'Alert buckets',
     p90Lift: 'p90 lift',
@@ -235,6 +241,12 @@ const dataLabels = {
       accident: 'Onnettomuus',
       technical_problem: 'Tekninen vika',
     },
+    alertEffect: {
+      detour: 'Poikkeusreitti',
+      significant_delays: 'Merkittäviä viiveitä',
+      stop_moved: 'Pysäkki siirretty',
+      unknown: 'Tuntematon vaikutus',
+    },
     alertScope: { route: 'Linja', stop: 'Pysäkki' },
     qualityCheck: {
       is_implausible_delay: 'Epäuskottava viive',
@@ -251,6 +263,12 @@ const dataLabels = {
       other_cause: 'Other cause',
       accident: 'Accident',
       technical_problem: 'Technical problem',
+    },
+    alertEffect: {
+      detour: 'Detour',
+      significant_delays: 'Significant delays',
+      stop_moved: 'Stop moved',
+      unknown: 'Unknown effect',
     },
     alertScope: { route: 'Line', stop: 'Stop' },
     qualityCheck: {

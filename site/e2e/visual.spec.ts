@@ -29,3 +29,21 @@ test('ranking evidence remains legible at desktop and mobile widths', async ({
     animations: 'disabled',
   });
 });
+
+test('disruption groups remain distinct and legible at desktop and mobile widths', async ({
+  page,
+}, testInfo) => {
+  test.skip(
+    !['chromium-desktop', 'mobile-chromium'].includes(testInfo.project.name),
+    'Visual baselines are intentionally limited to Chromium desktop and mobile.',
+  );
+  await page.goto('./#/?view=table');
+  await page.addStyleTag({
+    content: '.site-header, .skip-link { visibility: hidden !important; }',
+  });
+  const alerts = page.locator('#alerts');
+  await alerts.scrollIntoViewIfNeeded();
+  await expect(alerts).toHaveScreenshot(`alerts-${testInfo.project.name}.png`, {
+    animations: 'disabled',
+  });
+});

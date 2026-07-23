@@ -190,7 +190,20 @@ test('explorers use readable labels and a useful default profile', async ({ page
   );
   expect(styles.every(({ transform, weight }) => transform === 'none' && weight <= 700)).toBe(true);
 
-  await expect(page.getByRole('rowheader', { name: 'Muu syy', exact: true }).first()).toBeVisible();
+  const detourPriority1000 = page.getByRole('rowheader', {
+    name: 'Muu syy Poikkeusreitti · Tiedoteprioriteetti 1000',
+    exact: true,
+  });
+  await expect(detourPriority1000).toHaveCount(2);
+  await expect(detourPriority1000.first()).toBeVisible();
+  await expect(
+    page.getByRole('rowheader', {
+      name: 'Muu syy Poikkeusreitti · Tiedoteprioriteetti 900',
+      exact: true,
+    }),
+  ).toBeVisible();
+  await expect(page.getByText('Tuntematon vaikutus', { exact: false }).first()).toBeVisible();
+  await expect(page.getByText(/pienempi prioriteettiluku tarkoittaa tärkeämpää/)).toBeVisible();
   await expect(page.getByText('other cause', { exact: true })).toHaveCount(0);
   if (testInfo.project.name.startsWith('mobile')) {
     await expect(page.getByRole('navigation', { name: 'Päävalikko' })).toBeVisible();
