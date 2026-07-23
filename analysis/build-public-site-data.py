@@ -499,7 +499,7 @@ def build_public_data(
         db=db,
         cache_dir=cache_dir,
         gtfs_root=gtfs_root,
-        min_observations=MIN_BUCKETS,
+        min_observations=min_buckets,
         limit=20,
     )
     _print_progress("Verifying Polars report cache")

@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from datetime import date
 from pathlib import Path
+from unittest import mock
 
 import polars as pl
 
@@ -120,6 +121,29 @@ class PublicSiteDataTests(unittest.TestCase):
 
         self.assertEqual([row["stop_id"] for row in payload["stops"]], ["10"])
         self.assertTrue(all(row["bucket_count"] >= 2 for row in payload["metrics"]))
+
+    def test_requested_minimum_bucket_count_configures_report_cache(self) -> None:
+        class CacheProbe(Exception):
+            pass
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            with mock.patch.object(
+                self.generator,
+                "ensure_report_cache",
+                side_effect=CacheProbe,
+            ) as ensure_cache:
+                with self.assertRaises(CacheProbe):
+                    self.generator.build_public_data(
+                        db=root / "foli.db",
+                        cache_dir=root / "cache",
+                        gtfs_root=root / "gtfs",
+                        output_dir=root / "output",
+                        min_buckets=47,
+                    )
+
+        settings = ensure_cache.call_args.args[0]
+        self.assertEqual(settings.min_observations, 47)
 
     def test_bilingual_caveats_cover_snapshot_estimate_filter_and_gaps(self) -> None:
         caveats = self.generator._overview_caveats(

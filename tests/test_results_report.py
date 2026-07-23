@@ -176,6 +176,39 @@ class ResultsReportCacheTests(unittest.TestCase):
             self.assertEqual(second.status, "reused")
             self.assertIn("cache_build_seconds", second.timings)
 
+    def test_report_cache_rebuilds_when_minimum_observations_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "foli.db"
+            cache_dir = Path(temp_dir) / "cache"
+            create_report_db(db_path)
+
+            first = ensure_report_cache(
+                ReportSettings(
+                    db=db_path,
+                    cache_dir=cache_dir,
+                    min_observations=1,
+                )
+            )
+            changed = ensure_report_cache(
+                ReportSettings(
+                    db=db_path,
+                    cache_dir=cache_dir,
+                    min_observations=2,
+                )
+            )
+            reused = ensure_report_cache(
+                ReportSettings(
+                    db=db_path,
+                    cache_dir=cache_dir,
+                    min_observations=2,
+                )
+            )
+
+            self.assertEqual(first.status, "rebuilt")
+            self.assertEqual(changed.status, "rebuilt")
+            self.assertEqual(changed.manifest["settings"]["min_observations"], 2)
+            self.assertEqual(reused.status, "reused")
+
     def test_base_cache_reuse_ignores_result_limit(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "foli.db"
