@@ -93,6 +93,9 @@ export function ReportPage({ language, search, onSearchChange }: ReportPageProps
   const largestGaps = [...context.collector_gaps]
     .sort((a, b) => b.missing_min - a.missing_min)
     .slice(0, 4);
+  const firstP90TakeawayIndex = overview.takeaways.findIndex((takeaway) =>
+    takeaway[language].includes(copy.p90),
+  );
   return (
     <>
       <InPageLink className="skip-link" targetId="main-content" focusTarget>
@@ -128,9 +131,27 @@ export function ReportPage({ language, search, onSearchChange }: ReportPageProps
           <div className="shell executive-summary">
             <h2>{copy.executive}</h2>
             <ul>
-              {overview.takeaways.map((takeaway) => (
-                <li key={takeaway.id}>{takeaway[language]}</li>
-              ))}
+              {overview.takeaways.map((takeaway, index) => {
+                const text = takeaway[language];
+                const termStart = text.indexOf(copy.p90);
+                if (index !== firstP90TakeawayIndex || termStart === -1) {
+                  return <li key={takeaway.id}>{text}</li>;
+                }
+                return (
+                  <li key={takeaway.id}>
+                    {text.slice(0, termStart)}
+                    <InPageLink
+                      className="p90-definition-link"
+                      targetId="p90-explanation"
+                      ariaLabel={copy.p90ExplanationLink}
+                      focusTarget
+                    >
+                      {copy.p90}
+                    </InPageLink>
+                    {text.slice(termStart + copy.p90.length)}
+                  </li>
+                );
+              })}
             </ul>
           </div>
           <div className="shell">
@@ -285,6 +306,15 @@ export function ReportPage({ language, search, onSearchChange }: ReportPageProps
               </ul>
             </div>
           </div>
+          <aside className="p90-explanation" aria-labelledby="p90-explanation">
+            <h3 id="p90-explanation" tabIndex={-1}>
+              {copy.p90ExplanationTitle}
+            </h3>
+            <p>{copy.p90Explanation}</p>
+            <p>
+              <strong>{copy.example}</strong> {copy.p90Example}
+            </p>
+          </aside>
         </Section>
       </main>
       <footer className="site-footer">

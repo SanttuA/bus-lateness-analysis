@@ -10,6 +10,8 @@ describe('reader-facing labels', () => {
     expect(t('fi').alertPriorityUnknown).toBe('tuntematon');
     expect(t('en').alertPriorityDescription).toContain('supplied by Föli');
     expect(t('en').alertPriorityDescription).toContain('shown as unknown');
+    expect(t('fi').p90Example).toContain('noin 90 sadasta');
+    expect(t('en').p90Example).toContain('about 90 of every 100');
   });
 
   it('translates public data codes instead of exposing raw identifiers', () => {

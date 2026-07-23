@@ -362,6 +362,17 @@ h1 {
   content: '';
 }
 
+.p90-definition-link {
+  color: var(--blue-dark);
+  font-weight: 750;
+  text-decoration-thickness: 0.09em;
+  text-underline-offset: 0.14em;
+}
+
+.p90-definition-link:hover {
+  color: var(--orange-dark);
+}
+
 .metric-strip {
   display: grid;
   grid-template-columns: repeat(6, 1fr);
@@ -910,6 +921,38 @@ input[type='range'] {
   padding: 9px 0;
   border-bottom: 1px solid var(--line);
   font-size: 1rem;
+}
+
+.p90-explanation {
+  max-width: 880px;
+  margin: 48px 0 0;
+  padding: 30px;
+  border-left: 4px solid var(--blue);
+  background: var(--blue-pale);
+}
+
+.p90-explanation h3 {
+  margin-bottom: 12px;
+  font-family: Charter, Georgia, serif;
+  font-size: clamp(1.5rem, 2.5vw, 2rem);
+  font-weight: 500;
+}
+
+.p90-explanation h3:focus {
+  outline: 3px solid var(--focus);
+}
+
+.p90-explanation p {
+  max-width: 760px;
+  margin-bottom: 12px;
+}
+
+.p90-explanation p:last-child {
+  margin-bottom: 0;
+}
+
+#p90-explanation {
+  scroll-margin-top: 96px;
 }
 
 .site-footer {
