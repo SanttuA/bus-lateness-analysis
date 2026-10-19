@@ -17,6 +17,7 @@ DEFAULT_GTFS_ROOT = PROJECT_ROOT / "data" / "gtfs"
 DEFAULT_ANALYSIS_CACHE_DIR = PROJECT_ROOT / "outputs" / "report-cache"
 DEFAULT_TIMEZONE = "Europe/Helsinki"
 DEFAULT_RUSH_WINDOWS = ("07:00-09:00", "15:00-18:00")
+DEFAULT_OFFPEAK_WINDOWS = ("09:00-15:00",)
 QUALITY_MODES = ("conservative", "diagnostic", "raw")
 BUCKET_MODES = ("poll", "trip-stop", "vehicle-trip", "line-hour")
 DEFAULT_QUALITY_MODE = "conservative"
@@ -26,6 +27,11 @@ STALE_OBSERVATION_SECONDS = 5 * 60
 PRE_TRIP_GRACE_SECONDS = 15 * 60
 POST_TRIP_GRACE_SECONDS = 30 * 60
 STOP_CALL_DISAGREEMENT_SECONDS = 10 * 60
+PLACEHOLDER_ZERO_STOP_CALL_SECONDS = 60
+NO_REALTIME_MIN_STOPS = 10
+ON_TIME_EARLY_SECONDS = 60
+ON_TIME_LATE_SECONDS = 180
+TRIP_KEY_COLUMNS = ["trip_match_key", "vehicle_id"]
 
 DELAY_FILTER_SQL = """
     is_gtfs_matchable = 1
@@ -49,6 +55,8 @@ QUALITY_SELECT_SQL = """
     v.line_ref,
     v.direction_ref,
     v.origin_aimed_departure_time_utc,
+    v.origin_ref,
+    v.destination_name,
     v.trip_match_key,
     v.published_line_name,
     v.delay_seconds,
@@ -71,14 +79,54 @@ QUALITY_FLAG_COLUMNS = [
     "is_stale_observation",
     "is_pre_trip_observation",
     "is_post_trip_observation",
+    "is_origin_layover",
+    "is_no_realtime_trip",
     "has_stop_call_disagreement",
+    "is_placeholder_zero",
 ]
 
+# Rows excluded by the conservative quality mode. Two of them target placeholder zero
+# delays: Föli reports delay 0 while a bus waits at its origin before departure and for
+# trips without realtime prediction, which otherwise inflate on-time shares.
 CONSERVATIVE_EXCLUSION_COLUMNS = [
     "is_implausible_delay",
     "is_stale_observation",
     "is_pre_trip_observation",
     "is_post_trip_observation",
+    "is_origin_layover",
+    "is_no_realtime_trip",
+]
+
+# Exclusions that indicate unreliable data rather than a bus waiting before departure.
+# A line's share of these rows drives its low-quality flag.
+DATA_FAULT_COLUMNS = [
+    "is_implausible_delay",
+    "is_stale_observation",
+    "is_post_trip_observation",
+    "is_no_realtime_trip",
+]
+
+# Column order shared by the pandas, DuckDB and Polars metric summaries.
+METRIC_COLUMNS = [
+    "bucket_count",
+    "raw_poll_count",
+    "trip_count",
+    "day_count",
+    "signed_mean_delay_min",
+    "avg_delay_min",
+    "median_delay_min",
+    "p75_delay_min",
+    "p90_delay_min",
+    "p95_delay_min",
+    "pct_on_time",
+    "pct_late",
+    "pct_over_3_min_late",
+    "pct_over_5_min_late",
+    "pct_early",
+    "pct_over_1_min_early",
+    "pct_over_3_min_early",
+    "median_early_min_abs",
+    "p90_early_min_abs",
 ]
 
 DELAY_METRIC_COLUMNS = [
@@ -141,6 +189,12 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=1,
         help="Only include groups with at least this many observations.",
+    )
+    parser.add_argument(
+        "--min-trips",
+        type=int,
+        default=None,
+        help="Only include groups with at least this many distinct trips. Defaults to 10.",
     )
     parser.add_argument(
         "--output-csv",
@@ -467,7 +521,9 @@ def add_local_time_columns(
     df: pd.DataFrame,
     utc_column: str,
     timezone: str,
+    holidays: tuple[str, ...] | list[str] = (),
 ) -> pd.DataFrame:
+    """Local calendar columns. Reduced-service holidays count as weekend days."""
     if df.empty:
         return df.copy()
 
@@ -475,12 +531,14 @@ def add_local_time_columns(
     result = df.copy()
     utc_times = pd.to_datetime(result[utc_column], utc=True, errors="coerce")
     local_times = utc_times.dt.tz_convert(tz)
+    holiday_dates = {date.fromisoformat(str(value)) for value in holidays}
 
     result["local_time"] = local_times
     result["local_date"] = local_times.dt.date
     result["local_hour"] = local_times.dt.hour
     result["local_weekday"] = local_times.dt.weekday
-    result["is_weekday"] = result["local_weekday"] < 5
+    result["is_holiday"] = result["local_date"].isin(holiday_dates)
+    result["is_weekday"] = (result["local_weekday"] < 5) & ~result["is_holiday"]
     result["local_minutes"] = local_times.dt.hour * 60 + local_times.dt.minute
     return result
 
@@ -501,6 +559,9 @@ def add_quality_flags(
         result["quality_pass"] = pd.Series(dtype="bool")
         return result
 
+    for column in ["next_stop_point_ref", "origin_ref", *TRIP_KEY_COLUMNS]:
+        if column not in result.columns:
+            result[column] = pd.NA
     result["delay_seconds"] = pd.to_numeric(result["delay_seconds"], errors="coerce")
     for column in [
         "recorded_at_utc",
@@ -556,9 +617,27 @@ def add_quality_flags(
     result["is_post_trip_observation"] = (
         recorded.gt(destination_aimed + pd.Timedelta(seconds=post_trip_grace_seconds)).fillna(False)
     )
+    # Waiting at the first stop before departure: Föli reports delay 0 for most of these.
+    next_stop = result["next_stop_point_ref"].astype("string")
+    origin = result["origin_ref"].astype("string")
+    result["is_origin_layover"] = (
+        (next_stop == origin).fillna(False)
+        & recorded.lt(origin_aimed).fillna(False)
+    ).astype(bool)
     result["has_stop_call_disagreement"] = result["stop_call_delay_diff_seconds"].gt(
         stop_call_disagreement_seconds
     ).fillna(False)
+    result["is_placeholder_zero"] = (
+        result["delay_seconds"].eq(0)
+        & result["stop_call_delay_seconds"].abs().gt(PLACEHOLDER_ZERO_STOP_CALL_SECONDS)
+    ).fillna(False).astype(bool)
+    # One integer id per trip keeps the two window aggregates cheap on large frames.
+    trip_id = result.groupby(TRIP_KEY_COLUMNS, dropna=False, sort=False).ngroup()
+    max_abs_delay = result["delay_seconds"].abs().groupby(trip_id).transform("max")
+    stop_count = result["next_stop_point_ref"].groupby(trip_id).transform("nunique")
+    result["is_no_realtime_trip"] = (
+        max_abs_delay.eq(0) & stop_count.ge(NO_REALTIME_MIN_STOPS)
+    ).fillna(False).astype(bool)
     result["quality_issue_count"] = result[QUALITY_FLAG_COLUMNS].sum(axis=1)
     return result
 
@@ -588,6 +667,7 @@ def add_representative_time_columns(
     df: pd.DataFrame,
     *,
     timezone: str = DEFAULT_TIMEZONE,
+    holidays: tuple[str, ...] | list[str] = (),
 ) -> pd.DataFrame:
     if df.empty:
         return df.copy()
@@ -601,7 +681,7 @@ def add_representative_time_columns(
     result["representative_time_utc"] = result["next_aimed_arrival_time_utc"].combine_first(
         result["recorded_at_utc"]
     )
-    result = add_local_time_columns(result, "representative_time_utc", timezone)
+    result = add_local_time_columns(result, "representative_time_utc", timezone, holidays)
     result["day_type"] = result["is_weekday"].map({True: "weekday", False: "weekend"})
     return result
 
@@ -611,13 +691,14 @@ def aggregate_delay_buckets(
     *,
     bucket: str = DEFAULT_BUCKET_MODE,
     timezone: str = DEFAULT_TIMEZONE,
+    holidays: tuple[str, ...] | list[str] = (),
 ) -> pd.DataFrame:
     if bucket not in BUCKET_MODES:
         raise ValueError(f"bucket must be one of: {', '.join(BUCKET_MODES)}")
     if df.empty:
         return _empty_bucket_frame()
 
-    working = add_representative_time_columns(df, timezone=timezone)
+    working = add_representative_time_columns(df, timezone=timezone, holidays=holidays)
     working["delay_seconds"] = pd.to_numeric(working["delay_seconds"], errors="coerce")
     working = working.dropna(subset=["delay_seconds", "representative_time_utc", "line_ref"])
     if working.empty:
@@ -632,9 +713,11 @@ def aggregate_delay_buckets(
         "next_stop_point_ref",
         "published_line_name",
         "next_stop_point_name",
+        "destination_name",
     ]:
         if column not in working.columns:
             working[column] = pd.NA
+    working["trip_match_key"] = working["trip_match_key"].astype("string")
     working["direction_ref"] = working["direction_ref"].astype("string").fillna("Unknown")
     working["line_ref"] = working["line_ref"].astype("string")
     working["next_stop_point_ref"] = working["next_stop_point_ref"].astype("string")
@@ -667,6 +750,7 @@ def aggregate_delay_buckets(
             raw_poll_count=("delay_seconds", "size"),
             published_line_name=("published_line_name", "first"),
             next_stop_point_name=("next_stop_point_name", "first"),
+            destination_name=("destination_name", "first"),
             representative_time_utc=("representative_time_utc", "min"),
             recorded_at_utc=("recorded_at_utc", "min"),
             first_recorded_at_utc=("recorded_at_utc", "min"),
@@ -675,16 +759,20 @@ def aggregate_delay_buckets(
         result["bucket_id"] = (
             result[group_keys].astype("string").fillna("<NA>").agg("|".join, axis=1)
         )
+        if "trip_match_key" not in group_keys:
+            result["trip_match_key"] = pd.NA
         if "local_date" not in result.columns or "local_hour" not in result.columns:
-            result = add_local_time_columns(result, "representative_time_utc", timezone)
+            result = add_local_time_columns(result, "representative_time_utc", timezone, holidays)
             result["day_type"] = result["is_weekday"].map({True: "weekday", False: "weekend"})
         else:
-            result["local_weekday"] = pd.to_datetime(result["representative_time_utc"]).dt.weekday
-            result["is_weekday"] = result["day_type"] == "weekday"
-            result["local_minutes"] = result["local_hour"] * 60
-            result["local_time"] = pd.to_datetime(
+            local_times = pd.to_datetime(
                 result["representative_time_utc"], utc=True, errors="coerce"
             ).dt.tz_convert(ZoneInfo(timezone))
+            result["local_weekday"] = local_times.dt.weekday
+            result["is_holiday"] = result["day_type"].eq("weekend") & (result["local_weekday"] < 5)
+            result["is_weekday"] = result["day_type"] == "weekday"
+            result["local_minutes"] = result["local_hour"] * 60
+            result["local_time"] = local_times
 
     result["delay_min"] = result["delay_seconds"] / 60.0
     result["bucket_mode"] = bucket
@@ -696,6 +784,7 @@ def summarize_delay_metrics(
     group_keys: list[str],
     *,
     min_observations: int = 1,
+    min_trips: int = 1,
     extra_aggs: dict[str, tuple[str, str]] | None = None,
 ) -> pd.DataFrame:
     if df.empty:
@@ -705,6 +794,9 @@ def summarize_delay_metrics(
     working["delay_seconds"] = pd.to_numeric(working["delay_seconds"], errors="coerce")
     if "raw_poll_count" not in working.columns:
         working["raw_poll_count"] = 1
+    for column in ("trip_match_key", "local_date"):
+        if column not in working.columns:
+            working[column] = pd.NA
     if not group_keys:
         working["_scope"] = "overall"
         group_keys = ["_scope"]
@@ -712,12 +804,18 @@ def summarize_delay_metrics(
     grouped = working.groupby(group_keys, dropna=False, as_index=False).agg(
         bucket_count=("delay_seconds", "size"),
         raw_poll_count=("raw_poll_count", "sum"),
+        trip_count=("trip_match_key", "nunique"),
+        day_count=("local_date", "nunique"),
         signed_mean_delay_min=("delay_seconds", lambda s: minutes(s).mean()),
         avg_delay_min=("delay_seconds", lambda s: minutes(s).mean()),
         median_delay_min=("delay_seconds", lambda s: minutes(s).median()),
         p75_delay_min=("delay_seconds", lambda s: minutes(s).quantile(0.75)),
         p90_delay_min=("delay_seconds", lambda s: minutes(s).quantile(0.90)),
         p95_delay_min=("delay_seconds", lambda s: minutes(s).quantile(0.95)),
+        pct_on_time=(
+            "delay_seconds",
+            lambda s: s.between(-ON_TIME_EARLY_SECONDS, ON_TIME_LATE_SECONDS).mean() * 100.0,
+        ),
         pct_late=("delay_seconds", lambda s: (s > 0).mean() * 100.0),
         pct_over_3_min_late=("delay_seconds", lambda s: (s > 180).mean() * 100.0),
         pct_over_5_min_late=("delay_seconds", lambda s: (s > 300).mean() * 100.0),
@@ -728,7 +826,10 @@ def summarize_delay_metrics(
         p90_early_min_abs=("delay_seconds", lambda s: _early_abs_quantile(s, 0.90)),
         **(extra_aggs or {}),
     )
-    grouped = grouped[grouped["bucket_count"] >= min_observations]
+    keep = grouped["bucket_count"] >= min_observations
+    if min_trips > 1:
+        keep &= grouped["trip_count"] >= min_trips
+    grouped = grouped[keep]
     if "_scope" in grouped.columns:
         grouped = grouped.drop(columns=["_scope"])
     return grouped.reset_index(drop=True)
@@ -742,10 +843,13 @@ def sort_robust_delay_metrics(
 ) -> pd.DataFrame:
     if df.empty:
         return df
-    result = df.sort_values(
-        ["p90_delay_min", "pct_over_5_min_late", "bucket_count"],
-        ascending=[ascending, ascending, not ascending],
-    )
+    # Ties favour the larger sample.
+    columns = ["p90_delay_min", "pct_over_5_min_late", "bucket_count"]
+    order = [ascending, ascending, False]
+    if "line_ref" in df.columns:
+        columns.append("line_ref")
+        order.append(True)
+    result = df.sort_values(columns, ascending=order)
     if limit is not None:
         result = result.head(limit)
     return result.reset_index(drop=True)
@@ -842,7 +946,9 @@ def _empty_bucket_frame() -> pd.DataFrame:
             "bucket_mode",
             "line_ref",
             "direction_ref",
+            "trip_match_key",
             "published_line_name",
+            "destination_name",
             "delay_seconds",
             "delay_min",
             "raw_poll_count",
@@ -854,6 +960,7 @@ def _empty_bucket_frame() -> pd.DataFrame:
             "local_date",
             "local_hour",
             "local_weekday",
+            "is_holiday",
             "is_weekday",
             "day_type",
             "local_minutes",
@@ -901,24 +1008,19 @@ def _load_one_gtfs_route_metadata(gtfs_dir: Path) -> pd.DataFrame:
 
 
 def _empty_metric_frame(group_columns: list[str]) -> pd.DataFrame:
-    return pd.DataFrame(
-        columns=[
-            *group_columns,
-            "bucket_count",
-            "raw_poll_count",
-            "signed_mean_delay_min",
-            "avg_delay_min",
-            "median_delay_min",
-            "p75_delay_min",
-            "p90_delay_min",
-            "p95_delay_min",
-            "pct_late",
-            "pct_over_3_min_late",
-            "pct_over_5_min_late",
-            "pct_early",
-            "pct_over_1_min_early",
-            "pct_over_3_min_early",
-            "median_early_min_abs",
-            "p90_early_min_abs",
-        ]
+    return pd.DataFrame(columns=[*group_columns, *METRIC_COLUMNS])
+
+
+def holiday_dates_for_args(args: object) -> tuple[str, ...]:
+    """Reduced-service weekday holidays from the GTFS calendar for CLI arguments."""
+    try:
+        from .service_calendar import holiday_date_strings
+    except ImportError:  # pragma: no cover - used when called as analysis/*.py script.
+        from service_calendar import holiday_date_strings
+
+    gtfs_dir = getattr(args, "gtfs_dir", None)
+    gtfs_root = getattr(args, "gtfs_root", None) or DEFAULT_GTFS_ROOT
+    return holiday_date_strings(
+        gtfs_root=resolve_project_path(gtfs_root),
+        gtfs_dir=resolve_project_path(gtfs_dir) if gtfs_dir else None,
     )

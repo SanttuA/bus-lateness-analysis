@@ -6,25 +6,63 @@ import duckdb
 import pandas as pd
 
 try:
-    from ._shared import DEFAULT_RUSH_WINDOWS, round_numeric, rush_window_values
+    from ._shared import DEFAULT_GTFS_ROOT, DEFAULT_RUSH_WINDOWS, round_numeric, rush_window_values
     from .report_cache import (
+        CONSERVATIVE_EXCLUSION_COLUMNS,
+        DEFAULT_MIN_TRIPS,
+        METRIC_COLUMNS,
+        QUALITY_FLAG_COLUMNS,
         ReportSettings,
+        _having,
         _local_time_select,
         _metric_select,
         _rush_condition,
         _sql_literal,
+        context_metrics_sql,
+        delay_bucket_sql,
         ensure_analysis_cache,
+        hourly_profile_sql,
+        line_ranking_frame,
+        quality_by_line_sql,
+        quality_summary_sql,
+        rush_impact_frame,
     )
 except ImportError:  # pragma: no cover - used when called as analysis/*.py script.
-    from _shared import DEFAULT_RUSH_WINDOWS, round_numeric, rush_window_values
+    from _shared import DEFAULT_GTFS_ROOT, DEFAULT_RUSH_WINDOWS, round_numeric, rush_window_values
     from report_cache import (
+        CONSERVATIVE_EXCLUSION_COLUMNS,
+        DEFAULT_MIN_TRIPS,
+        METRIC_COLUMNS,
+        QUALITY_FLAG_COLUMNS,
         ReportSettings,
+        _having,
         _local_time_select,
         _metric_select,
         _rush_condition,
         _sql_literal,
+        context_metrics_sql,
+        delay_bucket_sql,
         ensure_analysis_cache,
+        hourly_profile_sql,
+        line_ranking_frame,
+        quality_by_line_sql,
+        quality_summary_sql,
+        rush_impact_frame,
     )
+
+__all__ = [
+    "_local_time_select",
+    "_metric_select",
+    "_rush_condition",
+    "alert_observation_buckets",
+    "context_delay_metrics",
+    "hourly_delay_profile",
+    "line_rankings",
+    "quality_report",
+    "rush_impact",
+    "settings_from_args",
+    "stop_change_buckets",
+]
 
 
 def settings_from_args(args: object) -> ReportSettings:
@@ -35,6 +73,7 @@ def settings_from_args(args: object) -> ReportSettings:
         bucket=getattr(args, "bucket", "trip-stop"),
         timezone=getattr(args, "timezone", "Europe/Helsinki"),
         min_observations=getattr(args, "min_observations", 30),
+        min_trips=getattr(args, "min_trips", None) or DEFAULT_MIN_TRIPS,
         limit=getattr(args, "limit", 20),
         exclude_stop_call_disagreement=getattr(
             args,
@@ -48,6 +87,7 @@ def settings_from_args(args: object) -> ReportSettings:
         ),
         include_weekends=getattr(args, "include_weekends", False),
         gtfs_dir=getattr(args, "gtfs_dir", None),
+        gtfs_root=getattr(args, "gtfs_root", None) or DEFAULT_GTFS_ROOT,
     )
 
 
@@ -57,87 +97,45 @@ def ensure_cache_from_args(args: object) -> Path:
     return result.cache_db
 
 
+def _connect(cache_db: Path) -> duckdb.DuckDBPyConnection:
+    return duckdb.connect(str(cache_db), read_only=True)
+
+
 def line_rankings(
     args: object,
     ranking: str,
     *,
     cache_db: Path | None = None,
 ) -> pd.DataFrame:
+    """Late or early ranking (with trip-cluster intervals) or the combined robust view."""
     if cache_db is None:
         cache_db = ensure_cache_from_args(args)
-    line_metrics = f"""
-        WITH line_metrics AS (
-            SELECT
-                line_ref,
-                FIRST(published_line_name ORDER BY representative_time_utc) AS line_name,
-                {_metric_select()}
-            FROM delay_buckets
-            GROUP BY line_ref
-            HAVING COUNT(*) >= ?
-        )
-    """
-    if ranking == "late":
-        query = (
-            line_metrics
-            + """
+    settings = settings_from_args(args)
+    with _connect(cache_db) as con:
+        if ranking in ("late", "early"):
+            return line_ranking_frame(con, settings, ranking)
+        query = f"""
+            WITH line_metrics AS (
+                SELECT
+                    line_ref,
+                    FIRST(published_line_name ORDER BY representative_time_utc) AS line_name,
+                    {_metric_select()}
+                FROM delay_buckets
+                GROUP BY line_ref
+                {_having(settings)}
+            )
             SELECT
                 line_ref,
                 line_name,
                 bucket_count,
                 raw_poll_count,
+                trip_count,
                 signed_mean_delay_min,
                 median_delay_min,
                 p75_delay_min,
                 p90_delay_min,
                 p95_delay_min,
-                pct_over_3_min_late,
-                pct_over_5_min_late
-            FROM line_metrics
-            ORDER BY p90_delay_min DESC,
-                pct_over_5_min_late DESC,
-                bucket_count DESC,
-                line_ref
-            LIMIT ?
-            """
-        )
-    elif ranking == "early":
-        query = (
-            line_metrics
-            + """
-            SELECT
-                line_ref,
-                line_name,
-                bucket_count,
-                raw_poll_count,
-                signed_mean_delay_min,
-                median_delay_min,
-                pct_early,
-                pct_over_1_min_early,
-                pct_over_3_min_early,
-                median_early_min_abs,
-                p90_early_min_abs
-            FROM line_metrics
-            ORDER BY p90_early_min_abs DESC,
-                pct_over_3_min_early DESC,
-                bucket_count DESC,
-                line_ref
-            LIMIT ?
-            """
-        )
-    else:
-        query = (
-            line_metrics
-            + """
-            SELECT
-                line_ref,
-                line_name,
-                bucket_count,
-                raw_poll_count,
-                signed_mean_delay_min,
-                median_delay_min,
-                p75_delay_min,
-                p90_delay_min,
-                p95_delay_min,
+                pct_on_time,
                 pct_over_3_min_late,
                 pct_over_5_min_late,
                 pct_early,
@@ -146,16 +144,16 @@ def line_rankings(
             FROM line_metrics
             ORDER BY p90_delay_min DESC,
                 pct_over_5_min_late DESC,
-                bucket_count ASC,
+                bucket_count DESC,
                 line_ref
-            LIMIT ?
-            """
-        )
-    return round_numeric(_read_cache(cache_db, query, [args.min_observations, args.limit]))
+            LIMIT {settings.limit}
+        """
+        return round_numeric(con.execute(query).fetchdf())
 
 
 def context_delay_metrics(args: object) -> pd.DataFrame:
     cache_db = ensure_cache_from_args(args)
+    settings = settings_from_args(args)
     where_parts: list[str] = []
     params: list[object] = []
     if getattr(args, "line_ref", None):
@@ -168,223 +166,40 @@ def context_delay_metrics(args: object) -> pd.DataFrame:
         where_parts.append("day_type = ?")
         params.append(args.day_type)
     where_sql = "WHERE " + " AND ".join(where_parts) if where_parts else ""
-    query = f"""
-        SELECT
-            line_ref,
-            FIRST(published_line_name ORDER BY representative_time_utc) AS line_name,
-            direction_ref,
-            LPAD(CAST(local_hour AS VARCHAR), 2, '0') || ':00' AS hour_local,
-            day_type,
-            {_metric_select()}
-        FROM delay_buckets
-        {where_sql}
-        GROUP BY line_ref, direction_ref, local_hour, day_type
-        HAVING COUNT(*) >= ?
-        ORDER BY p90_delay_min DESC, pct_over_5_min_late DESC, bucket_count ASC
-        LIMIT ?
-    """
-    params.extend([args.min_observations, args.limit])
-    columns = [
-        "line_ref",
-        "line_name",
-        "direction_ref",
-        "hour_local",
-        "day_type",
-        "bucket_count",
-        "raw_poll_count",
-        "signed_mean_delay_min",
-        "median_delay_min",
-        "p75_delay_min",
-        "p90_delay_min",
-        "p95_delay_min",
-        "pct_over_3_min_late",
-        "pct_over_5_min_late",
-        "pct_early",
-        "pct_over_1_min_early",
-        "pct_over_3_min_early",
-        "median_early_min_abs",
-        "p90_early_min_abs",
-    ]
-    return round_numeric(_read_cache(cache_db, query, params)[columns])
+    columns = ["line_ref", "line_name", "direction_ref", "hour_local", "day_type", *METRIC_COLUMNS]
+    return round_numeric(_read_cache(cache_db, context_metrics_sql(settings, where_sql), params)[columns])
 
 
 def hourly_delay_profile(args: object) -> pd.DataFrame:
+    """Hourly metrics in hour order; --limit keeps the first N hours."""
     cache_db = ensure_cache_from_args(args)
+    settings = settings_from_args(args)
     where_sql = ""
     params: list[object] = []
     if getattr(args, "line_ref", None):
         where_sql = "WHERE line_ref = ?"
         params.append(args.line_ref)
-    query = f"""
-        SELECT
-            LPAD(CAST(local_hour AS VARCHAR), 2, '0') || ':00' AS hour_local,
-            {_metric_select()}
-        FROM delay_buckets
-        {where_sql}
-        GROUP BY local_hour
-        HAVING COUNT(*) >= ?
-        ORDER BY p90_delay_min DESC, pct_over_5_min_late DESC, bucket_count ASC
-        LIMIT ?
-    """
-    params.extend([args.min_observations, args.limit])
-    columns = [
-        "hour_local",
-        "bucket_count",
-        "raw_poll_count",
-        "signed_mean_delay_min",
-        "median_delay_min",
-        "p75_delay_min",
-        "p90_delay_min",
-        "p95_delay_min",
-        "pct_over_3_min_late",
-        "pct_over_5_min_late",
-        "pct_early",
-        "pct_over_1_min_early",
-        "pct_over_3_min_early",
-    ]
-    return round_numeric(_read_cache(cache_db, query, params)[columns])
+    query = hourly_profile_sql(settings, by_day_type=False, where_sql=where_sql)
+    result = _read_cache(cache_db, query, params).head(settings.limit)
+    return round_numeric(result[["hour_local", *METRIC_COLUMNS]])
 
 
 def rush_impact(args: object) -> pd.DataFrame:
     cache_db = ensure_cache_from_args(args)
-    rush_condition = _rush_condition(tuple(rush_window_values(args.rush_window)))
-    if not args.include_weekends:
-        rush_condition = f"({rush_condition}) AND is_weekday"
-    query = f"""
-        WITH marked AS (
-            SELECT *, {rush_condition} AS is_rush
-            FROM delay_buckets
-        ),
-        grouped AS (
-            SELECT
-                line_ref,
-                is_rush,
-                FIRST(published_line_name ORDER BY representative_time_utc) AS line_name,
-                {_metric_select()}
-            FROM marked
-            GROUP BY line_ref, is_rush
-            HAVING COUNT(*) >= ?
-        ),
-        non_rush AS (
-            SELECT * FROM grouped WHERE NOT is_rush
-        ),
-        rush AS (
-            SELECT * FROM grouped WHERE is_rush
-        )
-        SELECT
-            rush.line_ref,
-            COALESCE(rush.line_name, non_rush.line_name) AS line_name,
-            non_rush.bucket_count AS bucket_count_non_rush,
-            rush.bucket_count AS bucket_count_rush,
-            non_rush.raw_poll_count AS raw_poll_count_non_rush,
-            rush.raw_poll_count AS raw_poll_count_rush,
-            non_rush.median_delay_min AS median_delay_min_non_rush,
-            rush.median_delay_min AS median_delay_min_rush,
-            rush.median_delay_min - non_rush.median_delay_min
-                AS rush_median_delay_lift_min,
-            non_rush.p90_delay_min AS p90_delay_min_non_rush,
-            rush.p90_delay_min AS p90_delay_min_rush,
-            rush.p90_delay_min - non_rush.p90_delay_min AS rush_p90_delay_lift_min,
-            non_rush.pct_over_5_min_late AS pct_over_5_min_late_non_rush,
-            rush.pct_over_5_min_late AS pct_over_5_min_late_rush,
-            rush.pct_over_5_min_late - non_rush.pct_over_5_min_late
-                AS rush_over_5_min_late_pct_point_lift
-        FROM rush
-        JOIN non_rush ON non_rush.line_ref = rush.line_ref
-        ORDER BY rush_p90_delay_lift_min DESC,
-            rush_over_5_min_late_pct_point_lift DESC,
-            bucket_count_rush DESC
-        LIMIT ?
-    """
-    return round_numeric(_read_cache(cache_db, query, [args.min_observations, args.limit]))
+    settings = settings_from_args(args)
+    with _connect(cache_db) as con:
+        return rush_impact_frame(con, settings)
 
 
 def quality_report(args: object) -> pd.DataFrame:
     cache_db = ensure_cache_from_args(args)
     if args.view == "summary":
-        query = """
-            WITH totals AS (
-                SELECT COUNT(*)::DOUBLE AS total_rows
-                FROM quality_rows
-            ),
-            checks AS (
-                SELECT 'analysis_rows' AS quality_check, COUNT(*)::DOUBLE AS row_count
-                FROM quality_rows
-                UNION ALL
-                SELECT 'is_implausible_delay', SUM(CAST(is_implausible_delay AS INTEGER))
-                FROM quality_rows
-                UNION ALL
-                SELECT 'is_stale_observation', SUM(CAST(is_stale_observation AS INTEGER))
-                FROM quality_rows
-                UNION ALL
-                SELECT 'is_pre_trip_observation',
-                    SUM(CAST(is_pre_trip_observation AS INTEGER))
-                FROM quality_rows
-                UNION ALL
-                SELECT 'is_post_trip_observation',
-                    SUM(CAST(is_post_trip_observation AS INTEGER))
-                FROM quality_rows
-                UNION ALL
-                SELECT 'has_stop_call_disagreement',
-                    SUM(CAST(has_stop_call_disagreement AS INTEGER))
-                FROM quality_rows
-                UNION ALL
-                SELECT 'conservative_excluded_default',
-                    SUM(CAST(
-                        is_implausible_delay
-                        OR is_stale_observation
-                        OR is_pre_trip_observation
-                        OR is_post_trip_observation
-                        AS INTEGER
-                    ))
-                FROM quality_rows
-                UNION ALL
-                SELECT 'conservative_excluded_with_stop_call_disagreement',
-                    SUM(CAST(
-                        is_implausible_delay
-                        OR is_stale_observation
-                        OR is_pre_trip_observation
-                        OR is_post_trip_observation
-                        OR has_stop_call_disagreement
-                        AS INTEGER
-                    ))
-                FROM quality_rows
-            )
-            SELECT
-                quality_check,
-                CAST(row_count AS BIGINT) AS row_count,
-                CASE
-                    WHEN total_rows > 0 THEN row_count / total_rows * 100.0
-                    ELSE 0.0
-                END AS pct_rows
-            FROM checks, totals
-        """
-        return round_numeric(_read_cache(cache_db, query))
+        return round_numeric(_read_cache(cache_db, quality_summary_sql()))
 
     if args.view == "line":
-        query = """
-            SELECT
-                CAST(line_ref AS VARCHAR) AS line_ref,
-                FIRST(published_line_name ORDER BY recorded_at_utc) AS line_name,
-                COUNT(*) AS row_count,
-                SUM(CAST(is_implausible_delay AS INTEGER)) AS implausible_delay_rows,
-                SUM(CAST(is_stale_observation AS INTEGER)) AS stale_rows,
-                SUM(CAST(is_pre_trip_observation AS INTEGER)) AS pre_trip_rows,
-                SUM(CAST(is_post_trip_observation AS INTEGER)) AS post_trip_rows,
-                SUM(CAST(has_stop_call_disagreement AS INTEGER))
-                    AS stop_call_disagreement_rows,
-                SUM(CAST(
-                    is_implausible_delay
-                    OR is_stale_observation
-                    OR is_pre_trip_observation
-                    OR is_post_trip_observation
-                    AS INTEGER
-                )) AS conservative_excluded_rows,
-                conservative_excluded_rows / COUNT(*) * 100.0
-                    AS conservative_excluded_pct
-            FROM quality_rows
-            GROUP BY line_ref
-            HAVING COUNT(*) >= ?
+        query = f"""
+            SELECT * FROM ({quality_by_line_sql()})
+            WHERE row_count >= ?
             ORDER BY conservative_excluded_pct DESC,
                 conservative_excluded_rows DESC,
                 line_ref
@@ -392,7 +207,9 @@ def quality_report(args: object) -> pd.DataFrame:
         """
         return round_numeric(_read_cache(cache_db, query, [args.min_observations, args.limit]))
 
-    query = """
+    flag_list = ",\n            ".join(QUALITY_FLAG_COLUMNS)
+    any_flag = " OR ".join([*CONSERVATIVE_EXCLUSION_COLUMNS, "has_stop_call_disagreement"])
+    query = f"""
         SELECT
             recorded_at_utc,
             line_ref,
@@ -403,17 +220,9 @@ def quality_report(args: object) -> pd.DataFrame:
             delay_seconds / 60.0 AS delay_min,
             observation_age_seconds,
             stop_call_delay_diff_seconds,
-            is_implausible_delay,
-            is_stale_observation,
-            is_pre_trip_observation,
-            is_post_trip_observation,
-            has_stop_call_disagreement
+            {flag_list}
         FROM quality_rows
-        WHERE is_implausible_delay
-            OR is_stale_observation
-            OR is_pre_trip_observation
-            OR is_post_trip_observation
-            OR has_stop_call_disagreement
+        WHERE {any_flag}
         ORDER BY quality_issue_count DESC, recorded_at_utc ASC
         LIMIT ?
     """
@@ -521,123 +330,14 @@ def _parse_timestamp(value: str, timezone: str) -> pd.Timestamp:
 
 
 def _bucketed_quality_rows_query(args: object, extra_where_parts: list[str]) -> str:
-    settings = settings_from_args(args)
-    where_parts = [
-        "quality_pass",
-        "delay_seconds IS NOT NULL",
-        "COALESCE(next_aimed_arrival_time_utc, recorded_at_utc) IS NOT NULL",
-        "line_ref IS NOT NULL",
-        *extra_where_parts,
-    ]
-    where_sql = " AND ".join(where_parts)
-
-    if settings.bucket == "poll":
-        return f"""
-            SELECT
-                COALESCE(CAST(id AS VARCHAR), CAST(row_number() OVER () AS VARCHAR))
-                    AS bucket_id,
-                'poll' AS bucket_mode,
-                CAST(line_ref AS VARCHAR) AS line_ref,
-                COALESCE(CAST(direction_ref AS VARCHAR), 'Unknown') AS direction_ref,
-                COALESCE(CAST(published_line_name AS VARCHAR), CAST(line_ref AS VARCHAR))
-                    AS published_line_name,
-                delay_seconds,
-                delay_seconds / 60.0 AS delay_min,
-                1::BIGINT AS raw_poll_count,
-                CAST(next_stop_point_ref AS VARCHAR) AS next_stop_point_ref,
-                CAST(next_stop_point_name AS VARCHAR) AS next_stop_point_name,
-                COALESCE(next_aimed_arrival_time_utc, recorded_at_utc)
-                    AS representative_time_utc,
-                recorded_at_utc,
-                recorded_at_utc AS first_recorded_at_utc,
-                recorded_at_utc AS last_recorded_at_utc,
-                {_local_time_select(settings.timezone)}
-            FROM quality_rows
-            WHERE {where_sql}
-        """
-
-    if settings.bucket == "trip-stop":
-        group_keys = [
-            "trip_match_key",
-            "vehicle_id",
-            "line_ref",
-            "direction_ref",
-            "next_stop_point_ref",
-        ]
-    elif settings.bucket == "vehicle-trip":
-        group_keys = ["trip_match_key", "vehicle_id", "line_ref", "direction_ref"]
-    else:
-        group_keys = ["line_ref", "direction_ref", "local_date", "local_hour", "day_type"]
-
-    base = f"""
-        SELECT
-            id,
-            trip_match_key,
-            vehicle_id,
-            CAST(line_ref AS VARCHAR) AS line_ref,
-            COALESCE(CAST(direction_ref AS VARCHAR), 'Unknown') AS direction_ref,
-            CAST(next_stop_point_ref AS VARCHAR) AS next_stop_point_ref,
-            COALESCE(CAST(published_line_name AS VARCHAR), CAST(line_ref AS VARCHAR))
-                AS published_line_name,
-            CAST(next_stop_point_name AS VARCHAR) AS next_stop_point_name,
-            delay_seconds,
-            recorded_at_utc,
-            COALESCE(next_aimed_arrival_time_utc, recorded_at_utc)
-                AS representative_time_utc
-        FROM quality_rows
-        WHERE {where_sql}
-    """
-    if settings.bucket == "line-hour":
-        base = f"""
-            SELECT *, {_local_time_select(settings.timezone)}
-            FROM ({base}) base_rows
-            WHERE representative_time_utc IS NOT NULL
-        """
-
-    group_sql = ", ".join(group_keys)
-    bucket_id_sql = " || '|' || ".join(
-        f"COALESCE(CAST({column} AS VARCHAR), '<NA>')" for column in group_keys
+    """Bucket a filtered slice of quality_rows with the same SQL as the cache build."""
+    settings = settings_from_args(args).resolved()
+    return delay_bucket_sql(
+        bucket=settings.bucket,
+        timezone=settings.timezone,
+        holidays=settings.holiday_dates(),
+        extra_where_parts=extra_where_parts,
     )
-    return f"""
-        WITH base_rows AS (
-            {base}
-        ),
-        grouped AS (
-            SELECT
-                {group_sql},
-                MEDIAN(delay_seconds) AS delay_seconds,
-                COUNT(*) AS raw_poll_count,
-                FIRST(published_line_name ORDER BY representative_time_utc)
-                    AS published_line_name,
-                FIRST(next_stop_point_name ORDER BY representative_time_utc)
-                    AS next_stop_point_name,
-                MIN(representative_time_utc) AS representative_time_utc,
-                MIN(recorded_at_utc) AS recorded_at_utc,
-                MIN(recorded_at_utc) AS first_recorded_at_utc,
-                MAX(recorded_at_utc) AS last_recorded_at_utc
-            FROM base_rows
-            WHERE representative_time_utc IS NOT NULL
-            GROUP BY {group_sql}
-        )
-        SELECT
-            {bucket_id_sql} AS bucket_id,
-            {_sql_literal(settings.bucket)} AS bucket_mode,
-            line_ref,
-            direction_ref,
-            published_line_name,
-            delay_seconds,
-            delay_seconds / 60.0 AS delay_min,
-            raw_poll_count,
-            {'next_stop_point_ref' if 'next_stop_point_ref' in group_keys else 'NULL::VARCHAR'}
-                AS next_stop_point_ref,
-            next_stop_point_name,
-            representative_time_utc,
-            recorded_at_utc,
-            first_recorded_at_utc,
-            last_recorded_at_utc,
-            {_local_time_select(settings.timezone)}
-        FROM grouped
-    """
 
 
 def _read_cache(
@@ -645,5 +345,6 @@ def _read_cache(
     query: str,
     params: list[object] | None = None,
 ) -> pd.DataFrame:
-    with duckdb.connect(str(cache_db), read_only=True) as con:
+    with _connect(cache_db) as con:
         return con.execute(query, params or []).fetchdf()
+

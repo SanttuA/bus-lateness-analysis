@@ -14,19 +14,21 @@ import polars as pl
 import nbformat
 
 from analysis.polars._shared import (
+    QUALITY_FLAG_COLUMNS,
     add_quality_flags,
     aggregate_delay_buckets,
     apply_quality_filter,
+    sort_robust_delay_metrics,
     summarize_delay_metrics,
 )
 from analysis.polars.report_cache import (
+    RESULT_TABLES,
     ReportSettings as PolarsReportSettings,
     build_hourly_delay_profile,
     build_line_rankings,
     build_quality_summary_lazy,
     ensure_report_cache as ensure_polars_report_cache,
     enrich_stops,
-    matched_control_rows,
     read_result_table as read_polars_result_table,
 )
 from analysis.report_cache import (
@@ -76,6 +78,34 @@ def load_polars_script_module(name: str, relative_path: str):
             if previous is not missing:
                 sys.modules[module_name] = previous
         sys.path = previous_path
+
+
+def normalized_rows(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Engine-neutral comparison form: rounded floats, ISO dates, None for missing."""
+    import math
+
+    result = []
+    for row in rows:
+        normalized = {}
+        for key, value in row.items():
+            if key == "note":
+                continue
+            if hasattr(value, "item") and not isinstance(value, str):
+                value = value.item()
+            if isinstance(value, float):
+                value = None if math.isnan(value) else round(value, 2)
+            elif hasattr(value, "isoformat"):
+                value = value.isoformat()[:10] if key == "local_date" else value.isoformat()
+            elif value is not None and type(value).__name__ in {"NAType", "NaTType"}:
+                value = None
+            if isinstance(value, bool):
+                value = bool(value)
+            elif isinstance(value, int):
+                value = float(value)
+            normalized[key] = value
+        if normalized:
+            result.append(normalized)
+    return result
 
 
 def quality_sample() -> pl.DataFrame:
@@ -216,20 +246,72 @@ class PolarsSharedAnalyticsTests(unittest.TestCase):
         self.assertIsNone(enriched["gtfs_feed_date"][0])
         self.assertEqual(enriched["stop_name"].to_list(), ["Fallback before", "First feed", "Second feed"])
 
-    def test_alert_controls_match_active_context(self) -> None:
-        rows = pl.DataFrame(
+    def test_origin_layover_and_no_realtime_trips_are_excluded(self) -> None:
+        base = quality_sample().head(1).with_columns(pl.lit("1").alias("origin_ref"))
+        layover = base.with_columns(
+            pl.lit(0).alias("delay_seconds"),
+            pl.lit("10").alias("origin_ref"),
+            pl.lit("2026-04-23T07:45:00Z").alias("recorded_at_utc"),
+            pl.lit("2026-04-23T07:45:30Z").alias("collected_at_utc"),
+            pl.lit("2026-04-23T07:46:00Z").alias("valid_until_utc"),
+        )
+        silent_trip = pl.concat(
+            [
+                base.with_columns(
+                    pl.lit(100 + index).alias("id"),
+                    pl.lit(0).alias("delay_seconds"),
+                    pl.lit("silent").alias("trip_match_key"),
+                    pl.lit(str(index)).alias("next_stop_point_ref"),
+                    pl.lit("1").alias("origin_ref"),
+                )
+                for index in range(10)
+            ]
+        )
+        rows = pl.concat([base, layover, silent_trip], how="vertical_relaxed")
+
+        flagged = add_quality_flags(rows)
+        kept = apply_quality_filter(rows)
+
+        self.assertEqual(flagged["is_origin_layover"].to_list()[:2], [False, True])
+        self.assertTrue(all(flagged["is_no_realtime_trip"].to_list()[2:]))
+        self.assertEqual(kept["id"].to_list(), [1])
+
+    def test_reduced_service_holiday_counts_as_weekend(self) -> None:
+        rows = quality_sample().head(1).with_columns(
+            pl.lit("2026-05-01T08:05:00Z").alias("next_aimed_arrival_time_utc")
+        )
+        normal = aggregate_delay_buckets(rows, bucket="trip-stop")
+        holiday = aggregate_delay_buckets(rows, bucket="trip-stop", holidays=("2026-05-01",))
+
+        self.assertEqual(normal["day_type"][0], "weekday")
+        self.assertEqual(holiday["day_type"][0], "weekend")
+        self.assertTrue(holiday["is_holiday"][0])
+        self.assertEqual(holiday["local_weekday"][0], 4)
+
+    def test_hourly_profile_keeps_every_hour_in_order(self) -> None:
+        buckets = pl.DataFrame(
             {
-                "line_ref": ["3", "3", "3"],
-                "direction_ref": ["1", "1", "2"],
-                "local_hour": [8, 8, 8],
-                "day_type": ["weekday", "weekday", "weekday"],
-                "delay_seconds": [60, 120, 180],
+                "local_hour": list(range(24)),
+                "delay_seconds": [float(hour * 10) for hour in range(24)],
+                "raw_poll_count": [1] * 24,
+                "trip_match_key": [f"t{hour}" for hour in range(24)],
+                "line_ref": ["3"] * 24,
             }
         )
-        active, controls = matched_control_rows(rows, pl.Series([True, False, False]))
+        profile = build_hourly_delay_profile(buckets, min_observations=1)
 
-        self.assertEqual(active["delay_seconds"].to_list(), [60])
-        self.assertEqual(controls["delay_seconds"].to_list(), [120])
+        self.assertEqual(profile["hour_local"].to_list(), [f"{hour:02d}:00" for hour in range(24)])
+
+    def test_ranking_ties_favour_larger_samples(self) -> None:
+        metrics = pl.DataFrame(
+            {
+                "line_ref": ["small", "large"],
+                "p90_delay_min": [1.0, 1.0],
+                "pct_over_5_min_late": [0.0, 0.0],
+                "bucket_count": [1, 5],
+            }
+        )
+        self.assertEqual(sort_robust_delay_metrics(metrics)["line_ref"].to_list(), ["large", "small"])
 
     def test_lazy_quality_summary_is_empty_for_no_analysis_rows(self) -> None:
         summary = build_quality_summary_lazy(
@@ -241,7 +323,7 @@ class PolarsSharedAnalyticsTests(unittest.TestCase):
                     "is_stale_observation": pl.Boolean,
                     "is_pre_trip_observation": pl.Boolean,
                     "is_post_trip_observation": pl.Boolean,
-                    "has_stop_call_disagreement": pl.Boolean,
+                    **{column: pl.Boolean for column in QUALITY_FLAG_COLUMNS},
                 }
             ).lazy()
         ).collect()
@@ -313,35 +395,26 @@ class PolarsReportParityTests(unittest.TestCase):
                 db=db_path,
                 cache_dir=temp / "polars-cache",
                 min_observations=1,
+                min_trips=1,
                 limit=5,
             )
             ensure_polars_report_cache(polars_settings, force=True)
 
-            duck_quality = read_duckdb_result_table(
-                duckdb_cache.cache_db,
-                "quality_summary",
-            )
-            polars_quality = read_polars_result_table(
-                polars_settings.cache_dir,
-                "quality_summary",
-            )
-            self.assertEqual(
-                dict(zip(duck_quality["quality_check"], duck_quality["row_count"], strict=True)),
-                dict(zip(polars_quality["quality_check"], polars_quality["row_count"], strict=True)),
-            )
-
-            duck_lines = read_duckdb_result_table(duckdb_cache.cache_db, "line_late_rankings")
-            polars_lines = read_polars_result_table(polars_settings.cache_dir, "line_late_rankings")
-            self.assertEqual(duck_lines["line_ref"].tolist(), polars_lines["line_ref"].to_list())
-            self.assertAlmostEqual(duck_lines.loc[0, "p90_delay_min"], polars_lines["p90_delay_min"][0])
+            for table in RESULT_TABLES:
+                with self.subTest(table=table):
+                    duck = normalized_rows(
+                        read_duckdb_result_table(duckdb_cache.cache_db, table).to_dict("records")
+                    )
+                    polars_rows = normalized_rows(
+                        read_polars_result_table(polars_settings.cache_dir, table).to_dicts()
+                    )
+                    self.assertEqual(duck, polars_rows)
 
             polars_buckets = read_polars_result_table(polars_settings.cache_dir, "delay_buckets")
             hourly = build_hourly_delay_profile(polars_buckets, min_observations=1, limit=5)
             self.assertFalse(hourly.is_empty())
-
-            stop_change = read_polars_result_table(polars_settings.cache_dir, "stop_midpoint_change")
-            stop_10 = stop_change.filter(pl.col("stop_id") == "10").row(0, named=True)
-            self.assertAlmostEqual(stop_10["p90_delay_change_min"], 8.0)
+            cancellations = read_polars_result_table(polars_settings.cache_dir, "service_cancellations")
+            self.assertEqual(cancellations["line_ref"].to_list(), ["4"])
 
     def test_polars_report_cache_reuses_matching_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -383,6 +456,8 @@ class PolarsReportParityTests(unittest.TestCase):
                     str(report_path),
                     "--min-observations",
                     "1",
+                    "--min-trips",
+                    "1",
                     "--limit",
                     "5",
                 ],
@@ -418,6 +493,8 @@ class PolarsReportParityTests(unittest.TestCase):
                     "--output-csv",
                     str(output_csv),
                     "--min-observations",
+                    "1",
+                    "--min-trips",
                     "1",
                     "--limit",
                     "5",

@@ -1,24 +1,19 @@
 import { lazy, Suspense, useEffect, useState } from 'react';
 
 import { loadContext, loadLines, loadOverview } from './data';
-import {
-  formatAlertPriority,
-  formatDate,
-  formatDuration,
-  formatNumber,
-  formatPercent,
-} from './format';
+import { formatDate, formatDuration, formatPercent } from './format';
 import { dataLabel, t } from './i18n';
 import type { ContextPayload, Language, LinesPayload, OverviewPayload, SearchState } from './types';
+import { AlertChart } from './components/AlertChart';
+import { DailyTrendChart } from './components/DailyTrendChart';
 import { HourlyChart } from './components/HourlyChart';
 import { InPageLink } from './components/InPageLink';
 import { LineExplorer } from './components/LineExplorer';
 import { MetricStrip } from './components/MetricStrip';
-import { RankingChart } from './components/RankingChart';
+import { PunctualityChart } from './components/PunctualityChart';
 import { RushChart } from './components/RushChart';
 import { Section } from './components/Section';
 import { SiteHeader } from './components/SiteHeader';
-import { StopChangeChart } from './components/StopChangeChart';
 
 const StopExplorer = lazy(() => import('./components/StopExplorer'));
 
@@ -89,6 +84,7 @@ export function ReportPage({ language, search, onSearchChange }: ReportPageProps
   }
 
   const { overview, lines, context } = data;
+  const headlines = overview.headlines[language];
   const qualityRows = context.quality.filter((row) => row.quality_check !== 'analysis_rows');
   const largestGaps = [...context.collector_gaps]
     .sort((a, b) => b.missing_min - a.missing_min)
@@ -121,11 +117,7 @@ export function ReportPage({ language, search, onSearchChange }: ReportPageProps
                 <span className="sr-only"> – </span>
                 {formatDate(overview.summary.end_date, language)}
               </strong>
-              <p>
-                {language === 'fi'
-                  ? 'Staattinen, käsin päivitettävä analyysi'
-                  : 'Static, manually refreshed analysis'}
-              </p>
+              <p>{copy.staticNote}</p>
             </aside>
           </div>
           <div className="shell executive-summary">
@@ -163,14 +155,17 @@ export function ReportPage({ language, search, onSearchChange }: ReportPageProps
           </div>
         </section>
 
-        <Section id="findings" number="01" title={copy.rankingTitle} intro={copy.rankingIntro}>
-          <div className="chart-grid two-up">
-            <RankingChart language={language} rows={lines.lines} mode="late" />
-            <RankingChart language={language} rows={lines.lines} mode="early" />
-          </div>
+        <Section id="findings" number="01" title={headlines.ranking} intro={copy.rankingIntro}>
+          <PunctualityChart
+            language={language}
+            lines={lines.lines}
+            frequentTripsPerDay={overview.meta.frequent_trips_per_day}
+            search={search}
+            onSearchChange={onSearchChange}
+          />
         </Section>
 
-        <Section number="02" title={copy.hourlyTitle} intro={copy.hourlyIntro} tone="tinted">
+        <Section number="02" title={headlines.hourly} intro={copy.hourlyIntro} tone="tinted">
           <HourlyChart language={language} rows={overview.hourly_profile} />
         </Section>
 
@@ -183,58 +178,17 @@ export function ReportPage({ language, search, onSearchChange }: ReportPageProps
           />
         </Section>
 
-        <Section number="04" title={copy.rushTitle} intro={copy.rushIntro} tone="dark">
+        <Section number="04" title={headlines.rush} intro={copy.rushIntro} tone="tinted">
           <RushChart language={language} rows={context.rush_impact} />
         </Section>
 
-        <Section id="alerts" number="05" title={copy.alertsTitle} intro={copy.alertsIntro}>
-          <p id="alert-priority-note" className="definition-note alert-priority-note">
-            <span aria-hidden="true">i</span>
-            {copy.alertPriorityDescription}
-          </p>
-          <div className="table-scroll evidence-table">
-            <InPageLink className="skip-link" targetId="alert-table-end" focusTarget>
-              {language === 'fi' ? 'Ohita häiriötaulukko' : 'Skip disruption table'}
-            </InPageLink>
-            <p className="table-scroll-hint">{copy.tableScrollHint}</p>
-            <table aria-describedby="alert-priority-note">
-              <caption>{copy.tableCaption}</caption>
-              <thead>
-                <tr>
-                  <th scope="col">{copy.alert}</th>
-                  <th scope="col">{copy.scope}</th>
-                  <th scope="col">{copy.alertBuckets}</th>
-                  <th scope="col">{copy.p90Lift}</th>
-                </tr>
-              </thead>
-              <tbody>
-                {[...context.alerts]
-                  .sort((a, b) => b.p90_delay_lift_min - a.p90_delay_lift_min)
-                  .slice(0, 8)
-                  .map((row) => (
-                    <tr key={`${row.cause}-${row.effect}-${row.alert_scope}-${row.priority}`}>
-                      <th scope="row" className="alert-label">
-                        <span className="alert-cause">
-                          {dataLabel(language, 'alertCause', row.cause)}
-                        </span>
-                        <span className="alert-detail">
-                          {`${dataLabel(language, 'alertEffect', row.effect)} · ${copy.alertPriority}: ${formatAlertPriority(row.priority, copy.alertPriorityUnknown)}`}
-                        </span>
-                      </th>
-                      <td>{dataLabel(language, 'alertScope', row.alert_scope)}</td>
-                      <td>{formatNumber(row.bucket_count_alert, language)}</td>
-                      <td>
-                        {row.p90_delay_lift_min > 0 ? '+' : ''}
-                        {formatNumber(row.p90_delay_lift_min, language, 2)} min
-                      </td>
-                    </tr>
-                  ))}
-              </tbody>
-            </table>
-            <span id="alert-table-end" className="sr-only" tabIndex={-1}>
-              {language === 'fi' ? 'Häiriötaulukko päättyy' : 'End of disruption table'}
-            </span>
-          </div>
+        <Section id="alerts" number="05" title={headlines.alerts} intro={copy.alertsIntro}>
+          <AlertChart
+            language={language}
+            rows={context.alerts}
+            inventory={context.alert_inventory}
+            cancellations={context.cancellations}
+          />
         </Section>
 
         <Section
@@ -249,15 +203,15 @@ export function ReportPage({ language, search, onSearchChange }: ReportPageProps
           </Suspense>
         </Section>
 
-        <Section number="07" title={copy.changesTitle} intro={copy.changesIntro}>
-          <StopChangeChart language={language} rows={context.stop_changes} />
+        <Section id="daily" number="07" title={headlines.daily} intro={copy.dailyIntro}>
+          <DailyTrendChart language={language} rows={context.daily} />
         </Section>
 
         <Section number="08" title={copy.qualityTitle} tone="dark">
           <div className="action-grid">
             <div>
               <ol className="recommendations">
-                {copy.recommendations.map((item) => (
+                {headlines.recommendations.map((item) => (
                   <li key={item}>{item}</li>
                 ))}
               </ol>
@@ -284,9 +238,9 @@ export function ReportPage({ language, search, onSearchChange }: ReportPageProps
               </ul>
             </div>
             <div className="method-card">
-              <h3>{language === 'fi' ? 'Laatufiltterin laajuus' : 'Quality-filter scope'}</h3>
+              <h3>{copy.filterTitle}</h3>
               <dl className="quality-list">
-                {qualityRows.slice(0, 6).map((row) => (
+                {qualityRows.map((row) => (
                   <div key={row.quality_check}>
                     <dt>{dataLabel(language, 'qualityCheck', row.quality_check)}</dt>
                     <dd>{formatPercent(row.pct_rows, language, 2)}</dd>
@@ -295,7 +249,7 @@ export function ReportPage({ language, search, onSearchChange }: ReportPageProps
               </dl>
             </div>
             <div className="method-card gaps-card">
-              <h3>{language === 'fi' ? 'Suurimmat keräysaukot' : 'Largest collection gaps'}</h3>
+              <h3>{copy.gapsTitle}</h3>
               <ul>
                 {largestGaps.map((gap) => (
                   <li key={`${gap.source}-${gap.gap_start_utc}`}>
@@ -322,7 +276,7 @@ export function ReportPage({ language, search, onSearchChange }: ReportPageProps
           <p>{copy.source}</p>
           <a href="https://github.com/SanttuA/bus-lateness-analysis">{copy.code}</a>
           <p>
-            {language === 'fi' ? 'Välimuisti rakennettu' : 'Cache built'}:{' '}
+            {copy.cacheBuilt}:{' '}
             <time dateTime={overview.meta.generated_at_utc}>
               {overview.meta.generated_at_utc.slice(0, 10)}
             </time>

@@ -15,6 +15,9 @@ export function validateSearch(search: Record<string, unknown>): SearchState {
   const day = stringValue(search.day);
   const metric = stringValue(search.metric);
   const view = stringValue(search.view);
+  const lines = stringValue(search.lines);
+  const rank = stringValue(search.rank);
+  const heat = stringValue(search.heat);
   const from = hourValue(search.from);
   const to = hourValue(search.to);
   return {
@@ -26,6 +29,9 @@ export function validateSearch(search: Record<string, unknown>): SearchState {
     ...(stringValue(search.stop) ? { stop: stringValue(search.stop) } : {}),
     ...(metric === 'late' || metric === 'early' ? { metric } : {}),
     ...(view === 'map' || view === 'table' ? { view } : {}),
+    ...(lines === 'frequent' || lines === 'all' ? { lines } : {}),
+    ...(rank === 'late' || rank === 'early' ? { rank } : {}),
+    ...(heat === 'late' || heat === 'early' ? { heat } : {}),
   };
 }
 

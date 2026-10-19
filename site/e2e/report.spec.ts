@@ -25,8 +25,11 @@ test('Finnish report presents the answer before the evidence', async ({ page }) 
     page.getByRole('heading', { level: 1, name: 'Fölin bussit: täsmällisyys datassa' }),
   ).toBeVisible();
   await expect(page.getByRole('heading', { level: 2, name: 'Tiivistelmä' })).toBeVisible();
-  await expect(page.getByText('3 746 770')).toBeVisible();
-  await expect(page.getByRole('heading', { name: /Kolme linjaa erottuu/ })).toBeVisible();
+  await expect(page.getByText('pysäkkiohituksista aikataulussa')).toBeVisible();
+  await expect(
+    page.getByRole('heading', { level: 2, name: /ovat useimmin myöhässä/ }),
+  ).toBeVisible();
+  await expect(page.getByText(/95 %:n luottamusväli/).first()).toBeVisible();
 });
 
 test('first p90 mention links to a focused plain-language explanation', async ({ page }) => {
@@ -41,7 +44,7 @@ test('first p90 mention links to a focused plain-language explanation', async ({
 
   const explanation = page.getByRole('heading', { name: 'What does p90 mean?' });
   await expect(explanation).toBeFocused();
-  await expect(page.getByText(/about 90 of every 100 trip–stop buckets/)).toBeVisible();
+  await expect(page.getByText(/about 90 of every 100 stop passes/)).toBeVisible();
   await expect(page).toHaveURL(originalUrl);
 });
 
@@ -107,12 +110,11 @@ test('line explorer filters are reflected in the shareable URL', async ({ page }
   await page.goto('./#/en?view=table');
   const explorer = page.locator('#lines');
   await explorer.getByRole('combobox', { name: 'Line', exact: true }).selectOption('24');
-  await explorer.getByRole('combobox', { name: 'Direction', exact: true }).selectOption('1');
-  await explorer.getByRole('combobox', { name: 'Day type', exact: true }).selectOption('weekend');
+  await explorer.getByRole('button', { name: 'Over 3 min early', exact: true }).click();
   await expect(page).toHaveURL(/line=24/);
-  await expect(page).toHaveURL(/direction=1/);
-  await expect(page).toHaveURL(/day=weekend/);
+  await expect(page).toHaveURL(/heat=early/);
   await expect(explorer.getByRole('heading', { name: 'Line 24' })).toBeVisible();
+  await expect(explorer.getByText(/Direction 1/).first()).toBeVisible();
 });
 
 test('line explorer controls update the URL without moving the page', async ({ page }) => {
@@ -120,19 +122,21 @@ test('line explorer controls update the URL without moving the page', async ({ p
   await page.addStyleTag({ content: 'html { scroll-behavior: auto !important; }' });
   const explorer = page.locator('#lines');
   const line = explorer.getByRole('combobox', { name: 'Line', exact: true });
-  const direction = explorer.getByRole('combobox', { name: 'Direction', exact: true });
-  const day = explorer.getByRole('combobox', { name: 'Day type', exact: true });
-  const from = explorer.locator('input[type="range"]').first();
+  const early = explorer.getByRole('button', { name: 'Over 3 min early', exact: true });
 
   await expectUpdateToPreserveScroll(page, line, () => line.selectOption('24'), /line=24/);
-  await expectUpdateToPreserveScroll(
-    page,
-    direction,
-    () => direction.selectOption('1'),
-    /direction=1/,
-  );
-  await expectUpdateToPreserveScroll(page, day, () => day.selectOption('weekend'), /day=weekend/);
-  await expectUpdateToPreserveScroll(page, from, () => from.fill('7'), /from=7/);
+  await expectUpdateToPreserveScroll(page, early, () => early.click(), /heat=early/);
+});
+
+test('punctuality ranking switches between frequent and all lines', async ({ page }) => {
+  await page.goto('./#/en?view=table');
+  await page.addStyleTag({ content: 'html { scroll-behavior: auto !important; }' });
+  const findings = page.locator('#findings');
+  const all = findings.getByRole('button', { name: 'All', exact: true });
+  await expectUpdateToPreserveScroll(page, all, () => all.click(), /lines=all/);
+  await expect(findings.getByText(/incomplete data/).first()).toBeAttached();
+  await findings.getByRole('button', { name: 'Early', exact: true }).click();
+  await expect(page).toHaveURL(/rank=early/);
 });
 
 test('stop explorer exposes an exact table alternative', async ({ page }) => {
@@ -206,18 +210,18 @@ test('explorers use readable labels and a useful default profile', async ({ page
   );
   expect(styles.every(({ transform, weight }) => transform === 'none' && weight <= 700)).toBe(true);
 
-  const detourPriority1000 = page.getByRole('rowheader', {
-    name: 'Muu syy Poikkeusreitti · Tiedoteprioriteetti: 1000',
-    exact: true,
-  });
-  await expect(detourPriority1000).toHaveCount(2);
-  await expect(detourPriority1000.first()).toBeVisible();
+  await page.locator('#alerts summary').click();
+  const alertTable = page.locator('#alerts table');
   await expect(
-    page.getByRole('rowheader', {
-      name: 'Muu syy Poikkeusreitti · Tiedoteprioriteetti: 900',
-      exact: true,
+    alertTable.getByRole('rowheader', {
+      name: /^Muu syy · Poikkeusreitti · Linja · tiedoteprioriteetti 1000$/,
     }),
-  ).toBeVisible();
+  ).toHaveCount(1);
+  await expect(
+    alertTable.getByRole('rowheader', {
+      name: /Poikkeusreitti · Pysäkki · tiedoteprioriteetti 1000/,
+    }),
+  ).toHaveCount(1);
   await expect(page.getByText('Tuntematon vaikutus', { exact: false }).first()).toBeVisible();
   await expect(
     page.getByText(/Fölin antamissa prioriteettiluvuissa pienempi luku tarkoittaa tärkeämpää/),
@@ -226,7 +230,9 @@ test('explorers use readable labels and a useful default profile', async ({ page
   await expect(page.getByText('other cause', { exact: true })).toHaveCount(0);
   if (testInfo.project.name.startsWith('mobile')) {
     await expect(page.getByRole('navigation', { name: 'Päävalikko' })).toBeVisible();
-    await expect(page.getByText('Taulukkoa voi vierittää sivusuunnassa.')).toBeVisible();
+    await expect(
+      page.locator('#stops').getByText('Taulukkoa voi vierittää sivusuunnassa.', { exact: true }),
+    ).toBeVisible();
   }
 });
 
@@ -234,16 +240,26 @@ test('missing alert priorities are presented as unknown', async ({ page }) => {
   await page.route(/\/data\/context\.json$/, async (route) => {
     const response = await route.fetch();
     const payload = (await response.json()) as { alerts: Array<{ priority: number }> };
-    payload.alerts[0].priority = -1;
+    for (const alert of payload.alerts) alert.priority = -1;
     await route.fulfill({ response, json: payload });
   });
   await page.goto('./#/en?view=table');
 
   const alerts = page.locator('#alerts');
+  // Narrow screens shorten the chart label to 'prio.'; the full wording stays in the table.
+  await expect(alerts.getByText(/(message priority|prio\.) unknown/).first()).toBeVisible();
+  await expect(alerts.getByText('message priority -1', { exact: false })).toHaveCount(0);
+});
+
+test('daily trend replaces the stop-change list and marks holidays', async ({ page }) => {
+  await page.goto('./#/en?view=table');
+  const daily = page.locator('#daily');
+  await expect(daily.getByRole('heading', { name: 'Late and early running by day' })).toBeVisible();
+  await daily.getByText('Datataulukko / Data table').click();
   await expect(
-    alerts.getByText('Detour · Message priority: unknown', { exact: true }),
+    daily.getByRole('row', { name: /Weekends and holidays \(holiday\)/ }).first(),
   ).toBeVisible();
-  await expect(alerts.getByText('Message priority: -1', { exact: false })).toHaveCount(0);
+  await expect(page.getByText(/Largest stop-level p90 changes/)).toHaveCount(0);
 });
 
 test('line explorer only advertises lines with hourly profiles', async ({ page }) => {

@@ -4,9 +4,11 @@ import {
   formatAlertPriority,
   formatDate,
   formatDuration,
+  formatInterval,
   formatMinutes,
   formatNumber,
   formatPercent,
+  formatSigned,
 } from '../format';
 
 describe('reader-facing formatting', () => {
@@ -29,5 +31,14 @@ describe('reader-facing formatting', () => {
     expect(formatAlertPriority(-1, 'unknown')).toBe('unknown');
     expect(formatAlertPriority(0, 'unknown')).toBe('0');
     expect(formatAlertPriority(1000, 'unknown')).toBe('1000');
+  });
+
+  it('formats trip-level intervals and signed differences', () => {
+    expect(formatInterval(16.61, 20.6, 'fi', '%')).toBe(' (95 %: 16,6–20,6 %)');
+    expect(formatInterval(1.75, 2.59, 'en', 'pp')).toBe(' (95%: 1.8–2.6 pp)');
+    expect(formatInterval(null, 2, 'en', 'min')).toBe('');
+    expect(formatSigned(2.16, 'en')).toBe('+2.2');
+    expect(formatSigned(-0.4, 'fi')).toBe('−0,4');
+    expect(formatSigned(0, 'en')).toBe('0');
   });
 });

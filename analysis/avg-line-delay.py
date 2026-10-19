@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 
 from _shared import (
+    holiday_dates_for_args,
     QUALIFIED_DELAY_FILTER_SQL,
     add_common_args,
     add_bucket_arg,
@@ -48,7 +49,9 @@ def main() -> None:
             quality_mode=args.quality_mode,
             exclude_stop_call_disagreement=args.exclude_stop_call_disagreement,
         )
-        buckets = aggregate_delay_buckets(df, bucket=args.bucket, timezone=args.timezone)
+        buckets = aggregate_delay_buckets(
+        df, bucket=args.bucket, timezone=args.timezone, holidays=holiday_dates_for_args(args)
+    )
         metrics = summarize_delay_metrics(
             buckets,
             ["line_ref"],

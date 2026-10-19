@@ -37,7 +37,12 @@ def load_quality_rows_for_args(args: Namespace) -> pl.DataFrame:
 def load_delay_buckets_for_args(args: Namespace) -> pl.DataFrame:
     if getattr(args, "no_cache", False):
         quality_rows = load_quality_rows_for_args(args)
-        return aggregate_delay_buckets(quality_rows, bucket=args.bucket, timezone=args.timezone)
+        return aggregate_delay_buckets(
+            quality_rows,
+            bucket=args.bucket,
+            timezone=args.timezone,
+            holidays=settings_from_args(args).resolved().holiday_dates(),
+        )
     settings = settings_from_args(args)
     ensure_analysis_cache(settings, force=getattr(args, "force_cache", False))
     return read_table(settings.cache_dir, DELAY_BUCKETS_NAME)

@@ -81,6 +81,15 @@ def parse_args() -> argparse.Namespace:
         help="Minimum buckets required for grouped metrics. Defaults to 30.",
     )
     parser.add_argument(
+        "--min-trips",
+        type=int,
+        default=10,
+        help=(
+            "Minimum distinct trips required for grouped metrics. Buckets from one trip are "
+            "correlated, so this guards against single-trip results. Defaults to 10."
+        ),
+    )
+    parser.add_argument(
         "--rush-window",
         action="append",
         default=None,
@@ -98,6 +107,12 @@ def parse_args() -> argparse.Namespace:
         "--gtfs-dir",
         type=Path,
         help="GTFS directory containing routes.txt for alert route mapping.",
+    )
+    parser.add_argument(
+        "--gtfs-root",
+        type=Path,
+        default=Path("data/gtfs"),
+        help="Root of gtfs_YYYY-MM-DD snapshots used for holidays, routes and schedules.",
     )
     parser.add_argument(
         "--force",
@@ -127,10 +142,12 @@ def main() -> None:
         timezone=args.timezone,
         limit=args.limit,
         min_observations=args.min_observations,
+        min_trips=args.min_trips,
         exclude_stop_call_disagreement=args.exclude_stop_call_disagreement,
         rush_windows=tuple(args.rush_window or DEFAULT_RUSH_WINDOWS),
         include_weekends=args.include_weekends,
         gtfs_dir=args.gtfs_dir,
+        gtfs_root=args.gtfs_root,
     )
     cache_result = ensure_report_cache(
         settings,

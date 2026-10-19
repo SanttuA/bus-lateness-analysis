@@ -12,6 +12,7 @@ from _shared import (
     round_numeric,
     write_optional_csv,
 )
+from collector_gaps import missing_spots, missing_summary_rows, source_summaries
 
 
 def parse_args() -> argparse.Namespace:
@@ -69,127 +70,29 @@ def load_polls(args: argparse.Namespace) -> pd.DataFrame:
         return read_sql(con, query, params)
 
 
+def _poll_records(polls: pd.DataFrame) -> list[dict[str, object]]:
+    return polls.astype(object).where(polls.notna(), None).to_dict("records")
+
+
 def build_missing_spots(
     polls: pd.DataFrame,
-    gap_multiplier: float,
-    min_missing_minutes: float,
+    gap_multiplier: float = 2.0,
+    min_missing_minutes: float = 0.0,
 ) -> pd.DataFrame:
-    rows: list[dict[str, object]] = []
-    if polls.empty:
-        return pd.DataFrame()
-
-    polls = polls.copy()
-    polls["attempted_at_utc"] = pd.to_datetime(
-        polls["attempted_at_utc"],
-        utc=True,
-        errors="coerce",
+    """Gaps between consecutive successful polls (shared definition in collector_gaps)."""
+    rows = missing_spots(
+        _poll_records(polls),
+        gap_multiplier=gap_multiplier,
+        min_missing_minutes=min_missing_minutes,
     )
-    polls["collected_at_utc"] = pd.to_datetime(
-        polls["collected_at_utc"],
-        utc=True,
-        errors="coerce",
-    )
-
-    for source, source_df in polls.groupby("source"):
-        source_df = source_df.sort_values("attempted_at_utc")
-        successful = source_df[source_df["ok"] == 1].copy()
-        successful_gaps = successful["gap_seconds_since_previous_success"].dropna()
-        successful_gaps = successful_gaps[successful_gaps > 0]
-        if successful_gaps.empty:
-            continue
-
-        expected_cadence_seconds = float(successful_gaps.median())
-        successful = successful.dropna(subset=["collected_at_utc"])
-        previous_success_at: pd.Timestamp | None = None
-
-        for success in successful.itertuples(index=False):
-            current_success_at = success.collected_at_utc
-            if previous_success_at is None:
-                previous_success_at = current_success_at
-                continue
-
-            gap_seconds = (current_success_at - previous_success_at).total_seconds()
-            missing_seconds = max(0.0, gap_seconds - expected_cadence_seconds)
-            if gap_seconds <= gap_multiplier * expected_cadence_seconds:
-                previous_success_at = current_success_at
-                continue
-            if missing_seconds / 60.0 < min_missing_minutes:
-                previous_success_at = current_success_at
-                continue
-
-            failed_attempts = source_df[
-                (source_df["attempted_at_utc"] > previous_success_at)
-                & (source_df["attempted_at_utc"] < current_success_at)
-                & (source_df["ok"] != 1)
-            ]
-            avg_rows_per_success = successful["row_count"].mean()
-            estimated_missed_polls = missing_seconds / expected_cadence_seconds
-            estimated_missed_rows = estimated_missed_polls * avg_rows_per_success
-
-            rows.append(
-                {
-                    "source": source,
-                    "gap_start_utc": previous_success_at.isoformat(),
-                    "gap_end_utc": current_success_at.isoformat(),
-                    "gap_min": gap_seconds / 60.0,
-                    "expected_cadence_seconds": expected_cadence_seconds,
-                    "missing_min": missing_seconds / 60.0,
-                    "estimated_missed_polls": estimated_missed_polls,
-                    "estimated_missed_rows": estimated_missed_rows,
-                    "failed_attempt_count": int(failed_attempts.shape[0]),
-                    "next_success_status": success.status,
-                }
-            )
-            previous_success_at = current_success_at
-
-    result = pd.DataFrame(rows)
-    if result.empty:
-        return result
-    result = result.sort_values(["missing_min", "source"], ascending=[False, True])
-    return round_numeric(result)
+    return round_numeric(pd.DataFrame(rows)) if rows else pd.DataFrame()
 
 
 def summarize_missing_spots(spots: pd.DataFrame, polls: pd.DataFrame) -> pd.DataFrame:
+    del spots  # Recomputed from the polls with the shared gap definition.
     if polls.empty:
         return pd.DataFrame()
-
-    summary_rows: list[dict[str, object]] = []
-    spot_groups = spots.groupby("source") if not spots.empty else {}
-
-    for source, source_df in polls.groupby("source"):
-        source_spots = (
-            spot_groups.get_group(source)
-            if not spots.empty and source in spot_groups.groups
-            else pd.DataFrame()
-        )
-        summary_rows.append(
-            {
-                "source": source,
-                "poll_count": int(source_df.shape[0]),
-                "success_count": int((source_df["ok"] == 1).sum()),
-                "failed_count": int((source_df["ok"] != 1).sum()),
-                "missing_spot_count": int(source_spots.shape[0]),
-                "total_missing_min": source_spots["missing_min"].sum()
-                if not source_spots.empty
-                else 0.0,
-                "largest_missing_min": source_spots["missing_min"].max()
-                if not source_spots.empty
-                else 0.0,
-                "estimated_missed_polls": source_spots["estimated_missed_polls"].sum()
-                if not source_spots.empty
-                else 0.0,
-                "estimated_missed_rows": source_spots["estimated_missed_rows"].sum()
-                if not source_spots.empty
-                else 0.0,
-            }
-        )
-
-    result = pd.DataFrame(summary_rows)
-    result = result.sort_values(
-        ["total_missing_min", "missing_spot_count", "source"],
-        ascending=[False, False, True],
-    )
-    return round_numeric(result)
+    return round_numeric(pd.DataFrame(missing_summary_rows(source_summaries(_poll_records(polls)))))
 
 
 def main() -> None:

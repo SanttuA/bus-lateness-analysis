@@ -34,6 +34,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timezone", default=DEFAULT_TIMEZONE)
     parser.add_argument("--limit", type=int, default=20)
     parser.add_argument("--min-observations", type=int, default=30)
+    parser.add_argument("--min-trips", type=int, default=10)
     parser.add_argument("--rush-window", action="append", default=None)
     parser.add_argument("--include-weekends", action="store_true")
     parser.add_argument("--gtfs-dir", type=Path)
@@ -62,6 +63,7 @@ def main() -> None:
         timezone=args.timezone,
         limit=args.limit,
         min_observations=args.min_observations,
+        min_trips=args.min_trips,
         exclude_stop_call_disagreement=args.exclude_stop_call_disagreement,
         rush_windows=tuple(args.rush_window or DEFAULT_RUSH_WINDOWS),
         include_weekends=args.include_weekends,

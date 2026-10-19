@@ -45,6 +45,7 @@ Thumbs.db
 .idea/
 .codex
 .codex/
+.claude-notes/
 
 # React site
 node_modules/

@@ -10,14 +10,14 @@ export function MetricStrip({
   overview: OverviewPayload;
 }) {
   const copy = t(language);
-  const { summary, meta } = overview;
+  const { summary } = overview;
   const metrics = [
-    { value: formatNumber(summary.bucket_count, language), label: copy.kpiBuckets },
-    { value: formatNumber(summary.line_count, language), label: copy.kpiLines },
-    { value: formatNumber(summary.stop_count, language), label: copy.kpiStops },
-    { value: formatMinutes(summary.p90_delay_min, language, 2), label: copy.kpiP90 },
-    { value: formatPercent(summary.pct_over_5_min_late, language, 2), label: copy.kpiLate },
-    { value: formatPercent(meta.conservative_excluded_pct, language, 2), label: copy.kpiExcluded },
+    { value: formatPercent(summary.pct_on_time, language, 1), label: copy.kpiOnTime },
+    { value: formatPercent(summary.pct_over_5_min_late, language, 1), label: copy.kpiLate },
+    { value: formatPercent(summary.pct_over_3_min_early, language, 1), label: copy.kpiEarly },
+    { value: formatMinutes(summary.p90_delay_min, language, 1), label: copy.kpiP90 },
+    { value: formatNumber(summary.trip_count, language), label: copy.kpiTrips },
+    { value: formatNumber(summary.day_count, language), label: copy.kpiDays },
   ];
   return (
     <dl className="metric-strip">

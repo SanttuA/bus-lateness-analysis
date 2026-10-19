@@ -60,6 +60,7 @@ class CachedArgs:
         self.cache_dir = cache_dir
         self.limit = limit
         self.min_observations = min_observations
+        self.min_trips = 1
         self.quality_mode = "conservative"
         self.bucket = "trip-stop"
         self.timezone = "Europe/Helsinki"
@@ -104,7 +105,7 @@ class ResultsReportCacheTests(unittest.TestCase):
             self.assertEqual(bucket, (120.0, 2))
             self.assertEqual(excluded, 0)
 
-    def test_midpoint_change_uses_matched_stop_contexts(self) -> None:
+    def test_daily_profile_replaces_midpoint_split_and_reports_coverage(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "foli.db"
             create_report_db(db_path)
@@ -113,22 +114,44 @@ class ResultsReportCacheTests(unittest.TestCase):
             result = ensure_report_cache(settings, force=True)
 
             with duckdb.connect(str(result.cache_db), read_only=True) as con:
-                row = con.execute(
+                tables = {
+                    row[0]
+                    for row in con.execute("SELECT table_name FROM information_schema.tables").fetchall()
+                }
+                daily = con.execute(
                     """
-                    SELECT
-                        stop_id,
-                        baseline_p90_delay_min,
-                        comparison_p90_delay_min,
-                        p90_delay_change_min
-                    FROM stop_midpoint_change
-                    WHERE stop_id = '10'
+                    SELECT CAST(local_date AS VARCHAR), day_type, bucket_count, trip_count,
+                        collector_coverage_pct IS NOT NULL
+                    FROM daily_network_profile
+                    ORDER BY local_date
                     """
-                ).fetchone()
+                ).fetchall()
 
-            self.assertEqual(row[0], "10")
-            self.assertAlmostEqual(row[1], 2.0)
-            self.assertAlmostEqual(row[2], 10.0)
-            self.assertAlmostEqual(row[3], 8.0)
+            self.assertNotIn("stop_midpoint_change", tables)
+            self.assertEqual(
+                [row[:4] for row in daily],
+                [("2026-04-23", "weekday", 1, 1), ("2026-04-30", "weekday", 2, 2)],
+            )
+            self.assertTrue(all(row[4] for row in daily))
+
+    def test_alerts_skip_cancellations_and_report_them_separately(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "foli.db"
+            create_report_db(db_path)
+            settings = report_settings(db_path, Path(temp_dir) / "cache")
+
+            result = ensure_report_cache(settings, force=True)
+
+            with duckdb.connect(str(result.cache_db), read_only=True) as con:
+                inventory = con.execute(
+                    "SELECT alert_key, included, exclusion_reason FROM service_alert_inventory"
+                ).fetchall()
+                cancellations = con.execute(
+                    "SELECT line_ref, cause, cancelled_departures FROM service_cancellations"
+                ).fetchall()
+
+            self.assertEqual(inventory, [("alert-1", True, None)])
+            self.assertEqual(cancellations, [("4", "TECHNICAL_PROBLEM", 1)])
 
     def test_cache_builds_collector_coverage_tables(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -276,7 +299,7 @@ class ResultsReportCacheTests(unittest.TestCase):
             self.assertAlmostEqual(result.loc[0, "median_delay_min"], 6.0)
             self.assertAlmostEqual(result.loc[0, "p90_delay_min"], 9.2)
 
-    def test_cached_robust_line_ranking_matches_legacy_bucket_tie_order(self) -> None:
+    def test_cached_robust_line_ranking_ties_favour_larger_samples(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "foli.db"
             cache_dir = Path(temp_dir) / "cache"
@@ -329,34 +352,7 @@ class ResultsReportCacheTests(unittest.TestCase):
                         line_ref="large",
                     ),
                 ]
-                con.executemany(
-                    """
-                    INSERT INTO vehicle_observations (
-                        id,
-                        poll_id,
-                        vehicle_id,
-                        recorded_at_utc,
-                        valid_until_utc,
-                        line_ref,
-                        direction_ref,
-                        origin_aimed_departure_time_utc,
-                        trip_match_key,
-                        is_gtfs_matchable,
-                        published_line_name,
-                        delay_seconds,
-                        next_stop_point_ref,
-                        next_stop_point_name,
-                        next_aimed_arrival_time_utc,
-                        next_expected_arrival_time_utc,
-                        next_aimed_departure_time_utc,
-                        next_expected_departure_time_utc,
-                        destination_aimed_arrival_time_utc,
-                        created_at_utc
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    rows,
-                )
+                insert_observations(con, rows)
 
             result = cached_line_rankings(
                 CachedArgs(db_path, cache_dir, limit=5, min_observations=1),
@@ -376,14 +372,14 @@ class ResultsReportCacheTests(unittest.TestCase):
             )
             legacy_result = sort_robust_delay_metrics(legacy_metrics, limit=5)
 
-            self.assertEqual(result["line_ref"].to_list(), ["alpha", "small", "large"])
-            self.assertEqual(result["bucket_count"].to_list(), [1, 1, 2])
+            self.assertEqual(result["line_ref"].to_list(), ["large", "alpha", "small"])
+            self.assertEqual(result["bucket_count"].to_list(), [2, 1, 1])
             self.assertEqual(
                 result["line_ref"].to_list(),
                 legacy_result["line_ref"].astype(str).to_list(),
             )
 
-    def test_cached_context_ranking_matches_legacy_bucket_tie_order(self) -> None:
+    def test_cached_context_ranking_ties_favour_larger_samples(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "foli.db"
             cache_dir = Path(temp_dir) / "cache"
@@ -425,34 +421,7 @@ class ResultsReportCacheTests(unittest.TestCase):
                         line_ref="large",
                     ),
                 ]
-                con.executemany(
-                    """
-                    INSERT INTO vehicle_observations (
-                        id,
-                        poll_id,
-                        vehicle_id,
-                        recorded_at_utc,
-                        valid_until_utc,
-                        line_ref,
-                        direction_ref,
-                        origin_aimed_departure_time_utc,
-                        trip_match_key,
-                        is_gtfs_matchable,
-                        published_line_name,
-                        delay_seconds,
-                        next_stop_point_ref,
-                        next_stop_point_name,
-                        next_aimed_arrival_time_utc,
-                        next_expected_arrival_time_utc,
-                        next_aimed_departure_time_utc,
-                        next_expected_departure_time_utc,
-                        destination_aimed_arrival_time_utc,
-                        created_at_utc
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    rows,
-                )
+                insert_observations(con, rows)
 
             args = CachedArgs(db_path, cache_dir, limit=5, min_observations=1)
             cached = cached_context_delay_metrics(args)
@@ -470,8 +439,8 @@ class ResultsReportCacheTests(unittest.TestCase):
             )
             legacy = sort_robust_delay_metrics(legacy_metrics, limit=5)
 
-            self.assertEqual(cached["line_ref"].to_list(), ["small", "large"])
-            self.assertEqual(cached["bucket_count"].to_list(), [1, 2])
+            self.assertEqual(cached["line_ref"].to_list(), ["large", "small"])
+            self.assertEqual(cached["bucket_count"].to_list(), [2, 1])
             self.assertEqual(
                 cached["line_ref"].to_list(),
                 legacy["line_ref"].astype(str).to_list(),
@@ -506,34 +475,7 @@ class ResultsReportCacheTests(unittest.TestCase):
                         "Market",
                     ),
                 ]
-                con.executemany(
-                    """
-                    INSERT INTO vehicle_observations (
-                        id,
-                        poll_id,
-                        vehicle_id,
-                        recorded_at_utc,
-                        valid_until_utc,
-                        line_ref,
-                        direction_ref,
-                        origin_aimed_departure_time_utc,
-                        trip_match_key,
-                        is_gtfs_matchable,
-                        published_line_name,
-                        delay_seconds,
-                        next_stop_point_ref,
-                        next_stop_point_name,
-                        next_aimed_arrival_time_utc,
-                        next_expected_arrival_time_utc,
-                        next_aimed_departure_time_utc,
-                        next_expected_departure_time_utc,
-                        destination_aimed_arrival_time_utc,
-                        created_at_utc
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    rows,
-                )
+                insert_observations(con, rows)
 
             result = alert_observation_buckets(
                 CachedArgs(db_path, cache_dir, limit=5, min_observations=1),
@@ -554,54 +496,34 @@ class ResultsReportCacheTests(unittest.TestCase):
             create_report_db(db_path)
             with sqlite3.connect(db_path) as con:
                 con.execute("DELETE FROM vehicle_observations")
-                con.execute(
-                    """
-                    INSERT INTO vehicle_observations (
-                        id,
-                        poll_id,
-                        vehicle_id,
-                        recorded_at_utc,
-                        valid_until_utc,
-                        line_ref,
-                        direction_ref,
-                        origin_aimed_departure_time_utc,
-                        trip_match_key,
-                        is_gtfs_matchable,
-                        published_line_name,
-                        delay_seconds,
-                        next_stop_point_ref,
-                        next_stop_point_name,
-                        next_aimed_arrival_time_utc,
-                        next_expected_arrival_time_utc,
-                        next_aimed_departure_time_utc,
-                        next_expected_departure_time_utc,
-                        destination_aimed_arrival_time_utc,
-                        created_at_utc
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        1,
-                        1,
-                        "missing-recorded",
-                        None,
-                        "2026-04-24T00:02:30Z",
-                        "3",
-                        "1",
-                        None,
-                        "missing-recorded-trip",
-                        1,
-                        "3",
-                        300,
-                        "10",
-                        "Market",
-                        "2026-04-24T00:01:00Z",
-                        "2026-04-24T00:06:00Z",
-                        None,
-                        None,
-                        "2026-04-24T01:00:00Z",
-                        "2026-04-24T00:00:30Z",
-                    ),
+                insert_observations(
+                    con,
+                    [
+                        (
+                            1,
+                            1,
+                            "missing-recorded",
+                            None,
+                            "2026-04-24T00:02:30Z",
+                            "3",
+                            "1",
+                            None,
+                            "missing-recorded-trip",
+                            1,
+                            "3",
+                            300,
+                            "10",
+                            "Market",
+                            "2026-04-24T00:01:00Z",
+                            "2026-04-24T00:06:00Z",
+                            None,
+                            None,
+                            "2026-04-24T01:00:00Z",
+                            "2026-04-24T00:00:30Z",
+                            None,
+                            None,
+                        ),
+                    ],
                 )
 
             cache = ensure_analysis_cache(
@@ -656,6 +578,8 @@ class ResultsReportCacheTests(unittest.TestCase):
                     str(report_path),
                     "--min-observations",
                     "1",
+                    "--min-trips",
+                    "1",
                     "--limit",
                     "5",
                 ],
@@ -698,6 +622,8 @@ class ResultsReportCacheTests(unittest.TestCase):
                     "--output-csv",
                     str(output_csv),
                     "--min-observations",
+                    "1",
+                    "--min-trips",
                     "1",
                     "--limit",
                     "5",
@@ -773,7 +699,7 @@ class ResultsReportCacheTests(unittest.TestCase):
             self.assertRegex(text, r"- Cache/build: \d+\.\d{2}s")
             self.assertRegex(text, r"- Report render: \d+\.\d{2}s")
             self.assertRegex(text, r"- Total report run: \d+\.\d{2}s")
-            self.assertIn("## Stop-Level Midpoint Changes", text)
+            self.assertIn("## Daily Network Profile", text)
             self.assertIn("Cached CSV:", text)
 
 
@@ -783,6 +709,42 @@ def report_settings(db_path: Path, cache_dir: Path) -> ReportSettings:
         cache_dir=cache_dir,
         limit=5,
         min_observations=1,
+        min_trips=1,
+    )
+
+
+OBSERVATION_COLUMNS = [
+    "id",
+    "poll_id",
+    "vehicle_id",
+    "recorded_at_utc",
+    "valid_until_utc",
+    "line_ref",
+    "direction_ref",
+    "origin_aimed_departure_time_utc",
+    "trip_match_key",
+    "is_gtfs_matchable",
+    "published_line_name",
+    "delay_seconds",
+    "next_stop_point_ref",
+    "next_stop_point_name",
+    "next_aimed_arrival_time_utc",
+    "next_expected_arrival_time_utc",
+    "next_aimed_departure_time_utc",
+    "next_expected_departure_time_utc",
+    "destination_aimed_arrival_time_utc",
+    "created_at_utc",
+    "origin_ref",
+    "destination_name",
+]
+
+
+def insert_observations(con: sqlite3.Connection, rows: list[tuple[object, ...]]) -> None:
+    columns = ", ".join(OBSERVATION_COLUMNS)
+    placeholders = ", ".join("?" for _ in OBSERVATION_COLUMNS)
+    con.executemany(
+        f"INSERT INTO vehicle_observations ({columns}) VALUES ({placeholders})",
+        rows,
     )
 
 
@@ -821,10 +783,13 @@ def create_report_db(db_path: Path) -> None:
                 next_aimed_departure_time_utc TEXT,
                 next_expected_departure_time_utc TEXT,
                 destination_aimed_arrival_time_utc TEXT,
-                created_at_utc TEXT
+                created_at_utc TEXT,
+                origin_ref TEXT,
+                destination_name TEXT
             );
 
             CREATE TABLE service_alerts (
+                alert_type TEXT,
                 source_alert_id TEXT,
                 line_ref TEXT,
                 cause TEXT,
@@ -835,6 +800,9 @@ def create_report_db(db_path: Path) -> None:
                 validity_end_utc TEXT,
                 affected_routes_json TEXT,
                 affected_stops_json TEXT,
+                departure_time_utc TEXT,
+                repeat_json TEXT,
+                header TEXT,
                 created_at_utc TEXT
             );
             """
@@ -916,63 +884,68 @@ def create_report_db(db_path: Path) -> None:
                 "Airport",
             ),
         ]
-        con.executemany(
-            """
-            INSERT INTO vehicle_observations (
-                id,
-                poll_id,
-                vehicle_id,
-                recorded_at_utc,
-                valid_until_utc,
-                line_ref,
-                direction_ref,
-                origin_aimed_departure_time_utc,
-                trip_match_key,
-                is_gtfs_matchable,
-                published_line_name,
-                delay_seconds,
-                next_stop_point_ref,
-                next_stop_point_name,
-                next_aimed_arrival_time_utc,
-                next_expected_arrival_time_utc,
-                next_aimed_departure_time_utc,
-                next_expected_departure_time_utc,
-                destination_aimed_arrival_time_utc,
-                created_at_utc
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            rows,
+        insert_observations(con, rows)
+        alert_columns = (
+            "alert_type, source_alert_id, line_ref, cause, effect, priority, is_active, "
+            "validity_start_utc, validity_end_utc, affected_routes_json, affected_stops_json, "
+            "departure_time_utc, repeat_json, header, created_at_utc"
         )
-        con.execute(
-            """
-            INSERT INTO service_alerts (
-                source_alert_id,
-                line_ref,
-                cause,
-                effect,
-                priority,
-                is_active,
-                validity_start_utc,
-                validity_end_utc,
-                affected_routes_json,
-                affected_stops_json,
-                created_at_utc
-            )
-            VALUES (
-                'alert-1',
-                '3',
-                'construction',
-                'delay',
-                1,
-                1,
-                '2026-04-30T07:00:00Z',
-                '2026-04-30T09:00:00Z',
-                '[]',
-                '[]',
-                '2026-04-30T07:00:00Z'
-            )
-            """
+        con.executemany(
+            f"INSERT INTO service_alerts ({alert_columns}) VALUES "
+            "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    "message",
+                    "alert-1",
+                    "3",
+                    "construction",
+                    "delay",
+                    1,
+                    1,
+                    "2026-04-30T07:00:00Z",
+                    "2026-04-30T09:00:00Z",
+                    '["3"]',
+                    "[]",
+                    None,
+                    None,
+                    "Line 3 detour",
+                    "2026-04-30T07:00:00Z",
+                ),
+                (
+                    "message",
+                    "alert-1",
+                    "3",
+                    "construction",
+                    "delay",
+                    1,
+                    1,
+                    "2026-04-30T07:00:00Z",
+                    "2026-04-30T09:00:00Z",
+                    '["3"]',
+                    "[]",
+                    None,
+                    None,
+                    "Line 3 detour",
+                    "2026-04-30T08:55:00Z",
+                ),
+                (
+                    "cancellation",
+                    None,
+                    "4",
+                    "TECHNICAL_PROBLEM",
+                    None,
+                    1200,
+                    1,
+                    None,
+                    None,
+                    '["4"]',
+                    '["20"]',
+                    "2026-04-30T08:05:00Z",
+                    None,
+                    None,
+                    "2026-04-30T07:30:00Z",
+                ),
+            ],
         )
 
 
@@ -1012,6 +985,8 @@ def observation_row(
         None,
         timestamp_plus_seconds(recorded_at_utc, 3600),
         timestamp_plus_seconds(recorded_at_utc, 30),
+        "1",
+        "Terminal",
     )
 
 

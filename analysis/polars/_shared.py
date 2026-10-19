@@ -3,9 +3,18 @@ from __future__ import annotations
 import argparse
 from bisect import bisect_right
 from datetime import UTC, date, datetime
+import os
 from pathlib import Path
 import re
 from zoneinfo import ZoneInfo
+
+# Polars allocates through jemalloc, which keeps freed pages for a while. Returning them
+# quickly keeps the multi-stage cache build near its per-stage peak (~2 GB instead of
+# ~5 GB on the full database). Must be set before polars is first imported.
+os.environ.setdefault(
+    "_RJEM_MALLOC_CONF",
+    "background_thread:true,dirty_decay_ms:500,muzzy_decay_ms:500",
+)
 
 import polars as pl
 import polars.selectors as cs
@@ -17,6 +26,7 @@ DEFAULT_GTFS_ROOT = PROJECT_ROOT / "data" / "gtfs"
 DEFAULT_ANALYSIS_CACHE_DIR = PROJECT_ROOT / "outputs" / "polars-report-cache"
 DEFAULT_TIMEZONE = "Europe/Helsinki"
 DEFAULT_RUSH_WINDOWS = ("07:00-09:00", "15:00-18:00")
+DEFAULT_OFFPEAK_WINDOWS = ("09:00-15:00",)
 QUALITY_MODES = ("conservative", "diagnostic", "raw")
 BUCKET_MODES = ("poll", "trip-stop", "vehicle-trip", "line-hour")
 DEFAULT_QUALITY_MODE = "conservative"
@@ -26,6 +36,11 @@ STALE_OBSERVATION_SECONDS = 5 * 60
 PRE_TRIP_GRACE_SECONDS = 15 * 60
 POST_TRIP_GRACE_SECONDS = 30 * 60
 STOP_CALL_DISAGREEMENT_SECONDS = 10 * 60
+PLACEHOLDER_ZERO_STOP_CALL_SECONDS = 60
+NO_REALTIME_MIN_STOPS = 10
+ON_TIME_EARLY_SECONDS = 60
+ON_TIME_LATE_SECONDS = 180
+TRIP_KEY_COLUMNS = ["trip_match_key", "vehicle_id"]
 
 QUALIFIED_DELAY_FILTER_SQL = """
     v.is_gtfs_matchable = 1
@@ -43,6 +58,8 @@ QUALITY_SELECT_SQL = """
     v.line_ref,
     v.direction_ref,
     v.origin_aimed_departure_time_utc,
+    v.origin_ref,
+    v.destination_name,
     v.trip_match_key,
     v.published_line_name,
     v.delay_seconds,
@@ -65,14 +82,31 @@ QUALITY_FLAG_COLUMNS = [
     "is_stale_observation",
     "is_pre_trip_observation",
     "is_post_trip_observation",
+    "is_origin_layover",
+    "is_no_realtime_trip",
     "has_stop_call_disagreement",
+    "is_placeholder_zero",
 ]
 
+# Rows excluded by the conservative quality mode. Two of them target placeholder zero
+# delays: Föli reports delay 0 while a bus waits at its origin before departure and for
+# trips without realtime prediction, which otherwise inflate on-time shares.
 CONSERVATIVE_EXCLUSION_COLUMNS = [
     "is_implausible_delay",
     "is_stale_observation",
     "is_pre_trip_observation",
     "is_post_trip_observation",
+    "is_origin_layover",
+    "is_no_realtime_trip",
+]
+
+# Exclusions that indicate unreliable data rather than a bus waiting before departure.
+# A line's share of these rows drives its low-quality flag.
+DATA_FAULT_COLUMNS = [
+    "is_implausible_delay",
+    "is_stale_observation",
+    "is_post_trip_observation",
+    "is_no_realtime_trip",
 ]
 
 GTFS_DIR_PATTERN = re.compile(r"^gtfs_(\d{4}-\d{2}-\d{2})$")
@@ -95,6 +129,12 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=1,
         help="Only include groups with at least this many observations.",
+    )
+    parser.add_argument(
+        "--min-trips",
+        type=int,
+        default=None,
+        help="Only include groups with at least this many distinct trips. Defaults to 10.",
     )
     parser.add_argument("--output-csv", type=Path, help="Optional CSV output path.")
 
@@ -327,7 +367,14 @@ def add_quality_flags(
     pre_trip_grace_seconds: int = PRE_TRIP_GRACE_SECONDS,
     post_trip_grace_seconds: int = POST_TRIP_GRACE_SECONDS,
     stop_call_disagreement_seconds: int = STOP_CALL_DISAGREEMENT_SECONDS,
+    trip_flags: bool = True,
 ) -> pl.DataFrame:
+    """Add row-level quality flags.
+
+    ``trip_flags=False`` leaves ``is_no_realtime_trip`` as False so callers that process
+    rows in batches can compute the trip-level flag once over all rows with
+    :func:`apply_no_realtime_trip_flag_lazy`.
+    """
     result = _ensure_columns(
         df,
         [
@@ -342,6 +389,10 @@ def add_quality_flags(
             "next_expected_arrival_time_utc",
             "next_aimed_departure_time_utc",
             "next_expected_departure_time_utc",
+            "next_stop_point_ref",
+            "origin_ref",
+            "trip_match_key",
+            "vehicle_id",
         ],
     )
     if result.is_empty():
@@ -414,13 +465,95 @@ def add_quality_flags(
         )
         .fill_null(False)
         .alias("is_post_trip_observation"),
+        # Waiting at the first stop before the scheduled departure: Föli reports delay 0
+        # for most of these rows, so they are not a measurement of punctuality.
+        (
+            (pl.col("next_stop_point_ref").cast(pl.Utf8) == pl.col("origin_ref").cast(pl.Utf8))
+            & (pl.col("recorded_at_utc") < pl.col("origin_aimed_departure_time_utc"))
+        )
+        .fill_null(False)
+        .alias("is_origin_layover"),
         (pl.col("stop_call_delay_diff_seconds") > stop_call_disagreement_seconds)
         .fill_null(False)
         .alias("has_stop_call_disagreement"),
+        (
+            (pl.col("delay_seconds") == 0)
+            & (pl.col("stop_call_delay_seconds").abs() > PLACEHOLDER_ZERO_STOP_CALL_SECONDS)
+        )
+        .fill_null(False)
+        .alias("is_placeholder_zero"),
     )
-    return result.with_columns(
-        pl.sum_horizontal([pl.col(column).cast(pl.Int64) for column in QUALITY_FLAG_COLUMNS]).alias(
-            "quality_issue_count"
+    if trip_flags:
+        result = result.with_columns(no_realtime_trip_expr().alias("is_no_realtime_trip"))
+    else:
+        result = result.with_columns(pl.lit(False).alias("is_no_realtime_trip"))
+    return result.with_columns(quality_issue_count_expr())
+
+
+def no_realtime_trip_expr() -> pl.Expr:
+    """Trips whose every delay reading is exactly 0 across many stops lack realtime data."""
+    return (
+        (pl.col("delay_seconds").abs().max().over(TRIP_KEY_COLUMNS) == 0)
+        & (
+            pl.col("next_stop_point_ref").drop_nulls().n_unique().over(TRIP_KEY_COLUMNS)
+            >= NO_REALTIME_MIN_STOPS
+        )
+    ).fill_null(False)
+
+
+def quality_issue_count_expr() -> pl.Expr:
+    return pl.sum_horizontal(
+        [pl.col(column).cast(pl.Int64) for column in QUALITY_FLAG_COLUMNS]
+    ).alias("quality_issue_count")
+
+
+def quality_pass_expr(
+    *,
+    quality_mode: str = DEFAULT_QUALITY_MODE,
+    exclude_stop_call_disagreement: bool = False,
+) -> pl.Expr:
+    if quality_mode in ("raw", "diagnostic"):
+        return pl.lit(True).alias("quality_pass")
+    exclusion_columns = CONSERVATIVE_EXCLUSION_COLUMNS.copy()
+    if exclude_stop_call_disagreement:
+        exclusion_columns.append("has_stop_call_disagreement")
+    return (~pl.any_horizontal([pl.col(column) for column in exclusion_columns])).alias(
+        "quality_pass"
+    )
+
+
+def no_realtime_trip_stats_lazy(quality_rows: pl.LazyFrame) -> pl.LazyFrame:
+    """One row per trip and vehicle (~100k rows) saying whether it lacks realtime data."""
+    return quality_rows.group_by(TRIP_KEY_COLUMNS).agg(
+        (
+            (pl.col("delay_seconds").abs().max() == 0)
+            & (pl.col("next_stop_point_ref").drop_nulls().n_unique() >= NO_REALTIME_MIN_STOPS)
+        ).alias("_no_realtime")
+    )
+
+
+def apply_no_realtime_trip_flag_lazy(
+    quality_rows: pl.LazyFrame,
+    *,
+    quality_mode: str = DEFAULT_QUALITY_MODE,
+    exclude_stop_call_disagreement: bool = False,
+    trip_stats: pl.LazyFrame | None = None,
+) -> pl.LazyFrame:
+    """Join the trip-level no-realtime flag onto rows and refresh quality_pass.
+
+    Pass precomputed ``trip_stats`` to flag one fragment at a time with bounded memory.
+    """
+    trips = trip_stats if trip_stats is not None else no_realtime_trip_stats_lazy(quality_rows)
+    return (
+        quality_rows.join(trips, on=TRIP_KEY_COLUMNS, how="left", nulls_equal=True)
+        .with_columns(pl.col("_no_realtime").fill_null(False).alias("is_no_realtime_trip"))
+        .drop("_no_realtime")
+        .with_columns(
+            quality_issue_count_expr(),
+            quality_pass_expr(
+                quality_mode=quality_mode,
+                exclude_stop_call_disagreement=exclude_stop_call_disagreement,
+            ),
         )
     )
 
@@ -430,17 +563,13 @@ def add_quality_pass(
     *,
     quality_mode: str = DEFAULT_QUALITY_MODE,
     exclude_stop_call_disagreement: bool = False,
+    trip_flags: bool = True,
 ) -> pl.DataFrame:
-    result = add_quality_flags(df)
-    if quality_mode in ("raw", "diagnostic"):
-        return result.with_columns(pl.lit(True).alias("quality_pass"))
-
-    exclusion_columns = CONSERVATIVE_EXCLUSION_COLUMNS.copy()
-    if exclude_stop_call_disagreement:
-        exclusion_columns.append("has_stop_call_disagreement")
+    result = add_quality_flags(df, trip_flags=trip_flags)
     return result.with_columns(
-        (~pl.any_horizontal([pl.col(column) for column in exclusion_columns])).alias(
-            "quality_pass"
+        quality_pass_expr(
+            quality_mode=quality_mode,
+            exclude_stop_call_disagreement=exclude_stop_call_disagreement,
         )
     )
 
@@ -467,37 +596,49 @@ def add_representative_time_columns(
     df: pl.DataFrame,
     *,
     timezone: str = DEFAULT_TIMEZONE,
+    holidays: tuple[str, ...] | list[str] = (),
 ) -> pl.DataFrame:
-    result = _ensure_columns(df, ["recorded_at_utc", "next_aimed_arrival_time_utc"])
-    result = result.with_columns(
-        _parse_datetime_expr("recorded_at_utc").alias("recorded_at_utc"),
-        _parse_datetime_expr("next_aimed_arrival_time_utc").alias("next_aimed_arrival_time_utc"),
-    )
-    result = result.with_columns(
-        pl.coalesce("next_aimed_arrival_time_utc", "recorded_at_utc").alias(
-            "representative_time_utc"
-        )
-    )
-    result = add_local_time_columns(result, "representative_time_utc", timezone)
-    return result.with_columns(
-        pl.when(pl.col("is_weekday")).then(pl.lit("weekday")).otherwise(pl.lit("weekend")).alias(
-            "day_type"
-        )
+    return add_representative_time_columns_lazy(
+        df.lazy(),
+        timezone=timezone,
+        holidays=holidays,
+    ).collect()
+
+
+def _holiday_dates(holidays: tuple[str, ...] | list[str] | tuple[date, ...]) -> list[date]:
+    return sorted(
+        value if isinstance(value, date) else date.fromisoformat(str(value))
+        for value in holidays
     )
 
 
-def add_local_time_columns(df: pl.DataFrame, utc_column: str, timezone: str) -> pl.DataFrame:
+def add_local_time_columns(
+    df: pl.DataFrame | pl.LazyFrame,
+    utc_column: str,
+    timezone: str,
+    holidays: tuple[str, ...] | list[str] = (),
+) -> pl.DataFrame | pl.LazyFrame:
+    """Local calendar columns. Reduced-service holidays count as weekend days."""
     local = pl.col(utc_column).dt.convert_time_zone(timezone)
-    return df.with_columns(
+    holiday_list = _holiday_dates(holidays)
+    is_holiday = (
+        local.dt.date().is_in(pl.lit(pl.Series(holiday_list, dtype=pl.Date)).implode())
+        if holiday_list
+        else pl.lit(False)
+    )
+    result = df.with_columns(
         local.alias("local_time"),
         local.dt.date().alias("local_date"),
         local.dt.hour().cast(pl.Int64).alias("local_hour"),
         (local.dt.weekday() - 1).cast(pl.Int64).alias("local_weekday"),
-        ((local.dt.weekday() - 1) < 5).alias("is_weekday"),
+        is_holiday.alias("is_holiday"),
         (
             local.dt.hour().cast(pl.Int64) * 60
             + local.dt.minute().cast(pl.Int64)
         ).alias("local_minutes"),
+    )
+    return result.with_columns(
+        ((pl.col("local_weekday") < 5) & ~pl.col("is_holiday")).alias("is_weekday")
     )
 
 
@@ -506,13 +647,19 @@ def aggregate_delay_buckets(
     *,
     bucket: str = DEFAULT_BUCKET_MODE,
     timezone: str = DEFAULT_TIMEZONE,
+    holidays: tuple[str, ...] | list[str] = (),
 ) -> pl.DataFrame:
     if bucket not in BUCKET_MODES:
         raise ValueError(f"bucket must be one of: {', '.join(BUCKET_MODES)}")
     if df.is_empty():
         return empty_bucket_frame()
 
-    return aggregate_delay_buckets_lazy(df.lazy(), bucket=bucket, timezone=timezone).collect()
+    return aggregate_delay_buckets_lazy(
+        df.lazy(),
+        bucket=bucket,
+        timezone=timezone,
+        holidays=holidays,
+    ).collect()
 
 
 def aggregate_delay_buckets_lazy(
@@ -520,6 +667,7 @@ def aggregate_delay_buckets_lazy(
     *,
     bucket: str = DEFAULT_BUCKET_MODE,
     timezone: str = DEFAULT_TIMEZONE,
+    holidays: tuple[str, ...] | list[str] = (),
     partition_count: int | None = None,
     partition_index: int | None = None,
 ) -> pl.LazyFrame:
@@ -530,7 +678,7 @@ def aggregate_delay_buckets_lazy(
     if partition_count is not None and not (0 <= partition_index < partition_count):
         raise ValueError("partition_index must be between 0 and partition_count - 1")
 
-    working = add_representative_time_columns_lazy(df, timezone=timezone)
+    working = add_representative_time_columns_lazy(df, timezone=timezone, holidays=holidays)
     working = _ensure_lazy_columns(
         working,
         [
@@ -542,12 +690,15 @@ def aggregate_delay_buckets_lazy(
             "next_stop_point_ref",
             "published_line_name",
             "next_stop_point_name",
+            "destination_name",
         ],
     ).with_columns(
         pl.col("delay_seconds").cast(pl.Float64, strict=False),
         pl.col("line_ref").cast(pl.Utf8),
         pl.col("direction_ref").cast(pl.Utf8).fill_null("Unknown"),
         pl.col("next_stop_point_ref").cast(pl.Utf8),
+        pl.col("trip_match_key").cast(pl.Utf8),
+        pl.col("destination_name").cast(pl.Utf8),
         pl.coalesce(pl.col("published_line_name").cast(pl.Utf8), pl.col("line_ref").cast(pl.Utf8))
         .alias("published_line_name"),
     )
@@ -585,15 +736,22 @@ def aggregate_delay_buckets_lazy(
             ).hash(seed=0)
             working = working.filter((partition_key % partition_count) == partition_index)
 
+        trip_agg = (
+            []
+            if "trip_match_key" in group_keys
+            else [pl.lit(None, dtype=pl.Utf8).alias("trip_match_key")]
+        )
         result = working.group_by(group_keys).agg(
             pl.col("delay_seconds").median().alias("delay_seconds"),
             pl.len().alias("raw_poll_count"),
             pl.col("published_line_name").sort_by("representative_time_utc").first(),
             pl.col("next_stop_point_name").sort_by("representative_time_utc").first(),
+            pl.col("destination_name").sort_by("representative_time_utc").first(),
             pl.col("representative_time_utc").min(),
             pl.col("recorded_at_utc").min(),
             pl.col("recorded_at_utc").min().alias("first_recorded_at_utc"),
             pl.col("recorded_at_utc").max().alias("last_recorded_at_utc"),
+            *trip_agg,
         )
         result = result.with_columns(
             pl.concat_str(
@@ -604,7 +762,7 @@ def aggregate_delay_buckets_lazy(
         if "next_stop_point_ref" not in result.collect_schema().names():
             result = result.with_columns(pl.lit(None, dtype=pl.Utf8).alias("next_stop_point_ref"))
 
-    result = add_local_time_columns(result, "representative_time_utc", timezone)
+    result = add_local_time_columns(result, "representative_time_utc", timezone, holidays)
     result = result.with_columns(
         pl.when(pl.col("is_weekday")).then(pl.lit("weekday")).otherwise(pl.lit("weekend")).alias(
             "day_type"
@@ -623,6 +781,7 @@ def add_representative_time_columns_lazy(
     df: pl.LazyFrame,
     *,
     timezone: str = DEFAULT_TIMEZONE,
+    holidays: tuple[str, ...] | list[str] = (),
 ) -> pl.LazyFrame:
     result = _ensure_lazy_columns(df, ["recorded_at_utc", "next_aimed_arrival_time_utc"])
     result = result.with_columns(
@@ -634,7 +793,7 @@ def add_representative_time_columns_lazy(
             "representative_time_utc"
         )
     )
-    result = add_local_time_columns(result, "representative_time_utc", timezone)
+    result = add_local_time_columns(result, "representative_time_utc", timezone, holidays)
     return result.with_columns(
         pl.when(pl.col("is_weekday")).then(pl.lit("weekday")).otherwise(pl.lit("weekend")).alias(
             "day_type"
@@ -647,13 +806,35 @@ def summarize_delay_metrics(
     group_keys: list[str],
     *,
     min_observations: int = 1,
+    min_trips: int = 1,
     extra_aggs: dict[str, tuple[str, str]] | None = None,
 ) -> pl.DataFrame:
     if df.is_empty():
         return empty_metric_frame(group_keys)
+    return summarize_delay_metrics_lazy(
+        df.lazy(),
+        group_keys,
+        min_observations=min_observations,
+        min_trips=min_trips,
+        extra_aggs=extra_aggs,
+        maintain_order=True,
+    ).collect()
 
-    working = df.with_columns(pl.col("delay_seconds").cast(pl.Float64, strict=False))
-    if "raw_poll_count" not in working.columns:
+
+def summarize_delay_metrics_lazy(
+    df: pl.LazyFrame,
+    group_keys: list[str],
+    *,
+    min_observations: int = 1,
+    min_trips: int = 1,
+    extra_aggs: dict[str, tuple[str, str]] | None = None,
+    maintain_order: bool = False,
+) -> pl.LazyFrame:
+    working = _ensure_lazy_columns(df, ["trip_match_key", "local_date"]).with_columns(
+        pl.col("delay_seconds").cast(pl.Float64, strict=False)
+    )
+    schema_names = working.collect_schema().names()
+    if "raw_poll_count" not in schema_names:
         working = working.with_columns(pl.lit(1, dtype=pl.Int64).alias("raw_poll_count"))
     keys = group_keys.copy()
     if not keys:
@@ -664,28 +845,39 @@ def summarize_delay_metrics(
     for output, (column, how) in (extra_aggs or {}).items():
         if how != "first":
             raise ValueError("Polars extra_aggs currently supports only first aggregations.")
-        aggs.append(pl.col(column).first().alias(output))
+        if "representative_time_utc" in schema_names:
+            aggs.append(pl.col(column).sort_by("representative_time_utc").first().alias(output))
+        else:
+            aggs.append(pl.col(column).first().alias(output))
 
-    grouped = working.group_by(keys, maintain_order=True).agg(*aggs)
-    grouped = grouped.filter(pl.col("bucket_count") >= min_observations)
-    if "_scope" in grouped.columns:
+    keep = pl.col("bucket_count") >= min_observations
+    if min_trips > 1:
+        keep = keep & (pl.col("trip_count") >= min_trips)
+    grouped = working.group_by(keys, maintain_order=maintain_order).agg(*aggs).filter(keep)
+    if "_scope" in grouped.collect_schema().names():
         grouped = grouped.drop("_scope")
     return grouped
 
 
 def metric_aggs(prefix: str = "") -> list[pl.Expr]:
+    """Robust delay metrics. Column order is shared with the DuckDB ``_metric_select``."""
     delay = pl.col("delay_seconds")
     delay_min = delay / 60.0
     early_abs_min = delay.filter(delay < 0).abs() / 60.0
     return [
         pl.len().alias(f"{prefix}bucket_count"),
         pl.col("raw_poll_count").sum().cast(pl.Int64).alias(f"{prefix}raw_poll_count"),
+        pl.col("trip_match_key").drop_nulls().n_unique().cast(pl.Int64).alias(f"{prefix}trip_count"),
+        pl.col("local_date").drop_nulls().n_unique().cast(pl.Int64).alias(f"{prefix}day_count"),
         delay.mean().truediv(60.0).alias(f"{prefix}signed_mean_delay_min"),
         delay.mean().truediv(60.0).alias(f"{prefix}avg_delay_min"),
         delay.median().truediv(60.0).alias(f"{prefix}median_delay_min"),
         delay_min.quantile(0.75, interpolation="linear").alias(f"{prefix}p75_delay_min"),
         delay_min.quantile(0.90, interpolation="linear").alias(f"{prefix}p90_delay_min"),
         delay_min.quantile(0.95, interpolation="linear").alias(f"{prefix}p95_delay_min"),
+        (
+            (delay >= -ON_TIME_EARLY_SECONDS) & (delay <= ON_TIME_LATE_SECONDS)
+        ).mean().mul(100.0).alias(f"{prefix}pct_on_time"),
         (delay > 0).mean().mul(100.0).alias(f"{prefix}pct_late"),
         (delay > 180).mean().mul(100.0).alias(f"{prefix}pct_over_3_min_late"),
         (delay > 300).mean().mul(100.0).alias(f"{prefix}pct_over_5_min_late"),
@@ -701,6 +893,29 @@ def metric_aggs(prefix: str = "") -> list[pl.Expr]:
     ]
 
 
+METRIC_COLUMNS = [
+    "bucket_count",
+    "raw_poll_count",
+    "trip_count",
+    "day_count",
+    "signed_mean_delay_min",
+    "avg_delay_min",
+    "median_delay_min",
+    "p75_delay_min",
+    "p90_delay_min",
+    "p95_delay_min",
+    "pct_on_time",
+    "pct_late",
+    "pct_over_3_min_late",
+    "pct_over_5_min_late",
+    "pct_early",
+    "pct_over_1_min_early",
+    "pct_over_3_min_early",
+    "median_early_min_abs",
+    "p90_early_min_abs",
+]
+
+
 def sort_robust_delay_metrics(
     df: pl.DataFrame,
     *,
@@ -709,10 +924,22 @@ def sort_robust_delay_metrics(
 ) -> pl.DataFrame:
     if df.is_empty():
         return df
-    result = df.sort(
-        ["p90_delay_min", "pct_over_5_min_late", "bucket_count"],
-        descending=[not ascending, not ascending, ascending],
-    )
+    return sort_robust_delay_metrics_lazy(df.lazy(), limit=limit, ascending=ascending).collect()
+
+
+def sort_robust_delay_metrics_lazy(
+    df: pl.LazyFrame,
+    *,
+    limit: int | None = None,
+    ascending: bool = False,
+) -> pl.LazyFrame:
+    """Rank by p90, then share >5 min late; ties favour the larger sample."""
+    columns = ["p90_delay_min", "pct_over_5_min_late", "bucket_count"]
+    descending = [not ascending, not ascending, True]
+    if "line_ref" in df.collect_schema().names():
+        columns.append("line_ref")
+        descending.append(False)
+    result = df.sort(columns, descending=descending, nulls_last=True)
     return result.head(limit) if limit is not None else result
 
 
@@ -744,7 +971,7 @@ def parse_hhmm(value: str) -> int:
     return hour * 60 + minute
 
 
-def rush_period_expr(windows: list[tuple[int, int]], *, include_weekends: bool) -> pl.Expr:
+def time_window_expr(windows: list[tuple[int, int]], *, include_weekends: bool) -> pl.Expr:
     expr = pl.lit(False)
     for start, end in windows:
         if start < end:
@@ -754,7 +981,11 @@ def rush_period_expr(windows: list[tuple[int, int]], *, include_weekends: bool) 
         expr = expr | in_window
     if not include_weekends:
         expr = expr & pl.col("is_weekday")
-    return expr.alias("is_rush")
+    return expr
+
+
+def rush_period_expr(windows: list[tuple[int, int]], *, include_weekends: bool) -> pl.Expr:
+    return time_window_expr(windows, include_weekends=include_weekends).alias("is_rush")
 
 
 def round_numeric(df: pl.DataFrame, digits: int = 2) -> pl.DataFrame:
@@ -961,7 +1192,9 @@ def empty_bucket_frame() -> pl.DataFrame:
             "bucket_mode": pl.Utf8,
             "line_ref": pl.Utf8,
             "direction_ref": pl.Utf8,
+            "trip_match_key": pl.Utf8,
             "published_line_name": pl.Utf8,
+            "destination_name": pl.Utf8,
             "delay_seconds": pl.Float64,
             "delay_min": pl.Float64,
             "raw_poll_count": pl.Int64,
@@ -973,6 +1206,7 @@ def empty_bucket_frame() -> pl.DataFrame:
             "local_date": pl.Date,
             "local_hour": pl.Int64,
             "local_weekday": pl.Int64,
+            "is_holiday": pl.Boolean,
             "is_weekday": pl.Boolean,
             "day_type": pl.Utf8,
             "local_minutes": pl.Int64,
@@ -981,25 +1215,12 @@ def empty_bucket_frame() -> pl.DataFrame:
 
 
 def empty_metric_frame(group_columns: list[str]) -> pl.DataFrame:
-    schema = {column: pl.Utf8 for column in group_columns}
+    schema: dict[str, pl.DataType] = {column: pl.Utf8 for column in group_columns}
+    integer_columns = {"bucket_count", "raw_poll_count", "trip_count", "day_count"}
     schema.update(
         {
-            "bucket_count": pl.Int64,
-            "raw_poll_count": pl.Int64,
-            "signed_mean_delay_min": pl.Float64,
-            "avg_delay_min": pl.Float64,
-            "median_delay_min": pl.Float64,
-            "p75_delay_min": pl.Float64,
-            "p90_delay_min": pl.Float64,
-            "p95_delay_min": pl.Float64,
-            "pct_late": pl.Float64,
-            "pct_over_3_min_late": pl.Float64,
-            "pct_over_5_min_late": pl.Float64,
-            "pct_early": pl.Float64,
-            "pct_over_1_min_early": pl.Float64,
-            "pct_over_3_min_early": pl.Float64,
-            "median_early_min_abs": pl.Float64,
-            "p90_early_min_abs": pl.Float64,
+            column: (pl.Int64 if column in integer_columns else pl.Float64)
+            for column in METRIC_COLUMNS
         }
     )
     return pl.DataFrame(schema=schema)

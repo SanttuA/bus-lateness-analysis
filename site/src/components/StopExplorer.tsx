@@ -1,14 +1,15 @@
 import { lazy, Suspense, useEffect, useMemo, useState } from 'react';
 
 import { loadStops } from '../data';
-import { formatMinutes, formatNumber } from '../format';
+import { formatNumber, formatPercent } from '../format';
 import { t } from '../i18n';
-import { selectStopPoints } from '../model';
+import { disambiguatedStopNames, quantileThresholds, selectStopPoints } from '../model';
 import type { DayFilter, DelayDirection, Language, SearchState, StopsPayload } from '../types';
 
 /* oxlint-disable jsx-a11y/no-noninteractive-tabindex -- The stop table's scrollable region must be keyboard-focusable for WCAG 2.1.1. */
 
 const StopMap = lazy(() => import('./StopMap'));
+const LEGEND_BINS = 5;
 
 interface StopExplorerProps {
   language: Language;
@@ -52,6 +53,16 @@ export default function StopExplorer({ language, search, onSearchChange }: StopE
       locale: language === 'fi' ? 'fi-FI' : 'en-GB',
     });
   }, [data, day, language, line, mode, search.stop]);
+
+  const thresholds = useMemo(
+    () =>
+      quantileThresholds(
+        points.map((point) => point.display_value),
+        LEGEND_BINS,
+      ),
+    [points],
+  );
+  const names = useMemo(() => disambiguatedStopNames(points), [points]);
 
   if (error)
     return (
@@ -114,7 +125,7 @@ export default function StopExplorer({ language, search, onSearchChange }: StopE
           />
         </label>
         <fieldset>
-          <legend>{language === 'fi' ? 'Esitystapa' : 'View'}</legend>
+          <legend>{copy.view}</legend>
           <div className="segmented">
             {(['map', 'table'] as const).map((value) => (
               <button
@@ -130,30 +141,37 @@ export default function StopExplorer({ language, search, onSearchChange }: StopE
         </fieldset>
       </div>
       <p className="result-count" aria-live="polite">
-        {formatNumber(points.length, language)}{' '}
-        {language === 'fi' ? 'pysäkkiä rajauksessa' : 'stops in selection'}
+        {formatNumber(points.length, language)} {copy.stopsInSelection}
       </p>
       {points.length === 0 ? <p className="empty-state">{copy.noData}</p> : null}
       {view === 'map' && points.length ? (
         <Suspense fallback={<p className="empty-state">{copy.loading}</p>}>
-          <StopMap language={language} mode={mode} points={points} />
+          <StopMap
+            language={language}
+            mode={mode}
+            points={points}
+            thresholds={thresholds}
+            names={names}
+          />
         </Suspense>
       ) : null}
       {view === 'table' && points.length ? (
         <section
           className="table-scroll stop-table"
-          aria-label={`${copy.tableCaption} · ${language === 'fi' ? '50 korkeinta arvoa' : 'top 50 values'}`}
+          aria-label={`${copy.tableCaption} · ${copy.topValues}`}
           tabIndex={0}
         >
+          <p className="table-scroll-hint">{copy.tableScrollHint}</p>
           <table>
             <caption>
-              {copy.tableCaption} · {language === 'fi' ? '50 korkeinta arvoa' : 'top 50 values'}
+              {copy.tableCaption} · {copy.topValues}
             </caption>
             <thead>
               <tr>
                 <th scope="col">{copy.stop}</th>
                 <th scope="col">ID</th>
-                <th scope="col">{mode === 'late' ? copy.p90 : copy.earlyP90}</th>
+                <th scope="col">{mode === 'late' ? copy.overFive : copy.overThreeEarly}</th>
+                <th scope="col">{copy.onTime}</th>
                 <th scope="col">{copy.buckets}</th>
                 <th scope="col">{copy.linesServed}</th>
               </tr>
@@ -161,9 +179,10 @@ export default function StopExplorer({ language, search, onSearchChange }: StopE
             <tbody>
               {points.slice(0, 50).map((point) => (
                 <tr key={point.stop_id}>
-                  <th scope="row">{point.stop_name}</th>
+                  <th scope="row">{names.get(point.stop_id) ?? point.stop_name}</th>
                   <td>{point.stop_id}</td>
-                  <td>{formatMinutes(point.display_value, language, 2)}</td>
+                  <td>{formatPercent(point.display_value, language, 1)}</td>
+                  <td>{formatPercent(point.pct_on_time, language, 1)}</td>
                   <td>{formatNumber(point.bucket_count, language)}</td>
                   <td>{formatNumber(point.line_count, language)}</td>
                 </tr>

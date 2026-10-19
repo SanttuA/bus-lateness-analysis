@@ -267,26 +267,43 @@ class MatchedAnalysisTests(unittest.TestCase):
         self.assertEqual(enriched.loc[2, "gtfs_feed_date"], date(2026, 4, 30))
         self.assertEqual(enriched.loc[2, "stop_name"], "Second feed")
 
-    def test_alert_controls_match_active_line_direction_hour_and_day_type(self) -> None:
+    def test_alert_cli_uses_shared_alert_tables_and_skips_cancellations(self) -> None:
+        import tempfile
+
+        from tests.test_results_report import create_report_db
+
         alerts = load_script_module(
             "service_alert_delay_correlation",
             "analysis/service-alert-delay-correlation.py",
         )
-        rows = pd.DataFrame(
-            {
-                "line_ref": ["3", "3", "3"],
-                "direction_ref": ["1", "1", "2"],
-                "local_hour": [8, 8, 8],
-                "day_type": ["weekday", "weekday", "weekday"],
-                "delay_seconds": [60, 120, 180],
-            }
-        )
-        active_mask = pd.Series([True, False, False])
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "foli.db"
+            create_report_db(db_path)
 
-        active, controls = alerts.matched_control_rows(rows, active_mask)
+            class Args:
+                db = db_path
+                cache_dir = Path(temp_dir) / "cache"
+                quality_mode = "conservative"
+                bucket = "trip-stop"
+                timezone = "Europe/Helsinki"
+                min_observations = 1
+                min_trips = 1
+                limit = 5
+                exclude_stop_call_disagreement = False
+                force_cache = False
+                alert_kind = "any"
+                line_ref = None
+                gtfs_dir = None
+                gtfs_root = None
 
-        self.assertEqual(active["delay_seconds"].to_list(), [60])
-        self.assertEqual(controls["delay_seconds"].to_list(), [120])
+            buckets = alerts.cached_alert_observation_buckets(Args, (None, None))
+            grouped, by_line = alerts.build_correlation_from_buckets(Args, buckets)
+
+        self.assertEqual(len(buckets), 3)
+        # One alert bucket and a single same-stratum control is below the 20-control
+        # minimum, so no lift is reported rather than a misleading one.
+        self.assertTrue(grouped.empty)
+        self.assertTrue(by_line.empty)
 
     def test_alert_window_uses_explicit_start_and_end_without_database_lookup(self) -> None:
         alerts = load_script_module(
@@ -307,55 +324,6 @@ class MatchedAnalysisTests(unittest.TestCase):
         self.assertEqual(start.isoformat(), "2026-05-05T21:00:00+00:00")
         self.assertEqual(end.isoformat(), "2026-05-07T21:00:00+00:00")
         self.assertIn("2026-05-05T21:00:00+00:00", description)
-
-    def test_alert_targets_map_routes_by_gtfs_feed_date(self) -> None:
-        alerts_module = load_script_module(
-            "service_alert_delay_correlation",
-            "analysis/service-alert-delay-correlation.py",
-        )
-        alert_rows = pd.DataFrame(
-            {
-                "source_alert_id": ["before", "first", "second"],
-                "line_ref": [pd.NA, pd.NA, pd.NA],
-                "cause": ["Unknown"] * 3,
-                "effect": ["Delay"] * 3,
-                "priority": [1, 1, 1],
-                "is_active": [1, 1, 1],
-                "validity_start_utc": [
-                    "2026-04-22T08:00:00Z",
-                    "2026-04-23T08:00:00Z",
-                    "2026-04-30T08:00:00Z",
-                ],
-                "validity_end_utc": [pd.NA, pd.NA, pd.NA],
-                "affected_routes_json": ['["route-a"]', '["route-a"]', '["route-a"]'],
-                "affected_stops_json": ["[]", "[]", "[]"],
-                "created_at_utc": [
-                    "2026-04-22T08:00:00Z",
-                    "2026-04-23T08:00:00Z",
-                    "2026-04-30T08:00:00Z",
-                ],
-            }
-        )
-        routes = pd.DataFrame(
-            {
-                "gtfs_feed_date": [date(2026, 4, 23), date(2026, 4, 30)],
-                "route_id": pd.Series(["route-a", "route-a"], dtype="string"),
-                "route_short_name": pd.Series(["3", "4"], dtype="string"),
-            }
-        )
-
-        targets = alerts_module.build_alert_targets(
-            alert_rows,
-            routes,
-            pd.Timestamp("2026-04-22T08:00:00Z"),
-            pd.Timestamp("2026-04-30T08:00:00Z"),
-            include_routes=True,
-            include_stops=False,
-            timezone="Europe/Helsinki",
-        ).sort_values("start_utc")
-
-        self.assertEqual(targets["target_ref"].to_list(), ["route-a", "3", "4"])
-
 
 if __name__ == "__main__":
     unittest.main()

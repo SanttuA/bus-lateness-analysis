@@ -104,8 +104,9 @@ uv run python analysis/build-results-report.py
 
 The report is written to `reports/generated/overall-results.md`. Intermediate
 DuckDB tables and compact CSVs are stored under `outputs/report-cache/` so later
-runs can reuse midpoint calculations and other summaries instead of loading the
-full SQLite database into pandas. The cache is rebuilt when `data/foli.db` or
+runs can reuse quality rows, delay buckets and result tables instead of loading
+the full SQLite database into pandas. DuckDB runs with a 3 GB memory limit and
+spills to disk, so the build fits on a machine with about 15 GiB of RAM. The cache is rebuilt when `data/foli.db` or
 report settings change; pass `--force` to rebuild it manually. The command
 prints simple progress updates and includes cache/build, render, and total run
 timings in the generated report.
@@ -171,7 +172,13 @@ no GTFS coordinates.
 - Raw Föli VM rows are repeated polls, so treating every 30-second poll as an
   independent event overweights vehicles that remain visible for longer.
 - The default analytics use conservative filtering for extreme, stale,
-  pre-trip, and post-trip rows before drawing operational conclusions.
+  pre-trip, and post-trip rows before drawing operational conclusions. They
+  also drop placeholder zero delays: rows of a bus waiting at its first stop
+  before departure, and trips that report exactly 0 at every stop.
+- One trip contributes many correlated trip-stop buckets, so grouped results
+  need at least 10 distinct trips and report trip-bootstrap intervals.
+- Weekday holidays with reduced service, detected from the GTFS calendar, count
+  as weekend days.
 - Rows where VM delay strongly disagrees with next stop-call expected-vs-aimed
   times are flagged by default and can be excluded explicitly in CLI scripts.
 

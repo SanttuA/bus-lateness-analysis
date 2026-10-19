@@ -61,14 +61,14 @@ class PublicSiteDataTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "forbidden public keys"):
             self.generator.validate_public_payload(
                 "bad",
-                {"schema_version": 1, "rows": [{"vehicle_id": "secret"}]},
+                {"schema_version": 2, "rows": [{"vehicle_id": "secret"}]},
             )
 
     def test_validate_payload_rejects_local_database_paths(self) -> None:
         with self.assertRaisesRegex(ValueError, "local paths"):
             self.generator.validate_public_payload(
                 "bad",
-                {"schema_version": 1, "source": "data/foli.db"},
+                {"schema_version": 2, "source": "data/foli.db"},
             )
 
     def test_validate_payload_rejects_missing_schema_and_non_finite_values(self) -> None:
@@ -76,11 +76,11 @@ class PublicSiteDataTests(unittest.TestCase):
             self.generator.validate_public_payload("bad", {"rows": []})
         with self.assertRaises(ValueError):
             self.generator.validate_public_payload(
-                "bad", {"schema_version": 1, "value": float("nan")}
+                "bad", {"schema_version": 2, "value": float("nan")}
             )
 
     def test_json_output_is_stable_and_utf8(self) -> None:
-        payload = {"schema_version": 1, "name": "Föli", "rows": [{"b": 2, "a": 1}]}
+        payload = {"schema_version": 2, "name": "Föli", "rows": [{"b": 2, "a": 1}]}
         with tempfile.TemporaryDirectory() as temp_dir:
             first = Path(temp_dir) / "first.json"
             second = Path(temp_dir) / "second.json"
@@ -145,19 +145,58 @@ class PublicSiteDataTests(unittest.TestCase):
         settings = ensure_cache.call_args.args[0]
         self.assertEqual(settings.min_observations, 47)
 
-    def test_bilingual_caveats_cover_snapshot_estimate_filter_and_gaps(self) -> None:
+    def test_bilingual_caveats_cover_snapshot_estimate_filter_trips_and_gaps(self) -> None:
         caveats = self.generator._overview_caveats(
             start_date=date(2026, 4, 23),
             end_date=date(2026, 5, 23),
-            excluded_pct=5.69,
+            excluded_pct=17.72,
+            placeholder_rows=1_590_276,
         )
 
         self.assertEqual(
             {row["id"] for row in caveats},
-            {"snapshot", "estimated-state", "quality-filter", "collector-gaps"},
+            {"snapshot", "estimated-state", "quality-filter", "trips", "collector-gaps"},
         )
         self.assertTrue(all(row["fi"] and row["en"] for row in caveats))
-        self.assertIn("5.69%", next(row["en"] for row in caveats if row["id"] == "quality-filter"))
+        quality = next(row for row in caveats if row["id"] == "quality-filter")
+        self.assertIn("17.72%", quality["en"])
+        self.assertIn("17,72 %", quality["fi"])
+        self.assertIn("1,590,276", quality["en"])
+
+    def test_headlines_and_takeaways_follow_the_data(self) -> None:
+        lines = [
+            {"line_ref": "1", "line_name": "1", "trips_per_day": 120, "low_quality": False,
+             "pct_over_5_min_late": 5.0, "p90_delay_min": 3.0, "pct_over_3_min_early": 4.0},
+            {"line_ref": "2", "line_name": "2", "trips_per_day": 80, "low_quality": False,
+             "pct_over_5_min_late": 9.0, "p90_delay_min": 4.0, "pct_over_3_min_early": 2.0,
+             "pct_over_5_min_late_ci_lo": 7.0, "pct_over_5_min_late_ci_hi": 11.0},
+            {"line_ref": "612", "line_name": "612", "trips_per_day": 2, "low_quality": False,
+             "pct_over_5_min_late": 40.0, "p90_delay_min": 14.0, "pct_over_3_min_early": 30.0},
+            {"line_ref": "P6", "line_name": "P6", "trips_per_day": 4, "low_quality": True,
+             "pct_over_5_min_late": 1.0, "p90_delay_min": 1.0, "pct_over_3_min_early": 60.0},
+        ]
+        hourly = [
+            {"day_type": "weekday", "local_hour": 8, "bucket_count": 5000, "pct_over_5_min_late": 4.0},
+            {"day_type": "weekday", "local_hour": 16, "bucket_count": 5000, "pct_over_5_min_late": 8.0},
+        ]
+        rush = [{"line_name": "2", "rush_over_5_min_late_pct_point_lift": 6.0,
+                 "rush_over_5_min_late_lift_ci_lo": 2.0}]
+
+        headlines = self.generator._overview_headlines(lines, hourly, rush, [], [])
+        takeaways = self.generator._overview_takeaways(lines, {"pct_on_time": 66.0}, hourly, rush)
+
+        self.assertTrue(headlines["en"]["ranking"].startswith("Lines 2 and 1"))
+        self.assertIn("16:00", headlines["en"]["hourly"])
+        self.assertIn("line 2", headlines["en"]["rush"])
+        late = next(row for row in takeaways if row["id"] == "late-lines")
+        self.assertIn("line 2 is most often", late["en"])
+        self.assertIn("line 612", late["en"])
+        early = next(row for row in takeaways if row["id"] == "early-lines")
+        self.assertIn("Among frequent lines, line 1 runs ahead", early["en"])
+        self.assertIn("the most extreme is 612", early["en"])
+        self.assertNotIn("P6", early["en"])
+        self.assertIn("1 lines with incomplete data", early["en"])
+        self.assertIn("are 1 and 2.", headlines["en"]["recommendations"][1])
 
     def test_checked_in_snapshot_reconciles_authoritative_findings(self) -> None:
         overview = json.loads(
@@ -165,12 +204,32 @@ class PublicSiteDataTests(unittest.TestCase):
         )
         findings = (PROJECT_ROOT / "FINDINGS.md").read_text()
 
-        self.assertEqual(overview["summary"]["bucket_count"], 3_746_770)
-        self.assertEqual(overview["summary"]["raw_poll_count"], 9_837_244)
+        self.assertEqual(overview["schema_version"], 2)
+        self.assertEqual(overview["summary"]["bucket_count"], 3_729_540)
+        self.assertEqual(overview["summary"]["raw_poll_count"], 8_582_662)
         self.assertEqual(overview["summary"]["line_count"], 140)
-        self.assertEqual(overview["meta"]["conservative_excluded_pct"], 5.69)
-        for expected in ("3,746,770", "9,837,244", "140", "5.69%"):
+        self.assertEqual(overview["meta"]["conservative_excluded_pct"], 17.72)
+        self.assertEqual(overview["meta"]["holiday_dates"], ["2026-05-01", "2026-05-14"])
+        for expected in ("3,729,540", "8,582,662", "140", "17.72%"):
             self.assertIn(expected, findings)
+
+    def test_checked_in_lines_meet_trip_minimum_and_carry_intervals(self) -> None:
+        payload = json.loads(
+            (PROJECT_ROOT / "site" / "public" / "data" / "lines.json").read_text()
+        )
+        self.assertTrue(all(row["trip_count"] >= 10 for row in payload["contexts"]))
+        self.assertTrue(all(row["trip_count"] >= 10 for row in payload["lines"]))
+        self.assertTrue(all("pct_over_5_min_late_ci_lo" in row for row in payload["lines"]))
+
+    def test_checked_in_context_replaces_stop_changes_with_daily_profile(self) -> None:
+        payload = json.loads(
+            (PROJECT_ROOT / "site" / "public" / "data" / "context.json").read_text()
+        )
+        self.assertNotIn("stop_changes", payload)
+        days = {row["local_date"]: row for row in payload["daily"]}
+        self.assertEqual(days["2026-05-01"]["day_type"], "weekend")
+        self.assertTrue(days["2026-05-01"]["is_holiday"])
+        self.assertTrue(all(row["bucket_count_alert"] < 1_000_000 for row in payload["alerts"]))
 
     def test_checked_in_stop_markers_are_canonical_and_ordered(self) -> None:
         payload = json.loads(

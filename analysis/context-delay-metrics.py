@@ -5,6 +5,7 @@ import argparse
 import pandas as pd
 
 from _shared import (
+    holiday_dates_for_args,
     QUALIFIED_DELAY_FILTER_SQL,
     add_bucket_arg,
     add_cache_args,
@@ -76,7 +77,9 @@ def build_context_metrics(args: argparse.Namespace, df: pd.DataFrame) -> pd.Data
         quality_mode=args.quality_mode,
         exclude_stop_call_disagreement=args.exclude_stop_call_disagreement,
     )
-    buckets = aggregate_delay_buckets(df, bucket=args.bucket, timezone=args.timezone)
+    buckets = aggregate_delay_buckets(
+        df, bucket=args.bucket, timezone=args.timezone, holidays=holiday_dates_for_args(args)
+    )
     if args.day_type != "all":
         buckets = buckets[buckets["day_type"] == args.day_type]
     if buckets.empty:

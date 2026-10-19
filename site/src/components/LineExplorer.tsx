@@ -3,10 +3,14 @@ import { useCallback, useMemo } from 'react';
 
 import { formatMinutes, formatNumber, formatPercent } from '../format';
 import { t } from '../i18n';
-import { selectDefaultLine, selectExplorableLines, selectLineContexts } from '../model';
-import { normalizeHourRange } from '../search';
-import type { Language, LinesPayload, SearchState } from '../types';
+import { labelStep, textWidth } from '../measure';
+import { selectDefaultLine, selectExplorableLines, selectHeatmapCells } from '../model';
+import type { HeatmapCell } from '../model';
+import { plotStyle, theme } from '../theme';
+import type { DelayDirection, Language, LinesPayload, SearchState } from '../types';
+import { BinLegend } from './ChartLegend';
 import { PlotFigure } from './PlotFigure';
+import { SegmentedControl } from './SegmentedControl';
 
 interface LineExplorerProps {
   language: Language;
@@ -18,67 +22,115 @@ interface LineExplorerProps {
 export function LineExplorer({ language, data, search, onSearchChange }: LineExplorerProps) {
   const copy = t(language);
   const lineRefs = useMemo(() => selectExplorableLines(data), [data]);
-  const direction = search.direction ?? '1';
-  const day = search.day ?? 'weekday';
-  const defaultLine = useMemo(
-    () => selectDefaultLine(data, direction, day),
-    [data, day, direction],
-  );
+  const defaultLine = useMemo(() => selectDefaultLine(data), [data]);
   const line = search.line && lineRefs.includes(search.line) ? search.line : defaultLine;
-  const { start, end } = normalizeHourRange(search.from, search.to);
-  const rows = useMemo(
-    () => (line ? selectLineContexts(data, line, direction, day, start, end) : []),
-    [data, day, direction, end, line, start],
+  const mode: DelayDirection = search.heat ?? 'late';
+  const lineRecord = data.lines.find((row) => row.line_ref === line);
+  const { rows, cells } = useMemo(
+    () => (line ? selectHeatmapCells(data, line, mode) : { rows: [], cells: [] }),
+    [data, line, mode],
   );
+  // Row label layouts from widest to most compact; render picks the first that fits.
+  const labelFormats = useMemo(() => {
+    const day = (value: string, short: boolean) =>
+      value === 'weekday'
+        ? short
+          ? copy.weekdayShort
+          : copy.weekday
+        : short
+          ? copy.weekendShort
+          : copy.weekend;
+    return {
+      preferred: [
+        (direction: string, value: string) =>
+          `${copy.direction} ${direction} · ${day(value, false)}`,
+        (direction: string, value: string) =>
+          `${copy.direction} ${direction}\n${day(value, false)}`,
+      ],
+      compact: (direction: string, value: string) =>
+        `${copy.direction} ${direction}\n${day(value, true)}`,
+    };
+  }, [copy]);
+  const ramp = mode === 'late' ? theme.lateRamp : theme.earlyRamp;
+  const maxValue = useMemo(() => Math.max(5, ...cells.map((cell) => cell.value ?? 0)), [cells]);
+  const metricLabel = mode === 'late' ? copy.heatmapLate : copy.heatmapEarly;
+  const thresholds = useMemo(() => {
+    const step = Math.max(1, Math.ceil(maxValue)) / ramp.length;
+    return Array.from(
+      { length: ramp.length - 1 },
+      (_, index) => Math.round(step * (index + 1) * 10) / 10,
+    );
+  }, [maxValue, ramp.length]);
+
   const render = useCallback(
-    (width: number) =>
-      Plot.plot({
+    (width: number) => {
+      const narrow = width < 560;
+      const filled = cells.filter((cell) => cell.value !== null);
+      const fits = (format: typeof labelFormats.compact) =>
+        textWidth(rows.map((row) => format(row.direction_ref, row.day_type))) + 12 <= width * 0.4;
+      const rowLabel = labelFormats.preferred.find(fits) ?? labelFormats.compact;
+      const labels = rows.map((row) => rowLabel(row.direction_ref, row.day_type));
+      const twoLine = labels.some((text) => text.includes('\n'));
+      const marginLeft = textWidth(labels) + 12;
+      const hourStep = labelStep((width - marginLeft - 8) / 24, textWidth(['23']));
+      return Plot.plot({
         width,
-        height: width < 560 ? 380 : 430,
-        marginTop: 16,
-        marginRight: 30,
-        marginBottom: 54,
-        marginLeft: 68,
-        style: {
-          background: 'transparent',
-          color: '#252c2e',
-          fontFamily: 'inherit',
-          fontSize: '16px',
-        },
+        height: 70 + rows.length * (twoLine ? 46 : narrow ? 30 : 36),
+        marginTop: 8,
+        marginRight: 8,
+        marginBottom: 40,
+        marginLeft,
+        padding: 0.06,
+        style: plotStyle,
         x: {
-          label: language === 'fi' ? 'paikallinen tunti' : 'local hour',
-          domain: [start, end],
-          ticks: width < 560 ? 6 : 12,
+          type: 'band',
+          domain: Array.from({ length: 24 }, (_, hour) => hour),
+          label: copy.hour,
+          tickFormat: (hour: number) => (hour % hourStep === 0 ? `${hour}` : ''),
+          tickSize: 0,
         },
-        y: { label: language === 'fi' ? 'viive, min' : 'delay, min', grid: true },
+        y: {
+          domain: rows.map((row) => rowLabel(row.direction_ref, row.day_type)),
+          label: null,
+          tickSize: 0,
+        },
+        color: { type: 'threshold', domain: thresholds, range: [...ramp] },
         marks: [
-          Plot.ruleY([0], { stroke: '#737b79' }),
-          Plot.lineY(rows, {
+          Plot.cell(cells, {
             x: 'local_hour',
-            y: 'p90_delay_min',
-            stroke: '#b85b1b',
-            strokeWidth: 3,
-            tip: true,
+            y: (cell: HeatmapCell) => rowLabel(cell.direction_ref, cell.day_type),
+            fill: theme.band,
+            rx: 3,
           }),
-          Plot.dot(rows, { x: 'local_hour', y: 'p90_delay_min', fill: '#b85b1b', r: 4 }),
-          Plot.lineY(rows, {
+          Plot.cell(filled, {
             x: 'local_hour',
-            y: 'median_delay_min',
-            stroke: '#316f9e',
-            strokeWidth: 2,
-            strokeDasharray: '5,4',
-            tip: true,
+            y: (cell: HeatmapCell) => rowLabel(cell.direction_ref, cell.day_type),
+            fill: 'value',
+            rx: 3,
+            channels: {
+              share: {
+                value: (cell: HeatmapCell) => formatPercent(cell.value ?? 0, language, 1),
+                label: metricLabel,
+              },
+              trips: {
+                value: (cell: HeatmapCell) => cell.context?.trip_count ?? 0,
+                label: copy.trips,
+              },
+            },
+            tip: { format: { fill: false, x: true, y: true, share: true, trips: true } },
           }),
         ],
-      }),
-    [end, language, rows, start],
+      });
+    },
+    [cells, copy, labelFormats, language, metricLabel, ramp, rows, thresholds],
   );
 
   if (!line) return null;
+  const directionLabels = lineRecord?.direction_labels ?? {};
   return (
     <div className="explorer-panel">
-      <div className="filter-grid" aria-label={copy.explorerTitle}>
-        <label>
+      <div className="filter-row">
+        <label className="select-field">
           <span>{copy.line}</span>
           <select value={line} onChange={(event) => onSearchChange({ line: event.target.value })}>
             {lineRefs.map((value) => (
@@ -88,87 +140,76 @@ export function LineExplorer({ language, data, search, onSearchChange }: LineExp
             ))}
           </select>
         </label>
-        <label>
-          <span>{copy.direction}</span>
-          <select
-            value={direction}
-            onChange={(event) => onSearchChange({ direction: event.target.value as '1' | '2' })}
-          >
-            <option value="1">1</option>
-            <option value="2">2</option>
-          </select>
-        </label>
-        <label>
-          <span>{copy.dayType}</span>
-          <select
-            value={day}
-            onChange={(event) =>
-              onSearchChange({ day: event.target.value as 'weekday' | 'weekend' })
-            }
-          >
-            <option value="weekday">{copy.weekday}</option>
-            <option value="weekend">{copy.weekend}</option>
-          </select>
-        </label>
-        <label>
-          <span>
-            {copy.fromHour}: {String(start).padStart(2, '0')}:00
-          </span>
-          <input
-            type="range"
-            min="0"
-            max="23"
-            value={start}
-            onChange={(event) => {
-              const value = Number(event.target.value);
-              onSearchChange({ from: value, ...(value > end ? { to: value } : {}) });
-            }}
-          />
-        </label>
-        <label>
-          <span>
-            {copy.toHour}: {String(end).padStart(2, '0')}:00
-          </span>
-          <input
-            type="range"
-            min="0"
-            max="23"
-            value={end}
-            onChange={(event) => {
-              const value = Number(event.target.value);
-              onSearchChange({ to: value, ...(value < start ? { from: value } : {}) });
-            }}
-          />
-        </label>
+        <SegmentedControl
+          legend={copy.metric}
+          value={mode}
+          options={[
+            { value: 'late', label: copy.heatmapLate },
+            { value: 'early', label: copy.heatmapEarly },
+          ]}
+          onChange={(value) => onSearchChange({ heat: value as DelayDirection })}
+        />
       </div>
-      {rows.length ? (
+      {Object.keys(directionLabels).length ? (
+        <ul className="direction-list">
+          {Object.entries(directionLabels).map(([direction, destination]) => (
+            <li key={direction}>
+              <strong>
+                {copy.direction} {direction}
+              </strong>{' '}
+              {copy.towards} {destination}
+            </li>
+          ))}
+        </ul>
+      ) : null}
+      {cells.some((cell) => cell.value !== null) ? (
         <PlotFigure
-          title={`${copy.line} ${line}`}
-          subtitle={`${direction} · ${day === 'weekday' ? copy.weekday : copy.weekend} · ${String(start).padStart(2, '0')}:00–${String(end).padStart(2, '0')}:00`}
+          className="heatmap-figure"
+          title={`${copy.line} ${lineRecord?.line_name ?? line}`}
+          subtitle={`${metricLabel} · ${formatNumber(lineRecord?.trip_count ?? 0, language)} ${copy.trips.toLowerCase()}`}
           render={render}
+          legend={
+            <BinLegend
+              language={language}
+              title={metricLabel}
+              thresholds={thresholds}
+              ramp={ramp}
+            />
+          }
         >
           <div className="table-scroll">
             <table>
               <caption className="sr-only">{copy.tableCaption}</caption>
               <thead>
                 <tr>
-                  <th scope="col">{language === 'fi' ? 'Tunti' : 'Hour'}</th>
-                  <th scope="col">{copy.median}</th>
-                  <th scope="col">{copy.p90}</th>
+                  <th scope="col">{copy.direction}</th>
+                  <th scope="col">{copy.dayType}</th>
+                  <th scope="col">{copy.hour}</th>
+                  <th scope="col">{copy.onTime}</th>
                   <th scope="col">{copy.overFive}</th>
-                  <th scope="col">{copy.buckets}</th>
+                  <th scope="col">{copy.overThreeEarly}</th>
+                  <th scope="col">{copy.p90}</th>
+                  <th scope="col">{copy.trips}</th>
                 </tr>
               </thead>
               <tbody>
-                {rows.map((row) => (
-                  <tr key={row.local_hour}>
-                    <th scope="row">{String(row.local_hour).padStart(2, '0')}:00</th>
-                    <td>{formatMinutes(row.median_delay_min, language, 2)}</td>
-                    <td>{formatMinutes(row.p90_delay_min, language, 2)}</td>
-                    <td>{formatPercent(row.pct_over_5_min_late, language, 2)}</td>
-                    <td>{formatNumber(row.bucket_count, language)}</td>
-                  </tr>
-                ))}
+                {cells
+                  .filter((cell) => cell.context !== null)
+                  .map((cell) => {
+                    const context = cell.context!;
+                    return (
+                      <tr key={`${cell.key}-${cell.local_hour}`}>
+                        <td>{cell.direction_ref}</td>
+                        <td>{cell.day_type === 'weekday' ? copy.weekday : copy.weekend}</td>
+                        <th scope="row">{String(cell.local_hour).padStart(2, '0')}:00</th>
+                        <td>{formatPercent(context.pct_on_time, language, 1)}</td>
+                        <td>{formatPercent(context.pct_over_5_min_late, language, 1)}</td>
+                        <td>{formatPercent(context.pct_over_3_min_early, language, 1)}</td>
+                        <td>{formatMinutes(context.p90_delay_min, language, 2)}</td>
+                        <td>{formatNumber(context.trip_count, language)}</td>
+                      </tr>
+                    );
+                  })}
               </tbody>
             </table>
           </div>

@@ -2,17 +2,26 @@ import L from 'leaflet';
 import { useEffect, useRef } from 'react';
 import 'leaflet/dist/leaflet.css';
 
-import { formatMinutes, formatNumber } from '../format';
+import { formatNumber, formatPercent } from '../format';
 import { t } from '../i18n';
+import { binIndex } from '../model';
+import { theme } from '../theme';
+import { BinLegend } from './ChartLegend';
 import type { DelayDirection, Language, StopMapPoint } from '../types';
 
 interface StopMapProps {
   language: Language;
   mode: DelayDirection;
   points: StopMapPoint[];
+  thresholds: number[];
+  names: Map<string, string>;
 }
 
-export default function StopMap({ language, mode, points }: StopMapProps) {
+function rampFor(mode: DelayDirection): readonly string[] {
+  return mode === 'late' ? theme.lateRamp : theme.earlyRamp;
+}
+
+export default function StopMap({ language, mode, points, thresholds, names }: StopMapProps) {
   const hostRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<L.Map | null>(null);
   const layerRef = useRef<L.LayerGroup | null>(null);
@@ -50,34 +59,45 @@ export default function StopMap({ language, mode, points }: StopMapProps) {
     const map = mapRef.current;
     if (!layer || !map) return;
     layer.clearLayers();
+    const ramp = rampFor(mode);
     const bounds: [number, number][] = [];
-    for (const point of points) {
+    // Draw low values first so the highest-value stops sit on top where markers overlap.
+    const ordered = [...points].sort((a, b) => a.display_value - b.display_value);
+    for (const point of ordered) {
       if (point.stop_lat === null || point.stop_lon === null) continue;
       const latLng: [number, number] = [point.stop_lat, point.stop_lon];
       bounds.push(latLng);
+      const color = ramp[Math.min(binIndex(point.display_value, thresholds), ramp.length - 1)];
       const marker = L.circleMarker(latLng, {
-        radius: Math.max(4, Math.min(12, 3 + Math.sqrt(point.bucket_count) / 10)),
-        color: mode === 'late' ? '#8f4516' : '#1f4f73',
-        weight: 1,
-        fillColor: mode === 'late' ? '#d77a31' : '#4f8fbd',
-        fillOpacity: 0.68,
+        radius: Math.max(4, Math.min(11, 3 + Math.sqrt(point.bucket_count) / 12)),
+        color: theme.surface,
+        weight: 1.5,
+        fillColor: color,
+        fillOpacity: 0.92,
       });
       const popup = document.createElement('div');
       const heading = document.createElement('strong');
-      heading.textContent = point.stop_name;
+      heading.textContent = names.get(point.stop_id) ?? point.stop_name;
       const details = document.createElement('p');
-      details.textContent = `${mode === 'late' ? copy.p90 : copy.earlyP90}: ${formatMinutes(point.display_value, language, 2)} · ${formatNumber(point.bucket_count, language)} ${copy.buckets.toLowerCase()}`;
+      details.textContent = `${mode === 'late' ? copy.legendTitleLate : copy.legendTitleEarly}: ${formatPercent(point.display_value, language, 1)} · ${copy.onTime.toLowerCase()} ${formatPercent(point.pct_on_time, language, 1)} · ${formatNumber(point.bucket_count, language)} ${copy.buckets.toLowerCase()}`;
       popup.append(heading, details);
       marker.bindPopup(popup);
       marker.addTo(layer);
     }
     if (bounds.length && bounds.length < 80)
       map.fitBounds(bounds, { padding: [24, 24], maxZoom: 14 });
-  }, [copy.buckets, copy.earlyP90, copy.p90, language, mode, points]);
+  }, [copy, language, mode, names, points, thresholds]);
 
   return (
     <div className="map-frame">
       <p className="map-hint">{copy.mapHint}</p>
+      <BinLegend
+        language={language}
+        title={mode === 'late' ? copy.legendTitleLate : copy.legendTitleEarly}
+        note={copy.legendNote}
+        thresholds={thresholds}
+        ramp={rampFor(mode)}
+      />
       <section
         ref={hostRef}
         className="stop-map"
